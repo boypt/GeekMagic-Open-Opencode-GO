@@ -10,9 +10,10 @@
 #include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
+#include <LittleFS.h>
 #include <Esp.h>
+#include <new>
 
-#include "opencodego/cert.h"
 #include "web/Webserver.h"
 
 // main.cpp 的全局 webserver：退避等待分片里 pump 一下，让 API 在
@@ -24,6 +25,10 @@ static inline void fetchPumpWebserver() {
         webserver->handleClient();
     }
 }
+
+// TLS 信任锚配置文件（LittleFS 根目录，Web 可配置；不位于 /web 下，静态
+// 路由 registerGenericStaticFallback("/web") 不会把它暴露出去）
+static constexpr const char* CA_PEM_PATH = "/ca.pem";
 
 struct OpenCodeGoWindow {
     bool present = false;  // usage.<key> 是否存在
@@ -75,6 +80,73 @@ bool isRetryableCode(int c) {
     if (c == 401 || c == 403) return false;
     // 其余均可重试：含 0（建连失败/响应不完整）/429/5xx/解析失败
     return true;
+}
+
+// TLS 信任来源
+enum class TrustSource {
+    BUILTIN,  // 内置 GTS Root R4
+    CUSTOM,   // LittleFS /ca.pem
+    INSECURE  // verify 关闭
+};
+
+// 从 LittleFS 读取自定义 CA PEM；失败返回空 String
+String loadCustomCaPem() {
+    if (!LittleFS.exists(CA_PEM_PATH)) {
+        return "";
+    }
+    File f = LittleFS.open(CA_PEM_PATH, "r");
+    if (!f) {
+        Serial.println("WARN: Failed to open /ca.pem");
+        return "";
+    }
+    String pem = f.readString();
+    f.close();
+    pem.trim();
+    return pem;
+}
+
+// 一次性初始化信任锚：仅支持 LittleFS /ca.pem 自定义根证书，读取/解析一次并
+// 常驻（避免每次拉取重新分配 String + X509List，实测会把 BearSSL 挤到 OOM）。
+// 源码不再内置默认证书：未配置 /ca.pem 时返回 nullptr，调用方 setInsecure
+// （即默认不校验）。
+BearSSL::X509List* trustAnchorList() {
+    static BearSSL::X509List* list = nullptr;
+    static bool loaded = false;
+    if (loaded) {
+        return list;
+    }
+    loaded = true;
+
+    String pem = loadCustomCaPem();
+    if (pem.indexOf("-----BEGIN CERTIFICATE-----") < 0 ||
+        pem.indexOf("-----END CERTIFICATE-----") < 0) {
+        return nullptr;
+    }
+
+    list = new (std::nothrow) BearSSL::X509List(pem.c_str());
+    if (list == nullptr || list->getCount() == 0) {
+        delete list;
+        list = nullptr;
+        Serial.println("WARN: /ca.pem parse failed, TLS verify disabled");
+        return nullptr;
+    }
+
+    Serial.printf("TLS trust: custom CA (%u bytes, anchors=%u)\n", static_cast<unsigned>(pem.length()),
+                  static_cast<unsigned>(list->getCount()));
+    return list;  // pem 出作用域释放
+}
+
+// 按当前配置给 client 设置信任锚；X509List 由静态单例持有，覆盖整个连接过程。
+// 无自定义 CA（或 verify 关闭）时 setInsecure —— 默认不校验。
+TrustSource applyTrustAnchors(WiFiClientSecure& client, bool verifyTlsCert) {
+    BearSSL::X509List* list = verifyTlsCert ? trustAnchorList() : nullptr;
+    if (list == nullptr) {
+        client.setInsecure();
+        Serial.println(verifyTlsCert ? "TLS trust: insecure (no CA configured)" : "TLS trust: insecure");
+        return TrustSource::INSECURE;
+    }
+    client.setTrustAnchors(list);
+    return TrustSource::CUSTOM;
 }
 
 // 轻量响应读取：拆 header/body、解析状态码、解码 chunked（同 sd2-common readHttpResponse）。
@@ -158,7 +230,6 @@ OpenCodeGoHttpResponse readHttpResponse(WiFiClientSecure& client, uint32_t timeo
 // 单次请求：host/path/apiKey/verifyTlsCert 由参数传入
 bool fetchOpenCodeGoUsageOnce(OpenCodeGoUsage& out, const char* host, const char* path,
                               const char* apiKey, bool verifyTlsCert, uint32_t timeout_ms) {
-    BearSSL::X509List trust;
     WiFiClientSecure client;
     // TLS 缓冲区削减：BearSSL 默认 rx 16384 + tx 512 ≈ 17.3KB heap，改为
     // 4096/512（≈5KB），给 instruction cache/stack/JSON 解析留 heap 余量。
@@ -167,15 +238,12 @@ bool fetchOpenCodeGoUsageOnce(OpenCodeGoUsage& out, const char* host, const char
     // handshake/write error），说明对端不支持 MFLN：临时回退默认缓冲
     // （删掉本行，代价 heap +12KB，需同步减小其他内存占用）。
     client.setBufferSizes(4096, 512);
-    if (verifyTlsCert) {
-        trust.append(GTS_ROOT_R4_PEM);
-        client.setTrustAnchors(&trust);
-    } else {
-        client.setInsecure();  // 仅应急：证书链异常环境
-    }
+    applyTrustAnchors(client, verifyTlsCert);
     client.setTimeout(timeout_ms);  // Stream 超时单位为 ms（勿除以 1000）
 
     uint32_t t0 = millis();
+    // 说明：本核心的 connect() 无超时参数，握手耗时由 BearSSL 内部约束
+    // （长链验证最坏约 15s），readHttpResponse 侧另有 timeout_ms 兜底。
     if (!client.connect(host, 443)) {
         char sslErr[64] = {0};
         client.getLastSSLError(sslErr, sizeof(sslErr));
@@ -327,3 +395,4 @@ inline bool fetchOpenCodeGoUsage(OpenCodeGoUsage& out, const char* host, const c
     }
     return ok;
 }
+

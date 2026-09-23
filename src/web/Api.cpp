@@ -21,6 +21,7 @@
 #include <Logger.h>
 #include <ArduinoJson.h>
 #include <Updater.h>
+#include <LittleFS.h>
 
 #include "web/Webserver.h"
 #include "web/Api.h"
@@ -29,6 +30,7 @@
 #include "config/ConfigManager.h"
 #include "wireless/WiFiManager.h"
 #include "ntp/NTPClient.h"
+#include "opencodego/OpenCodeGoClient.h"
 
 extern ConfigManager configManager;
 extern WiFiManager* wifiManager;
@@ -211,6 +213,21 @@ void registerApiEndpoints(Webserver* webserver) {
     // example={"opencodego_host":"opencode.ai","opencodego_path":"/zen/go/v1/usage","opencodego_api_key":"sk-...","verify_tls_cert":1}
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/opencodego/config", HTTP_POST, [webserver]() { handleOpenCodeGoConfigSet(webserver); });
+
+    // @openapi {get} /opencodego/ca version=v1 group=OpenCodeGo summary="Get custom TLS CA (PEM) config" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/opencodego/ca", HTTP_GET, [webserver]() { handleOpenCodeGoCaGet(webserver); });
+
+    // @openapi {post} /opencodego/ca version=v1 group=OpenCodeGo summary="Save custom TLS root CA PEM (validated, stored to /ca.pem)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=pem:string
+    // example={"pem":"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/opencodego/ca", HTTP_POST, [webserver]() { handleOpenCodeGoCaSet(webserver); });
+
+    // @openapi {delete} /opencodego/ca version=v1 group=OpenCodeGo summary="Delete custom TLS CA (verification disabled when absent)" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/opencodego/ca", HTTP_DELETE, [webserver]() { handleOpenCodeGoCaDelete(webserver); });
+
 
     webserver->raw().onNotFound([webserver]() {
         if (webserver->raw().method() == HTTP_OPTIONS) {
@@ -1995,3 +2012,187 @@ void handleOpenCodeGoConfigSet(Webserver* webserver) {
 
     Logger::info("OpenCodeGo config updated", "API");
 }
+
+/**
+ * @brief TLS trust CA file path + temp file for atomic write
+ */
+static constexpr const char* OC_CA_PATH = "/ca.pem";
+static constexpr const char* OC_CA_TMP_PATH = "/ca.pem.tmp";
+static constexpr size_t OC_CA_MAX_BYTES = 8192;
+
+/**
+ * @brief GET /api/v1/opencodego/ca
+ *
+ * 返回当前 TLS 信任锚配置：custom（LittleFS /ca.pem，含完整 PEM）或
+ * 未配置即不校验（setInsecure）。
+ */
+void handleOpenCodeGoCaGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    size_t bytes = 0;
+    if (LittleFS.exists(OC_CA_PATH)) {
+        File f = LittleFS.open(OC_CA_PATH, "r");
+        if (f && f.size() > 0) {
+            bytes = f.size();
+            // 流式读入临时 String（PEM ~2KB），手写 JSON 需转义，借用
+            // ArduinoJson 序列化保证转义正确
+            String pem = f.readString();
+            f.close();
+            doc["source"] = "custom";
+            doc["bytes"] = bytes;
+            doc["pem"] = pem;
+        } else if (f) {
+            f.close();
+        }
+    }
+
+    if (bytes == 0) {
+        // 源码不再内置默认证书：未配置 /ca.pem 即不校验
+        doc["source"] = "none";
+        doc["bytes"] = 0;
+    }
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief POST /api/v1/opencodego/ca  body {"pem":"-----BEGIN CERTIFICATE-----..."}
+ *
+ * 校验 PEM 结构 + 可被 BearSSL 解析后写 /ca.pem；先写临时文件再改名，
+ * 避免半截文件导致下次启动校验失败。
+ */
+void handleOpenCodeGoCaSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    auto sendErr = [&](int code, const String& message) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = message;
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(code, "application/json", json);
+    };
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "Missing JSON body");
+        return;
+    }
+
+    JsonDocument ddoc;
+    DeserializationError err = deserializeJson(ddoc, webserver->raw().arg("plain"));
+    if (err) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "Invalid JSON");
+        return;
+    }
+
+    // pem 字段可能是空串/null
+    if (!ddoc["pem"].is<const char*>()) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "pem field is required");
+        return;
+    }
+
+    String pem = ddoc["pem"].as<String>();
+    pem.trim();
+    if (pem.length() == 0) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "pem is empty");
+        return;
+    }
+    if (pem.length() > OC_CA_MAX_BYTES) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "pem too large (max 8192 bytes)");
+        return;
+    }
+    if (pem.indexOf("-----BEGIN CERTIFICATE-----") < 0 || pem.indexOf("-----END CERTIFICATE-----") < 0) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "pem missing BEGIN/END CERTIFICATE markers");
+        return;
+    }
+
+    // BearSSL 预解析校验：构造 X509List，BearSSL 对解析不了的 PEM 会静默
+    // 忽略，因此锚计数为 0 即视为无效直接拒绝
+    {
+        BearSSL::X509List testList;
+        testList.append(pem.c_str());
+        if (testList.getCount() == 0) {
+            sendErr(HTTP_CODE_BAD_REQUEST, "pem parse failed (no valid certificate found)");
+            Logger::warn("CA PEM rejected: BearSSL parse failed", "API");
+            return;
+        }
+    }
+
+    // 先写临时文件再改名，避免断电/半写导致 /ca.pem 损坏
+    if (LittleFS.exists(OC_CA_TMP_PATH)) {
+        LittleFS.remove(OC_CA_TMP_PATH);
+    }
+    File tmp = LittleFS.open(OC_CA_TMP_PATH, "w");
+    if (!tmp) {
+        sendErr(HTTP_CODE_INTERNAL_ERROR, "Failed to create temp file");
+        return;
+    }
+    size_t written = tmp.print(pem);
+    tmp.close();
+    if (written != pem.length()) {
+        LittleFS.remove(OC_CA_TMP_PATH);
+        sendErr(HTTP_CODE_INTERNAL_ERROR, "Failed to write temp file");
+        return;
+    }
+    if (LittleFS.exists(OC_CA_PATH)) {
+        LittleFS.remove(OC_CA_PATH);
+    }
+    if (!LittleFS.rename(OC_CA_TMP_PATH, OC_CA_PATH)) {
+        LittleFS.remove(OC_CA_TMP_PATH);
+        sendErr(HTTP_CODE_INTERNAL_ERROR, "Failed to commit /ca.pem");
+        return;
+    }
+
+    JsonDocument doc;
+    doc["status"] = "ok";
+    doc["bytes"] = pem.length();
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+
+    Logger::info(("Custom TLS CA saved: /ca.pem (" + String(pem.length()) + " bytes)").c_str(), "API");
+}
+
+/**
+ * @brief DELETE /api/v1/opencodego/ca — 删除 /ca.pem，回退内置 GTS Root R4
+ */
+void handleOpenCodeGoCaDelete(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (LittleFS.exists(OC_CA_PATH) && !LittleFS.remove(OC_CA_PATH)) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Failed to remove /ca.pem";
+        String json;
+        serializeJson(doc, json);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+        return;
+    }
+
+    JsonDocument doc;
+    doc["status"] = "ok";
+    doc["source"] = "none";
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+
+    Logger::info("Custom TLS CA deleted, verification disabled", "API");
+}
+

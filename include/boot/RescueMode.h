@@ -23,8 +23,10 @@
 #include <cstdint>
 
 // Boot loop detection: if the device reboots BOOT_LOOP_THRESHOLD times
-// before BOOT_STABLE_MS elapses, rescue mode is entered
-static constexpr uint32_t BOOT_LOOP_THRESHOLD = 3;
+// before BOOT_STABLE_MS elapses, rescue mode is entered.
+// 注意：每次刷机/手动复位都会算作一次启动，阈值过低会导致开发期频繁误入
+// rescue mode，故放宽到 10 次（约需连续 10 次在稳定窗口内重启才触发）。
+static constexpr uint32_t BOOT_LOOP_THRESHOLD = 10;
 static constexpr uint32_t BOOT_STABLE_MS = 20000;
 
 class RescueMode {

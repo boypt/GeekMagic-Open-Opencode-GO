@@ -56,4 +56,8 @@ void handleLogsClear(Webserver* webserver);
 void handleOpenCodeGoConfigGet(Webserver* webserver);
 void handleOpenCodeGoConfigSet(Webserver* webserver);
 
+void handleOpenCodeGoCaGet(Webserver* webserver);
+void handleOpenCodeGoCaSet(Webserver* webserver);
+void handleOpenCodeGoCaDelete(Webserver* webserver);
+
 #endif  // API_H

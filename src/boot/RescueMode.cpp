@@ -85,10 +85,46 @@ static auto writeRtcBoot(const RtcBootData& data) -> bool {
 }
 
 /**
+ * @brief Whether the last reset was caused by a crash (not a flash/manual reset)
+ *
+ * ESP8266 复位原因区分：崩溃类（Exception / Fatal / Watchdog）才应计入启动循环；
+ * 刷机、手动复位、主动 ESP.restart() 属于正常操作，不应累加计数——否则连续刷几次
+ * 就会被误判为 boot loop 而进入救援模式。
+ */
+static auto isCrashResetReason() -> bool {
+    const String reason = ESP.getResetReason();  // NOLINT(readability-static-accessed-through-instance)
+    return reason.indexOf("Exception") >= 0 || reason.indexOf("Fatal") >= 0 ||
+           reason.indexOf("Watchdog") >= 0;
+}
+
+/**
+ * @brief Clear both crash counters (RTC + persistent)
+ */
+static void clearCrashCounters() {
+    RtcBootData data{};
+    data.magic = RTC_MAGIC;
+    data.crashCount = 0;
+    writeRtcBoot(data);
+
+    configManager.secure.put("rescue_persistent_crash_count", "0");
+    configManager.secure.put("rescue_last_boot_clean", "1");
+}
+
+/**
  * @brief Inspect RTC memory and increment crash counter.
  *        Returns true if boot loop is detected.
  */
 auto RescueMode::checkBootLoop() -> bool {
+    // 非崩溃类复位（刷机/手动复位/主动重启）视为正常启动：直接清零计数并放行
+    if (!isCrashResetReason()) {
+        clearCrashCounters();
+        Logger::info(("Clean boot (" + ESP.getResetReason() +
+                      "), rescue counters cleared")  // NOLINT(readability-static-accessed-through-instance)
+                         .c_str(),
+                     "RescueMode");
+        return false;
+    }
+
     RtcBootData data{};
 
     bool readOk = readRtcBoot(data);

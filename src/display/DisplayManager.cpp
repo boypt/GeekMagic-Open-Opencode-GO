@@ -210,13 +210,45 @@ static constexpr uint8_t ST7789_ADDR_END_LOW = 0xEF;
 auto DisplayManager::getGfx() -> Arduino_GFX* { return &g_lcd; }
 
 /**
+ * @brief Apply the LCD backlight brightness via PWM
+ *
+ * 旧工程语义：brightness 0..1023 越大越亮，背光为低电平点亮
+ * （LCD_BACKLIGHT_ACTIVE_LOW=true，等价 sd2 PWM_INVERTED：off=1023）。
+ * 这里对外统一用 0..100 百分比，duty = percent*1023/100，输出取反。
+ * percent==0 视为关断（off = 1023，低电平点亮时全灭）。
+ *
+ * @param percent Brightness percentage in range [0, 100]
+ *
+ * @return void
+ */
+void DisplayManager::setBacklight(uint8_t percent) {
+    if (percent > 100) {
+        percent = 100;
+    }
+
+    const uint8_t pin = static_cast<uint8_t>(LCD_BACKLIGHT_GPIO);
+    pinMode(pin, OUTPUT);
+    analogWriteRange(1023);
+    if (percent == 0) {
+        // 关断：反相语义下输出全高（=旧工程 PWM_INVERTED off）
+        analogWrite(pin, LCD_BACKLIGHT_ACTIVE_LOW ? 1023 : 0);
+    } else {
+        const uint32_t duty = (static_cast<uint32_t>(percent) * 1023U) / 100U;
+        analogWrite(pin, LCD_BACKLIGHT_ACTIVE_LOW ? static_cast<uint16_t>(1023U - duty) : static_cast<uint16_t>(duty));
+    }
+
+    Logger::info(("Backlight: " + String(percent) + "%").c_str(), "DisplayManager");
+}
+
+/**
  * @brief Turn the LCD backlight on
+ *
+ * 按配置亮度（lcd_brightness，1..100）点亮而非无条件全亮
  *
  * @return void
  */
 static inline void lcdBacklightOn() {
-    pinMode((uint8_t)LCD_BACKLIGHT_GPIO, OUTPUT);
-    digitalWrite((uint8_t)LCD_BACKLIGHT_GPIO, LCD_BACKLIGHT_ACTIVE_LOW ? LOW : HIGH);
+    DisplayManager::setBacklight(configManager.getLCDBrightness());
 }
 
 /**
@@ -238,6 +270,7 @@ static constexpr uint8_t LCD_MADCTL_MX = 0x40;
 static constexpr uint8_t LCD_MADCTL_MV = 0x20;
 static constexpr uint8_t LCD_MADCTL_MY = 0x80;
 static constexpr uint8_t LCD_MADCTL_RGB = 0x00;
+static constexpr uint8_t LCD_MADCTL_BGR = 0x08;
 
 /**
  * @brief Re-send MADCTL (0x36) with runtime-configurable mirror bits
@@ -266,6 +299,11 @@ static void lcdApplyMirrorMADCTL(uint8_t rotation) {
 
     uint8_t madctl = ROTATION_MADCTL[rotation & 0x07];
 
+    if (configManager.getLCDBgr()) {
+        // 旧 sd2（TFT_eSPI ST7789_2）在 240x240 下因 CGRAM_OFFSET 默认走 BGR（0x08），
+        // 关闭时保持 Arduino_GFX 默认 RGB 色序
+        madctl |= LCD_MADCTL_BGR;
+    }
     if (configManager.getLCDMirrorX()) {
         madctl |= LCD_MADCTL_MX;
     }
@@ -279,7 +317,8 @@ static void lcdApplyMirrorMADCTL(uint8_t rotation) {
     g_lcdBus.endWrite();
 
     Logger::info(("MADCTL applied: 0x" + String(madctl, HEX) + " mirror_x=" + (configManager.getLCDMirrorX() ? "1" : "0") +
-                  " mirror_y=" + (configManager.getLCDMirrorY() ? "1" : "0"))
+                  " mirror_y=" + (configManager.getLCDMirrorY() ? "1" : "0") +
+                  " bgr=" + (configManager.getLCDBgr() ? "1" : "0"))
                      .c_str(),
                  "DisplayManager");
 }
@@ -399,6 +438,68 @@ static void lcdRunVendorInit() {
 }
 
 /**
+ * @brief Run the legacy sd2 (TFT_eSPI ST7789_2) minimal initialization sequence
+ *
+ * 移植自旧工程 TFT_eSPI TFT_Drivers/ST7789_2_Init.h（commandList 内容逐条对应：
+ * 1/8/10/16/17 行），仅 SLPOUT/COLMOD/MADCTL/CASET/PASET/INVON/NORON/DISPON，
+ * 无 porch/电源/gamma 配置（面板保持上电默认值）。MADCTL 一律发 0x00，
+ * BGR 色序随后由 lcdApplyMirrorMADCTL() 按 lcd_bgr 配置接管。
+ *
+ * @return void
+ */
+static void lcdRunSd2Init() {
+    // ST7789_2_Defines.h / ST7789_2_Init.h 中的命令与常量
+    static constexpr uint8_t SD2_SLPOUT = 0x11;   // TFT_SLPOUT
+    static constexpr uint8_t SD2_COLMOD = 0x3A;   // TFT_COLMOD
+    static constexpr uint8_t SD2_MADCTL = 0x36;   // TFT_MADCTL
+    static constexpr uint8_t SD2_CASET = 0x2A;    // TFT_CASET
+    static constexpr uint8_t SD2_PASET = 0x2B;    // TFT_PASET
+    static constexpr uint8_t SD2_INVON = 0x21;    // TFT_INVON
+    static constexpr uint8_t SD2_NORON = 0x13;    // TFT_NORON
+    static constexpr uint8_t SD2_DISPON = 0x29;   // TFT_DISPON
+    static constexpr uint8_t SD2_COLMOD_16BPP = 0x55;
+    static constexpr uint8_t SD2_ADDR_240_START_HIGH = 0x00;
+    static constexpr uint8_t SD2_ADDR_240_START_LOW = 0x00;
+    static constexpr uint8_t SD2_ADDR_END_HIGH = 0x00;
+    static constexpr uint8_t SD2_ADDR_END_LOW = 0xF0;
+
+    g_lcdBus.beginWrite();
+
+    ST7789_WriteCommand(SD2_SLPOUT);
+    delay(ST7789_SLEEP_DELAY_MS);
+
+    ST7789_WriteCommand(SD2_COLMOD);
+    ST7789_WriteData(SD2_COLMOD_16BPP);
+    delay(10);
+
+    ST7789_WriteCommand(SD2_MADCTL);
+    ST7789_WriteData(0x00);
+
+    ST7789_WriteCommand(SD2_CASET);
+    ST7789_WriteData(SD2_ADDR_240_START_HIGH);
+    ST7789_WriteData(SD2_ADDR_240_START_LOW);
+    ST7789_WriteData(SD2_ADDR_END_HIGH);
+    ST7789_WriteData(SD2_ADDR_END_LOW);
+
+    ST7789_WriteCommand(SD2_PASET);
+    ST7789_WriteData(SD2_ADDR_240_START_HIGH);
+    ST7789_WriteData(SD2_ADDR_240_START_LOW);
+    ST7789_WriteData(SD2_ADDR_END_HIGH);
+    ST7789_WriteData(SD2_ADDR_END_LOW);
+
+    ST7789_WriteCommand(SD2_INVON);
+    delay(10);
+
+    ST7789_WriteCommand(SD2_NORON);
+    delay(10);
+
+    ST7789_WriteCommand(SD2_DISPON);
+    delay(255);
+
+    g_lcdBus.endWrite();
+}
+
+/**
  * @brief Perform a hardware reset of the LCD panel
  *
  * Toggles the RST GPIO if defined, with appropriate delays
@@ -432,7 +533,17 @@ static void lcdEnsureInit() {
     // ...strange that SPI_MODE0 will not work as the IC doesn't care about CLK's polarity
     g_lcdBus.begin((int32_t)LCD_SPI_HZ, (int8_t)LCD_SPI_MODE);
     lcdHardReset();
-    lcdRunVendorInit();
+
+    const bool useSd2Init = configManager.getLCDInitSd2();
+    if (useSd2Init) {
+        lcdRunSd2Init();
+    } else {
+        lcdRunVendorInit();
+    }
+    Logger::info(("Init profile: " + String(useSd2Init ? "sd2 (ST7789_2 minimal)" : "vendor") +
+                  " BGR=" + (configManager.getLCDBgr() ? "1" : "0"))
+                     .c_str(),
+                 "DisplayManager");
     delay(LCD_BEGIN_DELAY_MS);
 
     g_lcd.setRotation(rotation);
@@ -612,6 +723,21 @@ auto DisplayManager::setRotation(uint8_t rotation, String currentIP) -> void {
     DisplayManager::drawStartup(currentIP);
 
     Logger::info(("Rotation set to " + String(rotation)).c_str(), "DisplayManager");
+}
+
+/**
+ * @brief Re-run the LCD init sequence (profile) and MADCTL with current settings
+ *
+ * 用于 Web 切换 lcd_bgr / lcd_init_sd2 后立即生效：重新硬复位 + 按当前
+ * profile（厂商序列或旧 sd2 精简序列）初始化，再重发 MADCTL。
+ *
+ * @return void
+ */
+auto DisplayManager::applyPanelProfile() -> void {
+    lcdEnsureInit();
+
+    String currentIP = "unknown";
+    DisplayManager::drawStartup(currentIP);
 }
 
 /**

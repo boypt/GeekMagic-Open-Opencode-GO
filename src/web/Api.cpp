@@ -59,8 +59,9 @@ void handleDisplayRotationGet(Webserver* webserver);
 void handleDisplayRotationSet(Webserver* webserver);
 void handleDisplayMirrorGet(Webserver* webserver);
 void handleDisplayMirrorSet(Webserver* webserver);
+void handleDisplayBrightnessGet(Webserver* webserver);
+void handleDisplayBrightnessSet(Webserver* webserver);
 void handleDeleteGif(Webserver* webserver);
-
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr size_t NTP_CONFIG_DOC_SIZE = 512;
 static constexpr int BEARER_LEN = 7;
@@ -105,23 +106,32 @@ void registerApiEndpoints(Webserver* webserver) {
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/ntp/config", HTTP_POST, [webserver]() { handleNtpConfigSet(webserver); });
 
-    // @openapi {get} /display/rotation version=v1 group=Display summary="Get display rotation and mirror settings" requiresAuth=true
+    // @openapi {get} /display/rotation version=v1 group=Display summary="Get display rotation, mirror, color order and init profile settings" requiresAuth=true
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/display/rotation", HTTP_GET, [webserver]() { handleDisplayRotationGet(webserver); });
 
-    // @openapi {post} /display/rotation version=v1 group=Display summary="Set display rotation (optionally with mirror flags)" requiresAuth=true
-    // requestBody=application/json requestBodySchema=rotation:integer,lcd_mirror_x:boolean,lcd_mirror_y:boolean example={"rotation":4,"lcd_mirror_x":false,"lcd_mirror_y":false}
+    // @openapi {post} /display/rotation version=v1 group=Display summary="Set display rotation (optionally with mirror flags, BGR color order and init profile)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=rotation:integer,lcd_mirror_x:boolean,lcd_mirror_y:boolean,lcd_bgr:boolean,lcd_init_sd2:boolean example={"rotation":4,"lcd_mirror_x":false,"lcd_mirror_y":false,"lcd_bgr":false,"lcd_init_sd2":false}
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/display/rotation", HTTP_POST, [webserver]() { handleDisplayRotationSet(webserver); });
 
-    // @openapi {get} /display/mirror version=v1 group=Display summary="Get display mirror (MADCTL MX/MY) settings" requiresAuth=true
+    // @openapi {get} /display/mirror version=v1 group=Display summary="Get display mirror (MADCTL MX/MY), color order and init profile settings" requiresAuth=true
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/display/mirror", HTTP_GET, [webserver]() { handleDisplayMirrorGet(webserver); });
 
-    // @openapi {post} /display/mirror version=v1 group=Display summary="Set display mirror (MADCTL MX/MY) and apply immediately" requiresAuth=true
-    // requestBody=application/json requestBodySchema=lcd_mirror_x:boolean,lcd_mirror_y:boolean example={"lcd_mirror_x":true,"lcd_mirror_y":false}
+    // @openapi {post} /display/mirror version=v1 group=Display summary="Set display mirror (optionally with BGR color order and init profile) and apply immediately" requiresAuth=true
+    // requestBody=application/json requestBodySchema=lcd_mirror_x:boolean,lcd_mirror_y:boolean,lcd_bgr:boolean,lcd_init_sd2:boolean example={"lcd_mirror_x":true,"lcd_mirror_y":false,"lcd_bgr":false,"lcd_init_sd2":false}
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/display/mirror", HTTP_POST, [webserver]() { handleDisplayMirrorSet(webserver); });
+
+    // @openapi {get} /display/brightness version=v1 group=Display summary="Get LCD backlight brightness (percentage)" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/display/brightness", HTTP_GET, [webserver]() { handleDisplayBrightnessGet(webserver); });
+
+    // @openapi {post} /display/brightness version=v1 group=Display summary="Set LCD backlight brightness (percentage 1..100) and apply immediately" requiresAuth=true
+    // requestBody=application/json requestBodySchema=lcd_brightness:integer example={"lcd_brightness":78}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/display/brightness", HTTP_POST, [webserver]() { handleDisplayBrightnessSet(webserver); });
 
     // @openapi {post} /reboot version=v1 group=System summary="Reboot the device" requiresAuth=true
     // responses=200:application/json,401:application/json
@@ -870,6 +880,9 @@ void handleDisplayRotationGet(Webserver* webserver) {
     doc["rotation"] = configManager.getLCDRotationSafe();
     doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
     doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
+    doc["lcd_bgr"] = configManager.getLCDBgr();
+    doc["lcd_init_sd2"] = configManager.getLCDInitSd2();
+    doc["lcd_brightness"] = configManager.getLCDBrightness();
 
     String json;
     serializeJson(doc, json);
@@ -939,12 +952,20 @@ void handleDisplayRotationSet(Webserver* webserver) {
 
     auto newRotation = static_cast<uint8_t>(rotation);
 
-    // 可选镜像翻转参数：POST 体中带 lcd_mirror_x / lcd_mirror_y（bool）则一并持久化
+    // 可选镜像翻转/面板 profile 参数：POST 体中带 lcd_mirror_x / lcd_mirror_y /
+    // lcd_bgr / lcd_init_sd2（bool）则一并持久化
+    const bool oldInitSd2 = configManager.getLCDInitSd2();
     if (ddoc["lcd_mirror_x"].is<bool>()) {
         configManager.setLCDMirrorX(ddoc["lcd_mirror_x"].as<bool>());
     }
     if (ddoc["lcd_mirror_y"].is<bool>()) {
         configManager.setLCDMirrorY(ddoc["lcd_mirror_y"].as<bool>());
+    }
+    if (ddoc["lcd_bgr"].is<bool>()) {
+        configManager.setLCDBgr(ddoc["lcd_bgr"].as<bool>());
+    }
+    if (ddoc["lcd_init_sd2"].is<bool>()) {
+        configManager.setLCDInitSd2(ddoc["lcd_init_sd2"].as<bool>());
     }
 
     configManager.setLCDRotation(newRotation);
@@ -954,7 +975,12 @@ void handleDisplayRotationSet(Webserver* webserver) {
         currentIP = wifiManager->getIP().toString();
     }
 
-    DisplayManager::setRotation(newRotation, currentIP);
+    if (configManager.getLCDInitSd2() || oldInitSd2 != configManager.getLCDInitSd2()) {
+        // init profile 参与切换（或已处于 sd2 profile）时需完整重新初始化面板
+        DisplayManager::applyPanelProfile();
+    } else {
+        DisplayManager::setRotation(newRotation, currentIP);
+    }
 
     if (!configManager.save()) {
         JsonDocument doc;
@@ -975,6 +1001,9 @@ void handleDisplayRotationSet(Webserver* webserver) {
     doc["rotation"] = newRotation;
     doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
     doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
+    doc["lcd_bgr"] = configManager.getLCDBgr();
+    doc["lcd_init_sd2"] = configManager.getLCDInitSd2();
+    doc["lcd_brightness"] = configManager.getLCDBrightness();
 
     String json;
     serializeJson(doc, json);
@@ -982,7 +1011,11 @@ void handleDisplayRotationSet(Webserver* webserver) {
     setCorsHeaders(webserver);
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 
-    Logger::info(("Display rotation updated to " + String(newRotation)).c_str(), "API");
+    Logger::info(("Display rotation updated to " + String(newRotation) +
+                  " BGR=" + (configManager.getLCDBgr() ? "1" : "0") +
+                  " init=" + (configManager.getLCDInitSd2() ? "sd2" : "vendor"))
+                     .c_str(),
+                 "API");
 }
 
 /**
@@ -996,6 +1029,8 @@ void handleDisplayMirrorGet(Webserver* webserver) {
     JsonDocument doc;
     doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
     doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
+    doc["lcd_bgr"] = configManager.getLCDBgr();
+    doc["lcd_init_sd2"] = configManager.getLCDInitSd2();
 
     String json;
     serializeJson(doc, json);
@@ -1051,13 +1086,26 @@ void handleDisplayMirrorSet(Webserver* webserver) {
         configManager.setLCDMirrorY(ddoc["lcd_mirror_y"].as<bool>());
     }
 
-    // 立刻应用：重设 rotation（内部重发 MADCTL 并按镜像位翻转）
+    // 可选面板 profile 参数：POST 体中带 lcd_bgr / lcd_init_sd2（bool）则一并处理
+    const bool oldInitSd2 = configManager.getLCDInitSd2();
+    if (ddoc["lcd_bgr"].is<bool>()) {
+        configManager.setLCDBgr(ddoc["lcd_bgr"].as<bool>());
+    }
+    if (ddoc["lcd_init_sd2"].is<bool>()) {
+        configManager.setLCDInitSd2(ddoc["lcd_init_sd2"].as<bool>());
+    }
+
+    // 立刻应用：init profile 变化需完整重新初始化，否则仅重发 MADCTL
     String currentIP = "unknown";
     if (wifiManager != nullptr) {
         currentIP = wifiManager->getIP().toString();
     }
 
-    DisplayManager::setRotation(configManager.getLCDRotationSafe(), currentIP);
+    if (configManager.getLCDInitSd2() || oldInitSd2 != configManager.getLCDInitSd2()) {
+        DisplayManager::applyPanelProfile();
+    } else {
+        DisplayManager::setRotation(configManager.getLCDRotationSafe(), currentIP);
+    }
 
     if (!configManager.save()) {
         JsonDocument doc;
@@ -1077,6 +1125,9 @@ void handleDisplayMirrorSet(Webserver* webserver) {
     doc["status"] = "ok";
     doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
     doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
+    doc["lcd_bgr"] = configManager.getLCDBgr();
+    doc["lcd_init_sd2"] = configManager.getLCDInitSd2();
+    doc["lcd_brightness"] = configManager.getLCDBrightness();
 
     String json;
     serializeJson(doc, json);
@@ -1085,9 +1136,116 @@ void handleDisplayMirrorSet(Webserver* webserver) {
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 
     Logger::info(("Display mirror updated: x=" + String(configManager.getLCDMirrorX() ? "1" : "0") +
-                  " y=" + String(configManager.getLCDMirrorY() ? "1" : "0"))
+                  " y=" + String(configManager.getLCDMirrorY() ? "1" : "0") +
+                  " BGR=" + (configManager.getLCDBgr() ? "1" : "0") +
+                  " init=" + (configManager.getLCDInitSd2() ? "sd2" : "vendor"))
                      .c_str(),
                  "API");
+}
+
+/**
+ * @brief Get LCD backlight brightness configuration
+ */
+void handleDisplayBrightnessGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["lcd_brightness"] = configManager.getLCDBrightness();
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Set LCD backlight brightness configuration and apply immediately
+ */
+void handleDisplayBrightnessSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Missing JSON body";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    String body = webserver->raw().arg("plain");
+    JsonDocument ddoc;
+    DeserializationError err = deserializeJson(ddoc, body);
+
+    if (err || !ddoc["lcd_brightness"].is<int>()) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Invalid JSON or missing lcd_brightness";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    const int brightness = ddoc["lcd_brightness"].as<int>();
+    if (brightness < 1 || brightness > 100) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "lcd_brightness must be between 1 and 100";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    configManager.setLCDBrightness(brightness);
+
+    // 立即应用新亮度
+    DisplayManager::setBacklight(configManager.getLCDBrightness());
+
+    if (!configManager.save()) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Failed to save config";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+
+        return;
+    }
+
+    JsonDocument doc;
+    doc["status"] = "ok";
+    doc["lcd_brightness"] = configManager.getLCDBrightness();
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+
+    Logger::info(("Display brightness updated to " + String(configManager.getLCDBrightness()) + "%").c_str(), "API");
 }
 
 /**

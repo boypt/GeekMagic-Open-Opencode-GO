@@ -37,7 +37,9 @@ class DisplayManager {
    public:
     static void begin();
     static void setRotation(uint8_t rotation, String currentIP);
+    static void setBacklight(uint8_t percent);
     static Arduino_GFX* getGfx();
+    static void applyPanelProfile();
     static void drawStartup(String currentIP);
     static void drawTextWrapped(int16_t xPos, int16_t yPos, const String& text, uint8_t textSize, uint16_t fgColor,
                                 uint16_t bgColor, bool clearBg);

@@ -72,6 +72,57 @@
           >
         </fieldset>
 
+        <fieldset>
+          <legend>Panel Color / Init</legend>
+          <label for="lcd-bgr">
+            <input
+              type="checkbox"
+              id="lcd-bgr"
+              role="switch"
+              x-model="lcdBgr"
+              x-bind:disabled="loading"
+            />
+            BGR color order (MADCTL 0x08, legacy sd2 default)
+          </label>
+          <label for="lcd-init-sd2">
+            <input
+              type="checkbox"
+              id="lcd-init-sd2"
+              role="switch"
+              x-model="lcdInitSd2"
+              x-bind:disabled="loading"
+            />
+            Legacy sd2 init sequence (ST7789_2 minimal)
+          </label>
+          <small
+            >Toggle these to A/B test color tint against the old sd2 firmware:
+            BGR swaps red/blue, the sd2 init skips vendor gamma/power
+            tuning.</small
+          >
+        </fieldset>
+
+        <fieldset>
+          <legend>Backlight</legend>
+          <label for="lcd-brightness">
+            Brightness: <span x-text="lcdBrightness"></span>%
+            <input
+              type="range"
+              id="lcd-brightness"
+              min="1"
+              max="100"
+              step="1"
+              x-model.number="lcdBrightness"
+              @input="previewBrightness()"
+              @change="saveBrightness()"
+              x-bind:disabled="loading"
+            />
+          </label>
+          <small
+            >Drag to preview, release to save. Applied instantly via PWM
+            (saved across reboots).</small
+          >
+        </fieldset>
+
         <div
           style="margin-top: 0.5em; display: flex; gap: 0.5em; flex-wrap: wrap"
         >
@@ -89,6 +140,13 @@
             x-bind:disabled="loading"
           >
             Save Mirror
+          </button>
+          <button
+            type="button"
+            @click="savePanel()"
+            x-bind:disabled="loading"
+          >
+            Save Panel Color / Init
           </button>
           <button
             type="button"

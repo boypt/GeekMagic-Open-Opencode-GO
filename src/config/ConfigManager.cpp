@@ -74,6 +74,11 @@ auto ConfigManager::load() -> bool {
     this->lcd_rotation = doc["lcd_rotation"] | lcd_rotation;
     this->lcd_mirror_x = doc["lcd_mirror_x"] | lcd_mirror_x;
     this->lcd_mirror_y = doc["lcd_mirror_y"] | lcd_mirror_y;
+    this->lcd_bgr = doc["lcd_bgr"] | lcd_bgr;
+    this->lcd_init_sd2 = doc["lcd_init_sd2"] | lcd_init_sd2;
+    // 用 setter 统一钳制到 1..100；缺失时保持默认值 78
+    const int lcd_brightness_cfg = doc["lcd_brightness"] | (int)lcd_brightness;
+    this->setLCDBrightness(lcd_brightness_cfg);
 
     String nvs_ssid = secure.get("wifi_ssid", "");
     String nvs_password = secure.get("wifi_password", "");
@@ -237,6 +242,9 @@ auto ConfigManager::save() -> bool {
     doc["lcd_rotation"] = lcd_rotation;
     doc["lcd_mirror_x"] = lcd_mirror_x;
     doc["lcd_mirror_y"] = lcd_mirror_y;
+    doc["lcd_bgr"] = lcd_bgr;
+    doc["lcd_init_sd2"] = lcd_init_sd2;
+    doc["lcd_brightness"] = lcd_brightness;
     if (!this->ntp_server.empty()) {
         doc["ntp_server"] = this->ntp_server.c_str();
     }

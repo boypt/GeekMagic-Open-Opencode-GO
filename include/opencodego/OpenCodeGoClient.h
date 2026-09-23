@@ -13,6 +13,17 @@
 #include <Esp.h>
 
 #include "opencodego/cert.h"
+#include "web/Webserver.h"
+
+// main.cpp 的全局 webserver：退避等待分片里 pump 一下，让 API 在
+// 用量拉取（TLS 重试退避最长约 65s）期间仍可响应，不再整体阻塞
+extern Webserver* webserver;
+
+static inline void fetchPumpWebserver() {
+    if (webserver != nullptr) {
+        webserver->handleClient();
+    }
+}
 
 struct OpenCodeGoWindow {
     bool present = false;  // usage.<key> 是否存在
@@ -279,6 +290,7 @@ inline bool fetchOpenCodeGoUsage(OpenCodeGoUsage& out, const char* host, const c
                     Serial.printf("Retry in %lu ms\n", static_cast<unsigned long>(wait_ms));
                     for (uint32_t waited = 0; waited < wait_ms; waited += 200) {
                         yield();
+                        fetchPumpWebserver();
                         delay(200);
                         if (WiFi.status() != WL_CONNECTED) break;
                     }
@@ -303,9 +315,11 @@ inline bool fetchOpenCodeGoUsage(OpenCodeGoUsage& out, const char* host, const c
             if (wait_ms > 30000) wait_ms = 30000;
             wait_ms += random(0, 1000);
             Serial.printf("Retry in %lu ms\n", static_cast<unsigned long>(wait_ms));
-            // 分片等待：每 200ms 一片 yield()，片间检查 WiFi，掉线提前跳出
+            // 分片等待：每 200ms 一片 yield()，片间 pump webserver（API 保持响应）
+            // 并检查 WiFi，掉线提前跳出
             for (uint32_t waited = 0; waited < wait_ms; waited += 200) {
                 yield();
+                fetchPumpWebserver();
                 delay(200);
                 if (WiFi.status() != WL_CONNECTED) break;
             }

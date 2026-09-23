@@ -1,6 +1,10 @@
 function rotationHandler() {
   return {
     loading: false,
+    loadingRotation: false,
+    loadingMirror: false,
+    loadingPanel: false,
+    loadingBrightness: false,
     rotation: 0,
     mirrorX: false,
     mirrorY: false,
@@ -8,8 +12,13 @@ function rotationHandler() {
     lcdInitSd2: false,
     lcdBrightness: 78,
     statusMsg: "",
+    statusRotation: "",
+    statusMirror: "",
+    statusPanel: "",
+    statusBrightness: "",
 
-    fetchRotation() {
+    // 一次拉全部显示设置（GET /display/rotation 返回全部字段）
+    fetchAll(manual) {
       this.loading = true;
       apiFetch("/api/v1/display/rotation")
         .then((r) => r.json())
@@ -22,10 +31,10 @@ function rotationHandler() {
           if (Number.isFinite(data.lcd_brightness)) {
             this.lcdBrightness = Math.min(100, Math.max(1, data.lcd_brightness));
           }
-          this.statusMsg = "";
+          this.statusMsg = manual ? "Settings refreshed" : "";
         })
         .catch((err) => {
-          this.statusMsg = "Failed to load rotation";
+          this.statusMsg = "Failed to load display settings";
           console.error(err);
         })
         .finally(() => {
@@ -33,15 +42,11 @@ function rotationHandler() {
         });
     },
 
+    // 每个区域的保存按钮只提交自己区域的字段（API 支持部分更新）
     saveRotation() {
-      this.loading = true;
-      const payload = {
-        rotation: Number(this.rotation),
-        lcd_mirror_x: this.mirrorX === true,
-        lcd_mirror_y: this.mirrorY === true,
-        lcd_bgr: this.lcdBgr === true,
-        lcd_init_sd2: this.lcdInitSd2 === true,
-      };
+      this.loadingRotation = true;
+      this.statusRotation = "";
+      const payload = { rotation: Number(this.rotation) };
 
       apiFetch("/api/v1/display/rotation", {
         method: "POST",
@@ -54,26 +59,23 @@ function rotationHandler() {
             this.rotation = Number.isInteger(data.rotation)
               ? data.rotation
               : payload.rotation;
-            this.mirrorX = data.lcd_mirror_x === true;
-            this.mirrorY = data.lcd_mirror_y === true;
-            this.lcdBgr = data.lcd_bgr === true;
-            this.lcdInitSd2 = data.lcd_init_sd2 === true;
-            this.statusMsg = "Rotation updated";
+            this.statusRotation = "Rotation saved";
           } else {
-            this.statusMsg = data.message || "Failed to save rotation";
+            this.statusRotation = data.message || "Failed to save rotation";
           }
         })
         .catch((err) => {
-          this.statusMsg = "Failed to save rotation";
+          this.statusRotation = "Failed to save rotation";
           console.error(err);
         })
         .finally(() => {
-          this.loading = false;
+          this.loadingRotation = false;
         });
     },
 
     saveMirror() {
-      this.loading = true;
+      this.loadingMirror = true;
+      this.statusMirror = "";
       const payload = {
         lcd_mirror_x: this.mirrorX === true,
         lcd_mirror_y: this.mirrorY === true,
@@ -89,27 +91,29 @@ function rotationHandler() {
           if (data.status === "ok") {
             this.mirrorX = data.lcd_mirror_x === true;
             this.mirrorY = data.lcd_mirror_y === true;
-            this.statusMsg = "Mirror updated";
+            this.statusMirror = "Mirror saved";
           } else {
-            this.statusMsg = data.message || "Failed to save mirror";
+            this.statusMirror = data.message || "Failed to save mirror";
           }
         })
         .catch((err) => {
-          this.statusMsg = "Failed to save mirror";
+          this.statusMirror = "Failed to save mirror";
           console.error(err);
         })
         .finally(() => {
-          this.loading = false;
+          this.loadingMirror = false;
         });
     },
 
     savePanel() {
-      this.loading = true;
+      this.loadingPanel = true;
+      this.statusPanel = "";
       const payload = {
         lcd_bgr: this.lcdBgr === true,
         lcd_init_sd2: this.lcdInitSd2 === true,
       };
 
+      // /display/mirror 端点接受 panel profile 字段的部分更新
       apiFetch("/api/v1/display/mirror", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -120,22 +124,24 @@ function rotationHandler() {
           if (data.status === "ok") {
             this.lcdBgr = data.lcd_bgr === true;
             this.lcdInitSd2 = data.lcd_init_sd2 === true;
-            this.statusMsg = "Panel color/init updated";
+            this.statusPanel = "Panel color/init saved";
           } else {
-            this.statusMsg = data.message || "Failed to save panel settings";
+            this.statusPanel = data.message || "Failed to save panel settings";
           }
         })
         .catch((err) => {
-          this.statusMsg = "Failed to save panel settings";
+          this.statusPanel = "Failed to save panel settings";
           console.error(err);
         })
         .finally(() => {
-          this.loading = false;
+          this.loadingPanel = false;
         });
     },
 
+    // 松手即保存并生效（PWM）
     saveBrightness() {
-      this.loading = true;
+      this.loadingBrightness = true;
+      this.statusBrightness = "";
       const payload = {
         lcd_brightness: Math.min(100, Math.max(1, Number(this.lcdBrightness) || 78)),
       };
@@ -149,17 +155,17 @@ function rotationHandler() {
         .then((data) => {
           if (data.status === "ok") {
             this.lcdBrightness = data.lcd_brightness;
-            this.statusMsg = "Brightness updated";
+            this.statusBrightness = "Brightness saved";
           } else {
-            this.statusMsg = data.message || "Failed to save brightness";
+            this.statusBrightness = data.message || "Failed to save brightness";
           }
         })
         .catch((err) => {
-          this.statusMsg = "Failed to save brightness";
+          this.statusBrightness = "Failed to save brightness";
           console.error(err);
         })
         .finally(() => {
-          this.loading = false;
+          this.loadingBrightness = false;
         });
     },
 
@@ -169,7 +175,7 @@ function rotationHandler() {
     },
 
     init() {
-      this.fetchRotation();
+      this.fetchAll(false);
     },
   };
 }

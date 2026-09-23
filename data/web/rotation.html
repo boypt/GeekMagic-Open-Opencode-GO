@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Screen Rotation</title>
+    <title>Display Settings</title>
     <link rel="stylesheet" href="./css/pico.min.css" />
     <link rel="stylesheet" href="./css/style.css" />
     <script src="./js/alpinejs.min.js" defer></script>
@@ -19,30 +19,58 @@
       <a href="./index.html" class="wifi-back-link">← Back to Home</a>
 
       <section x-data="rotationHandler()" x-init="init()">
-        <h2>Display Rotation</h2>
+        <h2>Display Settings</h2>
 
-        <p>Choose a display orientation and apply it immediately.</p>
+        <p>
+          Orientation, mirroring, panel color order / init sequence and
+          backlight. Each block saves on its own — press its Save button
+          (backlight saves when you release the slider).
+        </p>
 
-        <label for="screen-rotation">Rotation</label>
-        <select
-          id="screen-rotation"
-          x-model.number="rotation"
-          x-bind:disabled="loading"
+        <div
+          style="display: flex; gap: 0.5em; align-items: center; flex-wrap: wrap"
         >
-          <option value="0">Portrait (mode 0)</option>
-          <option value="1">Landscape right (mode 1)</option>
-          <option value="2">Upside down (mode 2)</option>
-          <option value="3">Landscape left (mode 3)</option>
-          <option value="4">Portrait mirrored (mode 4)</option>
-          <option value="5">Landscape right mirrored (mode 5)</option>
-          <option value="6">Upside down mirrored (mode 6)</option>
-          <option value="7">Landscape left mirrored (mode 7)</option>
-        </select>
+          <button type="button" @click="fetchAll(true)" x-bind:disabled="loading">
+            Refresh All
+          </button>
+          <small x-text="statusMsg"></small>
+        </div>
 
-        <small
-          >Modes 4 to 7 are mirrored variants supported by the display
-          driver.</small
-        >
+        <fieldset>
+          <legend>Rotation</legend>
+          <label for="screen-rotation">Rotation</label>
+          <select
+            id="screen-rotation"
+            x-model.number="rotation"
+            x-bind:disabled="loading || loadingRotation"
+          >
+            <option value="0">Portrait (mode 0)</option>
+            <option value="1">Landscape right (mode 1)</option>
+            <option value="2">Upside down (mode 2)</option>
+            <option value="3">Landscape left (mode 3)</option>
+            <option value="4">Portrait mirrored (mode 4)</option>
+            <option value="5">Landscape right mirrored (mode 5)</option>
+            <option value="6">Upside down mirrored (mode 6)</option>
+            <option value="7">Landscape left mirrored (mode 7)</option>
+          </select>
+
+          <small
+            >Modes 4 to 7 are mirrored variants supported by the display
+            driver.</small
+          >
+
+          <div style="margin-top: 0.5em">
+            <button
+              type="button"
+              class="primary"
+              @click="saveRotation()"
+              x-bind:disabled="loading || loadingRotation"
+            >
+              Save Rotation
+            </button>
+            <small x-text="statusRotation"></small>
+          </div>
+        </fieldset>
 
         <fieldset>
           <legend>Mirror</legend>
@@ -52,7 +80,7 @@
               id="lcd-mirror-x"
               role="switch"
               x-model="mirrorX"
-              x-bind:disabled="loading"
+              x-bind:disabled="loading || loadingMirror"
             />
             Mirror horizontally (MADCTL MX)
           </label>
@@ -62,7 +90,7 @@
               id="lcd-mirror-y"
               role="switch"
               x-model="mirrorY"
-              x-bind:disabled="loading"
+              x-bind:disabled="loading || loadingMirror"
             />
             Mirror vertically (MADCTL MY)
           </label>
@@ -70,6 +98,18 @@
             >Use these when text appears mirrored or upside down even after
             choosing a rotation mode.</small
           >
+
+          <div style="margin-top: 0.5em">
+            <button
+              type="button"
+              class="primary"
+              @click="saveMirror()"
+              x-bind:disabled="loading || loadingMirror"
+            >
+              Save Mirror
+            </button>
+            <small x-text="statusMirror"></small>
+          </div>
         </fieldset>
 
         <fieldset>
@@ -80,7 +120,7 @@
               id="lcd-bgr"
               role="switch"
               x-model="lcdBgr"
-              x-bind:disabled="loading"
+              x-bind:disabled="loading || loadingPanel"
             />
             BGR color order (MADCTL 0x08, legacy sd2 default)
           </label>
@@ -90,7 +130,7 @@
               id="lcd-init-sd2"
               role="switch"
               x-model="lcdInitSd2"
-              x-bind:disabled="loading"
+              x-bind:disabled="loading || loadingPanel"
             />
             Legacy sd2 init sequence (ST7789_2 minimal)
           </label>
@@ -99,6 +139,18 @@
             BGR swaps red/blue, the sd2 init skips vendor gamma/power
             tuning.</small
           >
+
+          <div style="margin-top: 0.5em">
+            <button
+              type="button"
+              class="primary"
+              @click="savePanel()"
+              x-bind:disabled="loading || loadingPanel"
+            >
+              Save Panel Color / Init
+            </button>
+            <small x-text="statusPanel"></small>
+          </div>
         </fieldset>
 
         <fieldset>
@@ -114,50 +166,17 @@
               x-model.number="lcdBrightness"
               @input="previewBrightness()"
               @change="saveBrightness()"
-              x-bind:disabled="loading"
+              x-bind:disabled="loading || loadingBrightness"
             />
           </label>
           <small
-            >Drag to preview, release to save. Applied instantly via PWM
-            (saved across reboots).</small
+            >Drag to preview, release to save and apply instantly via PWM
+            (kept across reboots).</small
           >
+          <div style="margin-top: 0.5em">
+            <small x-text="statusBrightness"></small>
+          </div>
         </fieldset>
-
-        <div
-          style="margin-top: 0.5em; display: flex; gap: 0.5em; flex-wrap: wrap"
-        >
-          <button
-            type="button"
-            class="primary"
-            @click="saveRotation()"
-            x-bind:disabled="loading"
-          >
-            Save Rotation
-          </button>
-          <button
-            type="button"
-            @click="saveMirror()"
-            x-bind:disabled="loading"
-          >
-            Save Mirror
-          </button>
-          <button
-            type="button"
-            @click="savePanel()"
-            x-bind:disabled="loading"
-          >
-            Save Panel Color / Init
-          </button>
-          <button
-            type="button"
-            @click="fetchRotation()"
-            x-bind:disabled="loading"
-          >
-            Refresh
-          </button>
-        </div>
-
-        <p x-text="statusMsg"></p>
       </section>
 
       <footer id="footer-placeholder"></footer>

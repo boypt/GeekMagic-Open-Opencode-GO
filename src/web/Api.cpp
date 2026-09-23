@@ -1065,10 +1065,15 @@ void handleDisplayMirrorSet(Webserver* webserver) {
     JsonDocument ddoc;
     DeserializationError err = deserializeJson(ddoc, body);
 
-    if (err || !(ddoc["lcd_mirror_x"].is<bool>() || ddoc["lcd_mirror_y"].is<bool>())) {
+    // 允许部分更新：mirror 与 panel profile 字段任一存在即可，
+    // 避免前端只提交 lcd_bgr/lcd_init_sd2 时被误判为非法请求。
+    const bool hasMirrorField = ddoc["lcd_mirror_x"].is<bool>() || ddoc["lcd_mirror_y"].is<bool>();
+    const bool hasProfileField = ddoc["lcd_bgr"].is<bool>() || ddoc["lcd_init_sd2"].is<bool>();
+
+    if (err || (!hasMirrorField && !hasProfileField)) {
         JsonDocument doc;
         doc["status"] = "error";
-        doc["message"] = "Invalid JSON or missing lcd_mirror_x/lcd_mirror_y";
+        doc["message"] = "Invalid JSON or missing display settings (lcd_mirror_x/lcd_mirror_y/lcd_bgr/lcd_init_sd2)";
 
         String json;
         serializeJson(doc, json);

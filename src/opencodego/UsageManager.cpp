@@ -195,11 +195,23 @@ static int textWidth(const String& s) {
     return static_cast<int>(u8g2().getUTF8Width(s.c_str()));
 }
 
-// logo 位图恢复 16bpp 原始位图（23 色保真，无 4bpp 调色板量化偏色），
-// 按 TFT_eSPI pushImage 字节序预交换，此处还原为标准 RGB565；
-// 0x0000 为透明色，只绘制字标像素。位置/尺寸/逐点绘制路径不变。
-// 位图存 flash(.irom.text.progmem，~11.4KB、0 RAM)，读取走 pgm_read_word
-// （32-bit 访问，见 IromAccess.h）。
+// logo 位图恢复 16bpp 原始位图（23 色保真），按 TFT_eSPI pushImage 字节序
+// 预交换，此处还原为标准 RGB565；0x0000 为透明色，只绘制字标像素。
+// 位置/尺寸/逐点绘制路径不变；位图存 flash(.irom.text.progmem，~11.4KB、
+// 0 RAM)，读取走 pgm_read_word（32-bit 访问，见 IromAccess.h）。
+// 【字节序证据】TFT_eSPI 中：
+//  - Processors/TFT_eSPI_ESP8266.c: pushPixels(const void*) 直接
+//    spi.writePattern(data,...) 原样发字节、不做交换；而 tft_Write_16(C)
+//    定义为 (C)<<8|(C)>>8 内部交换（TFT_eSPI_ESP8266.h:161）；
+//  - TFT_eSPI.cpp pushImage(PROGMEM data, transp)：buffer[] = pgm_read_word
+//    原值不经交换交给 pushPixels → 表内字节序即 SPI 发送序（高字节次序由
+//    表内容决定）→ oc_logo 表为「预交换（大端）」字节序，非真实 RGB565；
+//  - 本工程 Arduino_GFX 期望真实 RGB565，故绘制前须 (c<<8)|(c>>8) 还原，
+//    与旧固件颜色一致【交换必须在判透明之前还原？见下】——透明判定：
+//    旧代码 `if (!_swapBytes) transp = transp>>8|transp<<8;` 后比较的是
+//    表内原始值 vs 交换后的 transp（0x0000 交换不变）→ 即按表内原始值判 0；
+//    新代码 (c==0) 先判再交换，语义一致。旧工程未调用 setSwapBytes（全仓
+//    grep 无），_swapBytes 默认 false（TFT_eSPI.cpp:463）。
 static void drawLogo(int x, int y) {
     auto* gfx = DisplayManager::getGfx();
     for (int j = 0; j < OC_LOGO_H; j++) {
@@ -216,91 +228,56 @@ static void drawLogo(int x, int y) {
     }
 }
 
-// ---------- 七段数码管大字（还原旧工程 TFT_eSPI Font 7 观感）----------
-// 几何：数字格 32x48（同旧 Font 7 数字字宽/字高），段厚 6px、段间隙 2px、
-// 段端 45° 斜切（bevel 4px），与 48px 高度比例贴近真实数码管：
-//  - 横段 a/g/d：盒 y 0..5 / 21..26 / 42..47（各自中线 y+2 / y+23 / y+44），
-//    尖端 x 3..28，斜切 4px 后矩形段 x 7..24；
-//  - 竖段 f/b（上）/ e/c（下）：左右列 x 0..5 / 26..31，上段尖 y 8..18、
-//    下段尖 y 28..39（与横段各留 2px 间隙）；
-//  位序 a b c d e f g；熄灭段不绘制（保持暗底，同旧工程）；
-//  '-' 只画 g 段（未同步显示 "--"）；':' 以中缝分隔线表达，不在此绘制。
-//  位表存 flash，读取走 pgm_read_word（IROM 32-bit 访问约束，见 IromAccess.h），
-//  不占 RAM。
-static const uint16_t kSegFont[13] PROGMEM = {
-    0b1111110,  // 0
-    0b0110000,  // 1
-    0b1101101,  // 2
-    0b1111001,  // 3
-    0b0110011,  // 4
-    0b1011011,  // 5
-    0b1011111,  // 6
-    0b1110000,  // 7
-    0b1111111,  // 8
-    0b1111011,  // 9
-    0, 0,       // 保留
-    0b0000001,  // '-'
-};
+// ---------- 七段数码管大字（像素级复刻旧工程 TFT_eSPI Font 7）----------
+// 字模见 include/opencodego/SegFont7.h：由 TFT_eSPI Font7srle.c 的 8-bit RLE
+// 原始字模按 drawChar() 同款算法逐像素解码的 1bpp 行位图（32x48/字符，
+// MSB 左），渲染逐像素与旧固件一致。数字格 32x48，'-' 占满 32px 宽
+// （同旧固件字宽表 widtbl_f7s），'-' 前备用的 ':' 实际 12px 宽。
+// 渲染：每行把连续置位段合并为 drawFastHLine（等价旧固件 textsize=1 的
+// fillRect 行内 run 绘制），只画字不填底；颜色 C_WHITE。
+// 表存 flash，读取走 pgm_read_dword（IROM 32-bit 访问约束，见 IromAccess.h）。
 
-// 横段：中线 yMid（相对数字顶部），尖端 xTipL..xTipR，厚 6px + 4px 斜切端
-static void segHoriz(int ox, int oy, int yMid, uint16_t color) {
-    constexpr int TIP_L = 3, TIP_R = 28, BEV = 4;
-    auto* gfx = DisplayManager::getGfx();
-    const int ymid = oy + yMid;
-    const int xl = ox + TIP_L + BEV, xr = ox + TIP_R - BEV;
-    gfx->fillRect(static_cast<int16_t>(xl), static_cast<int16_t>(ymid - 2),
-                  static_cast<int16_t>(xr - xl + 1), 6, color);
-    gfx->fillTriangle(static_cast<int16_t>(ox + TIP_L), static_cast<int16_t>(ymid),
-                      static_cast<int16_t>(xl), static_cast<int16_t>(ymid - 2),
-                      static_cast<int16_t>(xl), static_cast<int16_t>(ymid + 3), color);
-    gfx->fillTriangle(static_cast<int16_t>(ox + TIP_R), static_cast<int16_t>(ymid),
-                      static_cast<int16_t>(xr), static_cast<int16_t>(ymid - 2),
-                      static_cast<int16_t>(xr), static_cast<int16_t>(ymid + 3), color);
-}
+#include "opencodego/SegFont7.h"
 
-// 竖段：左右列 x 0..5（cxBase=0）/ 26..31（cxBase=26），尖端 yTipTop..yTipBot
-static void segVert(int ox, int oy, int cxBase, int yTipTop, int yTipBot,
-                    uint16_t color) {
-    constexpr int BEV = 4;
-    auto* gfx = DisplayManager::getGfx();
-    const int xL = ox + cxBase, xR = xL + 5, xm = xL + 3;
-    const int yt = oy + yTipTop + BEV, yb = oy + yTipBot - BEV;
-    gfx->fillRect(static_cast<int16_t>(xL), static_cast<int16_t>(yt), 6,
-                  static_cast<int16_t>(yb - yt + 1), color);
-    gfx->fillTriangle(static_cast<int16_t>(xm), static_cast<int16_t>(oy + yTipTop),
-                      static_cast<int16_t>(xL), static_cast<int16_t>(yt),
-                      static_cast<int16_t>(xR), static_cast<int16_t>(yt), color);
-    gfx->fillTriangle(static_cast<int16_t>(xm), static_cast<int16_t>(oy + yTipBot),
-                      static_cast<int16_t>(xL), static_cast<int16_t>(yb),
-                      static_cast<int16_t>(xR), static_cast<int16_t>(yb), color);
-}
-
-// 单个数字字符（'0'-'9' / '-'），数字格 32x48，左上角 (x, y)
+// 单个数字字符（'0'-'9' / '-' / ':'，':' 宽 12 其余 32），左上角 (x, y)
 static void drawSegDigit(int x, int y, char ch, uint16_t color) {
-    uint16_t bits;
+    int idx;
     if (ch >= '0' && ch <= '9') {
-        bits = static_cast<uint16_t>(pgm_read_word(&kSegFont[ch - '0']));
+        idx = ch - '0';
     } else if (ch == '-') {
-        bits = static_cast<uint16_t>(pgm_read_word(&kSegFont[12]));
+        idx = SEG7_DASH;
+    } else if (ch == ':') {
+        idx = SEG7_COLON;  // ':' 仅 12px 宽（备用；时钟项目中缝线已表达分隔）
     } else {
-        return;  // ':' 等由中缝分隔线表达，不画（同旧工程）
+        return;
     }
-    if (bits & 0x40) segHoriz(x, y, 2, color);    // a
-    if (bits & 0x20) segVert(x, y, 26, 8, 18, color);   // b
-    if (bits & 0x10) segVert(x, y, 26, 28, 39, color);  // c
-    if (bits & 0x08) segHoriz(x, y, 44, color);   // d
-    if (bits & 0x04) segVert(x, y, 0, 28, 39, color);   // e
-    if (bits & 0x02) segVert(x, y, 0, 8, 18, color);    // f
-    if (bits & 0x01) segHoriz(x, y, 23, color);   // g
+    auto* gfx = DisplayManager::getGfx();
+    for (int row = 0; row < SEG7_H; row++) {
+        uint32_t bits = pgm_read_dword(&kSeg7Font[idx][row]);
+        if (bits == 0) continue;
+        int k = 0;
+        while (k < SEG7_W) {
+            if (!(bits & (1u << (31 - k)))) {
+                k++;
+                continue;
+            }
+            int run = 0;
+            while (k + run < SEG7_W && (bits & (1u << (31 - (k + run))))) run++;
+            gfx->drawFastHLine(static_cast<int16_t>(x + k),
+                               static_cast<int16_t>(y + row),
+                               static_cast<int16_t>(run), color);
+            k += run;
+        }
+    }
 }
 
-// 七段大字：与旧 drawSegText 一致，每字符宽 32，按中心 cx 水平居中
+// 七段大字：与旧 drawSegText 一致，每字符宽 32（':' 宽 12），按中心 cx 居中
 static void drawSegText(int cx, int topY, const String& s, uint16_t color) {
     const int total = static_cast<int>(s.length()) * 32;
     int x = cx - total / 2;
     for (unsigned i = 0; i < s.length(); i++) {
         drawSegDigit(x, topY, s[i], color);
-        x += 32;
+        x += (s[i] == ':') ? 12 : 32;
     }
 }
 

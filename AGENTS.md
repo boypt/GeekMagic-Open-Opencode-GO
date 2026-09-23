@@ -99,7 +99,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 ## 待办 / 备忘
 
-- 远端 `origin` = `git@github.com:boypt/GeekMagic-Open-Opencode-GO.git`，**尚未 push**（外层工程以 submodule 引用本目录，push 后别人才能 clone 到）。
+- 远端 `origin` = `git@github.com:boypt/GeekMagic-Open-Opencode-GO.git`，已推送（外层工程以 submodule 引用本目录）。
 - `x-opencode-session` 头仍是 `sd2-opencode-go-balance-<chipId>`（`OpenCodeGoClient.h`），可改项目名。
 - `data/config.example.json` 模板缺失（新克隆者需在 Web 里配 host/path 等）。
 - 上游同步：`upstream` 指向 Times-Z/GeekMagic-Open-Firmware，本仓库在其 develop 之上叠加了 OpenCode 业务与若干修复（BGR 默认、rescue 阈值、IROM 访问、TLS CA 可配）。

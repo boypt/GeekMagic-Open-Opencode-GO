@@ -76,13 +76,12 @@ static constexpr uint16_t C_GREEN = rgb565(0x34, 0xD3, 0x99);
 static constexpr uint16_t C_RED = rgb565(0xFF, 0x6B, 0x6B);
 static constexpr uint16_t C_YELLOW = rgb565(0xF6, 0xC3, 0x43);
 
-// ---- 字体（U8g2_for_Adafruit_GFX，替代旧 TFT_eSPI Font7/FreeSans/内置字体）----
-// - 时钟大数字 u8g2_font_logisoso46_tn：u8g2 内最大数字字体（字高约 46px，仅含
-//   空格 0-9 : + - .），最接近旧工程 Font 7 七段数码管 48px 观感；
+// ---- 字体（U8g2_for_Adafruit_GFX，替代旧 TFT_eSPI FreeSans/内置字体）----
+// - 时钟大数字不用字体：自绘七段数码管（见下方 drawSegDigit），恢复旧工程
+//   TFT_eSPI Font 7（七段数码管 48px）观感，并省出约 10KB flash；
 // - 百分比     u8g2_font_helvB12_tf：Helvetica Bold 12pt，接近旧 FreeSans12pt7b；
 // - 标签       u8g2_font_helvR10_tf：Helvetica Regular 10pt，接近旧 FreeSans9pt7b；
 // - 小字       u8g2_font_6x10_tf：6px 字宽同旧内置 Font 1（6x8），略高 2px。
-static const uint8_t* const FONT_BIG = u8g2_font_logisoso46_tn;
 static const uint8_t* const FONT_PCT = u8g2_font_helvB12_tf;
 static const uint8_t* const FONT_LABEL = u8g2_font_helvR10_tf;
 static const uint8_t* const FONT_MINI = u8g2_font_6x10_tf;
@@ -196,25 +195,112 @@ static int textWidth(const String& s) {
     return static_cast<int>(u8g2().getUTF8Width(s.c_str()));
 }
 
-// logo 位图按 TFT_eSPI pushImage 字节序预交换，此处还原为标准 RGB565；
-// 0x0000 (调色板 nibble 0) 为透明色，只绘制字标像素。
-// 【字节序】调色板沿用原表预交换形态，还原逻辑仍为 c=(c<<8)|(c>>8)，行为保持。
-// 位图/调色板存 flash(.irom.text.progmem)，读取一律走 pgm_read_byte/pgm_read_word。
+// logo 位图恢复 16bpp 原始位图（23 色保真，无 4bpp 调色板量化偏色），
+// 按 TFT_eSPI pushImage 字节序预交换，此处还原为标准 RGB565；
+// 0x0000 为透明色，只绘制字标像素。位置/尺寸/逐点绘制路径不变。
+// 位图存 flash(.irom.text.progmem，~11.4KB、0 RAM)，读取走 pgm_read_word
+// （32-bit 访问，见 IromAccess.h）。
 static void drawLogo(int x, int y) {
     auto* gfx = DisplayManager::getGfx();
     for (int j = 0; j < OC_LOGO_H; j++) {
-        const uint8_t* row = &OC_LOGO_BITS[j * (OC_LOGO_W / 2)];
+        const uint16_t* row = &OC_LOGO_BITS[j * OC_LOGO_W];
         for (int k = 0; k < OC_LOGO_W; k++) {
-            const uint8_t b = pgm_read_byte(&row[k >> 1]);
-            const uint8_t nib = (k & 1) ? static_cast<uint8_t>(b & 0x0F)
-                                         : static_cast<uint8_t>(b >> 4);
-            if (nib == OC_LOGO_NO_COLOR) {
+            uint16_t c = static_cast<uint16_t>(pgm_read_word(&row[k]));
+            if (c == OC_LOGO_NO_COLOR) {
                 continue;
             }
-            uint16_t c = pgm_read_word(&OC_LOGO_PALETTE[nib]);
             c = static_cast<uint16_t>((c << 8) | (c >> 8));
-            gfx->drawPixel(static_cast<int16_t>(x + k), static_cast<int16_t>(y + j), c);
+            gfx->drawPixel(static_cast<int16_t>(x + k), static_cast<int16_t>(y + j),
+                           c);
         }
+    }
+}
+
+// ---------- 七段数码管大字（还原旧工程 TFT_eSPI Font 7 观感）----------
+// 几何：数字格 32x48（同旧 Font 7 数字字宽/字高），段厚 6px、段间隙 2px、
+// 段端 45° 斜切（bevel 4px），与 48px 高度比例贴近真实数码管：
+//  - 横段 a/g/d：盒 y 0..5 / 21..26 / 42..47（各自中线 y+2 / y+23 / y+44），
+//    尖端 x 3..28，斜切 4px 后矩形段 x 7..24；
+//  - 竖段 f/b（上）/ e/c（下）：左右列 x 0..5 / 26..31，上段尖 y 8..18、
+//    下段尖 y 28..39（与横段各留 2px 间隙）；
+//  位序 a b c d e f g；熄灭段不绘制（保持暗底，同旧工程）；
+//  '-' 只画 g 段（未同步显示 "--"）；':' 以中缝分隔线表达，不在此绘制。
+//  位表存 flash，读取走 pgm_read_word（IROM 32-bit 访问约束，见 IromAccess.h），
+//  不占 RAM。
+static const uint16_t kSegFont[13] PROGMEM = {
+    0b1111110,  // 0
+    0b0110000,  // 1
+    0b1101101,  // 2
+    0b1111001,  // 3
+    0b0110011,  // 4
+    0b1011011,  // 5
+    0b1011111,  // 6
+    0b1110000,  // 7
+    0b1111111,  // 8
+    0b1111011,  // 9
+    0, 0,       // 保留
+    0b0000001,  // '-'
+};
+
+// 横段：中线 yMid（相对数字顶部），尖端 xTipL..xTipR，厚 6px + 4px 斜切端
+static void segHoriz(int ox, int oy, int yMid, uint16_t color) {
+    constexpr int TIP_L = 3, TIP_R = 28, BEV = 4;
+    auto* gfx = DisplayManager::getGfx();
+    const int ymid = oy + yMid;
+    const int xl = ox + TIP_L + BEV, xr = ox + TIP_R - BEV;
+    gfx->fillRect(static_cast<int16_t>(xl), static_cast<int16_t>(ymid - 2),
+                  static_cast<int16_t>(xr - xl + 1), 6, color);
+    gfx->fillTriangle(static_cast<int16_t>(ox + TIP_L), static_cast<int16_t>(ymid),
+                      static_cast<int16_t>(xl), static_cast<int16_t>(ymid - 2),
+                      static_cast<int16_t>(xl), static_cast<int16_t>(ymid + 3), color);
+    gfx->fillTriangle(static_cast<int16_t>(ox + TIP_R), static_cast<int16_t>(ymid),
+                      static_cast<int16_t>(xr), static_cast<int16_t>(ymid - 2),
+                      static_cast<int16_t>(xr), static_cast<int16_t>(ymid + 3), color);
+}
+
+// 竖段：左右列 x 0..5（cxBase=0）/ 26..31（cxBase=26），尖端 yTipTop..yTipBot
+static void segVert(int ox, int oy, int cxBase, int yTipTop, int yTipBot,
+                    uint16_t color) {
+    constexpr int BEV = 4;
+    auto* gfx = DisplayManager::getGfx();
+    const int xL = ox + cxBase, xR = xL + 5, xm = xL + 3;
+    const int yt = oy + yTipTop + BEV, yb = oy + yTipBot - BEV;
+    gfx->fillRect(static_cast<int16_t>(xL), static_cast<int16_t>(yt), 6,
+                  static_cast<int16_t>(yb - yt + 1), color);
+    gfx->fillTriangle(static_cast<int16_t>(xm), static_cast<int16_t>(oy + yTipTop),
+                      static_cast<int16_t>(xL), static_cast<int16_t>(yt),
+                      static_cast<int16_t>(xR), static_cast<int16_t>(yt), color);
+    gfx->fillTriangle(static_cast<int16_t>(xm), static_cast<int16_t>(oy + yTipBot),
+                      static_cast<int16_t>(xL), static_cast<int16_t>(yb),
+                      static_cast<int16_t>(xR), static_cast<int16_t>(yb), color);
+}
+
+// 单个数字字符（'0'-'9' / '-'），数字格 32x48，左上角 (x, y)
+static void drawSegDigit(int x, int y, char ch, uint16_t color) {
+    uint16_t bits;
+    if (ch >= '0' && ch <= '9') {
+        bits = static_cast<uint16_t>(pgm_read_word(&kSegFont[ch - '0']));
+    } else if (ch == '-') {
+        bits = static_cast<uint16_t>(pgm_read_word(&kSegFont[12]));
+    } else {
+        return;  // ':' 等由中缝分隔线表达，不画（同旧工程）
+    }
+    if (bits & 0x40) segHoriz(x, y, 2, color);    // a
+    if (bits & 0x20) segVert(x, y, 26, 8, 18, color);   // b
+    if (bits & 0x10) segVert(x, y, 26, 28, 39, color);  // c
+    if (bits & 0x08) segHoriz(x, y, 44, color);   // d
+    if (bits & 0x04) segVert(x, y, 0, 28, 39, color);   // e
+    if (bits & 0x02) segVert(x, y, 0, 8, 18, color);    // f
+    if (bits & 0x01) segHoriz(x, y, 23, color);   // g
+}
+
+// 七段大字：与旧 drawSegText 一致，每字符宽 32，按中心 cx 水平居中
+static void drawSegText(int cx, int topY, const String& s, uint16_t color) {
+    const int total = static_cast<int>(s.length()) * 32;
+    int x = cx - total / 2;
+    for (unsigned i = 0; i < s.length(); i++) {
+        drawSegDigit(x, topY, s[i], color);
+        x += 32;
     }
 }
 
@@ -323,14 +409,11 @@ void UsageManager::drawClock() {
         mm = buf;
     }
 
-    u8g2().setFont(FONT_BIG);
-    int hw = textWidth(hh);
-    drawText(CLOCK_CX - hw / 2, HH_Y, hh, C_WHITE);
+    drawSegText(CLOCK_CX, HH_Y, hh, C_WHITE);
 
     drawSeparator();  // 秒摆动分隔线（未同步时居中）
 
-    int mw = textWidth(mm);
-    drawText(CLOCK_CX - mw / 2, MM_Y, mm, C_WHITE);
+    drawSegText(CLOCK_CX, MM_Y, mm, C_WHITE);
 
     // 记录本次绘制的分钟/秒，供 tick 去重（未同步时不记录，保持 --/-- 可继续尝试）
     if (minuteOfDay >= 0) {

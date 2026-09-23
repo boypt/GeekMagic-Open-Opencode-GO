@@ -8,6 +8,12 @@ function albumUploadHandler() {
     freeBytes: 0,
     listLoaded: false,
 
+    // 裁剪控件状态（Cropper.js，单图模式）
+    cropping: false,
+    cropper: null,
+    pendingFile: null,
+    pendingCanvas: null,
+
     get usedBytesHR() {
       return humanFileSize(this.usedBytes);
     },
@@ -20,21 +26,76 @@ function albumUploadHandler() {
       return humanFileSize(this.freeBytes);
     },
 
-    // 浏览器端把任意图片转成 240x240 RGB565(LE) 原始位图（cover 裁剪），
-    // 固件零解码器，直接流式送屏
-    async convertToRgb565(file) {
-      const bitmap = await createImageBitmap(file);
-      const canvas = document.createElement("canvas");
-      canvas.width = 240;
-      canvas.height = 240;
-      const ctx = canvas.getContext("2d");
+    // ---- 解码：JPEG 走 jpeg-js（CDN），其余走浏览器内建 ----
+    // 浏览器内建解码对 CMYK/YCCK JPG 会反色（蓝→黄），jpeg-js 显式处理
+    async ensureJpegDecoder() {
+      if (window.__jpegJsDecode) return window.__jpegJsDecode;
+      const urls = [
+        "https://cdn.jsdelivr.net/npm/jpeg-js@0.4.4/+esm",
+        "https://esm.sh/jpeg-js@0.4.4",
+      ];
+      for (const u of urls) {
+        try {
+          const mod = await import(u);
+          const decode = mod.decode || (mod.default && mod.default.decode);
+          if (decode) {
+            window.__jpegJsDecode = decode;
+            return decode;
+          }
+        } catch (e) {
+          /* 试下一个源 */
+        }
+      }
+      return null;
+    },
 
-      const scale = Math.max(240 / bitmap.width, 240 / bitmap.height);
-      const w = bitmap.width * scale;
-      const h = bitmap.height * scale;
-      ctx.drawImage(bitmap, (240 - w) / 2, (240 - h) / 2, w, h);
+    async decodeToCanvas(file) {
+      const buf = await file.arrayBuffer();
+      const u8 = new Uint8Array(buf);
+      let src = null;
 
-      const data = ctx.getImageData(0, 0, 240, 240).data;
+      if (u8.length > 3 && u8[0] === 0xff && u8[1] === 0xd8) {
+        try {
+          const decode = await this.ensureJpegDecoder();
+          if (decode) {
+            const img = decode(u8, {
+              useTArray: true,
+              formatAsRGBA: true,
+              tolerantDecoding: true,
+            });
+            src = document.createElement("canvas");
+            src.width = img.width;
+            src.height = img.height;
+            const clamped = new Uint8ClampedArray(
+              img.data.buffer,
+              img.data.byteOffset,
+              img.data.length
+            );
+            src.getContext("2d").putImageData(
+              new ImageData(clamped, img.width, img.height),
+              0,
+              0
+            );
+          }
+        } catch (e) {
+          console.warn("jpeg-js decode failed, fallback to browser:", e);
+        }
+      }
+
+      if (!src) {
+        const bitmap = await createImageBitmap(file);
+        src = document.createElement("canvas");
+        src.width = bitmap.width;
+        src.height = bitmap.height;
+        src.getContext("2d").drawImage(bitmap, 0, 0);
+      }
+
+      return src;
+    },
+
+    // 240x240 画布 -> RGB565(LE) 字节
+    canvasToRgb565(canvas) {
+      const data = canvas.getContext("2d").getImageData(0, 0, 240, 240).data;
       const out = new Uint8Array(240 * 240 * 2);
 
       for (let i = 0, j = 0; i < data.length; i += 4, j += 2) {
@@ -49,42 +110,137 @@ function albumUploadHandler() {
       return out;
     },
 
-    async uploadImage() {
-      this.uploading = true;
-      this.uploadMessage = "";
-      const file = this.$refs.fileInput.files[0];
+    // 批量模式的自动适配：cover 裁剪缩放到 240x240
+    coverTo240(src) {
+      const canvas = document.createElement("canvas");
+      canvas.width = 240;
+      canvas.height = 240;
+      const ctx = canvas.getContext("2d");
+      const scale = Math.max(240 / src.width, 240 / src.height);
+      const w = src.width * scale;
+      const h = src.height * scale;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(src, (240 - w) / 2, (240 - h) / 2, w, h);
+      return canvas;
+    },
 
-      if (!file) {
-        this.uploadMessage = "Please select an image";
-        this.uploading = false;
+    imageName(file) {
+      return (
+        (file.name.replace(/\.[^.]+$/, "") || "photo").replace(
+          /[^\w.-]/g,
+          "_"
+        ) + ".rgb565"
+      );
+    },
+
+    async pushCanvas(canvas, file) {
+      const rgb565 = this.canvasToRgb565(canvas);
+      const formData = new FormData();
+      formData.append(
+        "upload",
+        new Blob([rgb565], { type: "application/octet-stream" }),
+        this.imageName(file)
+      );
+
+      const response = await apiFetch("/api/v1/album", {
+        method: "POST",
+        body: formData,
+      });
+      const result = await response.json();
+
+      if (result.status !== "success") {
+        throw new Error(result.message || "upload failed");
+      }
+    },
+
+    // ---- 上传入口：单张进裁剪控件，多张批量自动适配 ----
+    async uploadImage() {
+      const input = this.$refs.fileInput;
+      const files = Array.from(input.files || []);
+
+      if (files.length === 0) {
+        this.uploadMessage = "Please select image(s)";
         return;
       }
 
-      try {
-        const rgb565 = await this.convertToRgb565(file);
-        const name =
-          (file.name.replace(/\.[^.]+$/, "") || "photo").replace(/[^\w.-]/g, "_") +
-          ".rgb565";
+      if (files.length === 1) {
+        await this.openCropper(files[0]);
+        return;
+      }
 
-        const formData = new FormData();
-        formData.append(
-          "upload",
-          new Blob([rgb565], { type: "application/octet-stream" }),
-          name
-        );
+      this.uploading = true;
+      this.uploadMessage = "";
+      let ok = 0;
+      const failed = [];
 
-        const response = await apiFetch("/api/v1/album", {
-          method: "POST",
-          body: formData,
-        });
-        const result = await response.json();
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        this.uploadMessage = `Uploading ${i + 1}/${files.length}: ${file.name}`;
 
-        if (result.status === "success") {
-          this.uploadMessage = "Uploaded: " + result.filename;
-          await this.fetchList();
-        } else {
-          this.uploadMessage = result.message || "Upload failed";
+        try {
+          const src = await this.decodeToCanvas(file);
+          await this.pushCanvas(this.coverTo240(src), file);
+          ok++;
+        } catch (e) {
+          failed.push(file.name);
         }
+      }
+
+      this.uploadMessage =
+        failed.length === 0
+          ? `Uploaded ${ok}/${files.length}`
+          : `Uploaded ${ok}/${files.length}, failed: ${failed.join(", ")}`;
+
+      input.value = "";
+      await this.fetchList();
+      this.uploading = false;
+    },
+
+    // ---- Cropper.js 交互裁剪（单图）----
+    async openCropper(file) {
+      try {
+        this.pendingFile = file;
+        this.pendingCanvas = await this.decodeToCanvas(file);
+        const img = this.$refs.cropImage;
+        img.src = this.pendingCanvas.toDataURL("image/jpeg", 0.92);
+        this.cropping = true;
+
+        await this.$nextTick();
+        this.cropper = new Cropper(img, {
+          aspectRatio: 1,
+          viewMode: 1,
+          autoCropArea: 1,
+          movable: true,
+          zoomable: true,
+          scalable: true,
+          rotatable: true,
+          background: false,
+        });
+      } catch (e) {
+        this.uploadMessage = "Error: " + e;
+        this.closeCropper();
+      }
+    },
+
+    rotateCrop(delta) {
+      if (this.cropper) this.cropper.rotate(delta);
+    },
+
+    async cropUpload() {
+      if (!this.cropper) return;
+      this.uploading = true;
+
+      try {
+        const canvas = this.cropper.getCroppedCanvas({
+          width: 240,
+          height: 240,
+          imageSmoothingEnabled: true,
+          imageSmoothingQuality: "high",
+        });
+        await this.pushCanvas(canvas, this.pendingFile);
+        this.uploadMessage = "Uploaded: " + this.imageName(this.pendingFile);
+        this.closeCropper();
+        await this.fetchList();
       } catch (e) {
         this.uploadMessage = "Error: " + e;
       }
@@ -92,6 +248,35 @@ function albumUploadHandler() {
       this.uploading = false;
     },
 
+    cropAuto() {
+      if (!this.pendingCanvas) return;
+      this.uploading = true;
+      this.pushCanvas(this.coverTo240(this.pendingCanvas), this.pendingFile)
+        .then(async () => {
+          this.uploadMessage = "Uploaded: " + this.imageName(this.pendingFile);
+          this.closeCropper();
+          await this.fetchList();
+        })
+        .catch((e) => {
+          this.uploadMessage = "Error: " + e;
+        })
+        .finally(() => {
+          this.uploading = false;
+        });
+    },
+
+    closeCropper() {
+      if (this.cropper) {
+        this.cropper.destroy();
+        this.cropper = null;
+      }
+      this.cropping = false;
+      this.pendingFile = null;
+      this.pendingCanvas = null;
+      if (this.$refs.fileInput) this.$refs.fileInput.value = "";
+    },
+
+    // ---- 列表 / 场景 ----
     async fetchList() {
       this.listLoaded = false;
 

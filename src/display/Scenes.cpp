@@ -72,7 +72,8 @@ class BalanceScene : public Scene {
 // 图片格式：/album/<name>.rgb565 = 240x240 RGB565(LE) 原始位图（115200B），
 // 由 Web 端 canvas 转换后上传。固件零解码器：流式读文件直接送屏，
 // RAM 仅用 ~4KB 分带行缓冲。
-// 全手工切换策略：单张常驻显示；幻灯循环轮播，退出一律靠手动 switchTo
+// 双模式：param=单张固定显示（单图 Play）；无 param=轮播现存全部（Play all /
+// 外部场景按钮），播完自动从头开始。场景退出一律靠手动 switchTo
 class AlbumScene : public Scene {
    public:
     auto name() const -> const char* override { return "album"; }
@@ -82,7 +83,7 @@ class AlbumScene : public Scene {
         m_index = 0;
 
         if (param != nullptr && param[0] != '\0') {
-            // 单张模式
+            // 单张固定：只载入该图（update 里 m_count<=1 不轮播）
             String name = String(param);
             name.replace("\\", "/");
             name = name.substring(name.lastIndexOf('/') + 1);
@@ -94,7 +95,7 @@ class AlbumScene : public Scene {
 
             strlcpy(m_items[m_count++], name.c_str(), sizeof(m_items[0]));
         } else {
-            // 相册模式：/album 下全部顺序展示
+            // 轮播：收集现存全部图片
             collectDir();
 
             if (m_count == 0) {
@@ -111,7 +112,7 @@ class AlbumScene : public Scene {
     }
 
     auto update() -> void override {
-        // 单张模式常驻不动；幻灯模式按停留时长循环轮播（不自动切场景）
+        // 纯轮播：按停留时长换下一张，最后一张放完自动回到第一张（不自动切场景）
         if (m_count <= 1) {
             return;
         }
@@ -189,6 +190,24 @@ class AlbumScene : public Scene {
     }
 };
 
+// ---------- clock：纯时钟 ----------
+// 七段大字 HH:MM:SS + 顶部小字日期星期（绘制复用 UsageManager 的字模/主题）
+class ClockScene : public Scene {
+   public:
+    auto name() const -> const char* override { return "clock"; }
+
+    auto enter(const char* param) -> bool override {
+        (void)param;
+        UsageManager::drawClockPage();
+
+        return true;
+    }
+
+    auto update() -> void override { UsageManager::tickClockPage(); }
+
+    auto exit() -> void override {}
+};
+
 static StartupScene s_startupScene;
 static BalanceScene s_balanceScene;
 static AlbumScene s_albumScene;
@@ -215,10 +234,12 @@ class LiveScene : public Scene {
 };
 
 static LiveScene s_liveScene;
+static ClockScene s_clockScene;
 
 auto registerBuiltinScenes() -> void {
     SceneManager::addScene(&s_startupScene);
     SceneManager::addScene(&s_balanceScene);
     SceneManager::addScene(&s_albumScene);
+    SceneManager::addScene(&s_clockScene);
     SceneManager::addScene(&s_liveScene);
 }

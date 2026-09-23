@@ -81,6 +81,14 @@
             <button
               type="button"
               class="secondary"
+              @click="switchScene('clock')"
+              x-bind:disabled="loading"
+            >
+              Clock
+            </button>
+            <button
+              type="button"
+              class="secondary"
               @click="switchScene('startup')"
               x-bind:disabled="loading"
             >

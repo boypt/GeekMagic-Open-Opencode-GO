@@ -32,6 +32,10 @@ class UsageManager {
     static void drawBootPage(bool fail);
     static void drawMainPage();
 
+    // ---- 纯时钟场景页（clock 场景：七段时分秒 + 顶部小字日期星期）----
+    static void drawClockPage();
+    static void tickClockPage();
+
    private:
     static void drawBody();
     static void drawUpdateRow();

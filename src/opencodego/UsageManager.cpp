@@ -132,6 +132,10 @@ static bool ever_started = false;
 // 上次绘制的本地分钟（hour*60+min）/ 秒；-1 = 尚未绘制
 static int lastClockMinute = -1;
 static int lastClockSecond = -1;
+// 已绘制的 HH/MM 串与年积日（tickUi 差量更新基准）
+static String sClockHH;
+static String sClockMM;
+static int sClockYday = -1;
 
 // 主页面是否已绘制：只有绘制过后才允许时钟 tick / 局部重绘（boot 页除外）
 static bool mainPageDrawn = false;
@@ -271,9 +275,13 @@ static void drawSegDigit(int x, int y, char ch, uint16_t color) {
     }
 }
 
-// 七段大字：与旧 drawSegText 一致，每字符宽 32（':' 宽 12），按中心 cx 居中
+// 七段大字：每字符宽 32（':' 宽 12），按真实字宽以 cx 居中
+//（无冒号串与旧版逐像素一致；含冒号串修正旧版 total=len*32 的偏心）
 static void drawSegText(int cx, int topY, const String& s, uint16_t color) {
-    const int total = static_cast<int>(s.length()) * 32;
+    int total = 0;
+    for (unsigned i = 0; i < s.length(); i++) {
+        total += (s[i] == ':') ? 12 : 32;
+    }
     int x = cx - total / 2;
     for (unsigned i = 0; i < s.length(); i++) {
         drawSegDigit(x, topY, s[i], color);
@@ -371,20 +379,48 @@ void UsageManager::drawDateLine() {
     drawText(DATE_X, DATE_Y, s, C_SUB);
 }
 
-// 左栏时钟：日期在顶、HH 大字在中上、MM 大字在下，中间一条摆动分隔线
-void UsageManager::drawClock() {
-    drawDateLine();  // 日期只在零点变化，由分钟/整盒重绘天然覆盖
+// 前置声明：实现见下方纯时钟页段
+static void drawSegRuns(int x, int y, uint32_t bits, uint16_t color);
+static void redrawSegGlyphDiff(int x, int y, char oldCh, char newCh, uint16_t color);
 
-    int minuteOfDay = currentLocalMinute();
-    String hh = "--", mm = "--";
-    if (minuteOfDay >= 0) {
-        struct tm tmv = localTmNow();
+// 串级差量更新：按 32/12 走宽逐字形比对，仅翻转差异字形的差异段
+static void redrawSegTextDiff(int cx, int topY, const String& oldS, const String& newS, uint16_t color) {
+    int total = 0;
+    for (unsigned i = 0; i < newS.length(); i++) {
+        total += (newS[i] == ':') ? 12 : 32;
+    }
+
+    int x = cx - total / 2;
+
+    for (unsigned i = 0; i < newS.length(); i++) {
+        const char oldCh = (i < oldS.length()) ? oldS[i] : '\0';
+        redrawSegGlyphDiff(x, topY, oldCh, newS[i], color);
+        x += (newS[i] == ':') ? 12 : 32;
+    }
+}
+
+// 时间串生成（drawClock / tickUi 共用）
+static void clockStrings(String& hh, String& mm) {
+    hh = "--";
+    mm = "--";
+
+    if (currentLocalMinute() >= 0) {
+        const struct tm tmv = localTmNow();
         char buf[4];
         snprintf(buf, sizeof(buf), "%02d", tmv.tm_hour);
         hh = buf;
         snprintf(buf, sizeof(buf), "%02d", tmv.tm_min);
         mm = buf;
     }
+}
+
+// 左栏时钟：日期在顶、HH 大字在中上、MM 大字在下，中间一条摆动分隔线
+void UsageManager::drawClock() {
+    drawDateLine();  // 日期只在零点变化，由分钟/整盒重绘天然覆盖
+
+    String hh;
+    String mm;
+    clockStrings(hh, mm);
 
     drawSegText(CLOCK_CX, HH_Y, hh, C_WHITE);
 
@@ -392,37 +428,78 @@ void UsageManager::drawClock() {
 
     drawSegText(CLOCK_CX, MM_Y, mm, C_WHITE);
 
-    // 记录本次绘制的分钟/秒，供 tick 去重（未同步时不记录，保持 --/-- 可继续尝试）
+    // 记录已绘制状态，供 tickUi 差量更新（未同步时不记录，保持 --/-- 可继续尝试）
+    sClockHH = hh;
+    sClockMM = mm;
+
+    const int minuteOfDay = currentLocalMinute();
     if (minuteOfDay >= 0) {
         lastClockMinute = minuteOfDay;
         lastClockSecond = currentLocalSecond();
     }
 }
 
-// 常驻 tick（update() 每轮进一次，仅变化时碰屏）：
-//  - 分钟变化：整块时钟盒重绘（数字 + 分隔线）
-//  - 秒变化：只清/重画分隔线小条带，不碰 HH/MM 数字
+// 常驻 tick（update() 每轮进一次，仅变化时碰屏；全部走像素差量，无清底闪烁）：
+//  - 分钟变化：仅差量更新 HH/MM 中变化的字形（换日补画日期行）
+//  - 秒变化：仅翻转摆动分隔线的新旧尾段
 //  未同步时分隔线保持静态居中
 void UsageManager::tickUi() {
-    int m = currentLocalMinute();
-    if (m < 0) return;
-
-    auto* gfx = DisplayManager::getGfx();
-    if (m != lastClockMinute) {  // 分钟变化 -> 全时钟盒重绘
-        gfx->startWrite();
-        gfx->fillRect(CLOCK_X, CLOCK_Y, CLOCK_W, CLOCK_H, C_BG);
-        drawClock();  // 一并更新 lastClockMinute / lastClockSecond
-        gfx->endWrite();
+    const int m = currentLocalMinute();
+    if (m < 0) {
         return;
     }
 
-    int s = currentLocalSecond();  // 秒变化 -> 只重画分隔线条带
-    if (s == lastClockSecond) return;
+    auto* gfx = DisplayManager::getGfx();
+
+    if (m != lastClockMinute) {
+        String hh;
+        String mm;
+        clockStrings(hh, mm);
+
+        const struct tm tmv = localTmNow();
+
+        gfx->startWrite();
+        if (tmv.tm_yday != sClockYday) {
+            sClockYday = tmv.tm_yday;
+            drawDateLine();
+        }
+        if (hh != sClockHH) {
+            redrawSegTextDiff(CLOCK_CX, HH_Y, sClockHH, hh, C_WHITE);
+        }
+        if (mm != sClockMM) {
+            redrawSegTextDiff(CLOCK_CX, MM_Y, sClockMM, mm, C_WHITE);
+        }
+        gfx->endWrite();
+
+        sClockHH = hh;
+        sClockMM = mm;
+        lastClockMinute = m;
+        lastClockSecond = currentLocalSecond();
+        return;
+    }
+
+    int s = currentLocalSecond();  // 秒变化 -> 只差量更新分隔线
+    if (s == lastClockSecond) {
+        return;
+    }
+
+    const int oldX = CLOCK_CX - SEP_W / 2 + sepOffsetForSecond(lastClockSecond);
+    const int newX = CLOCK_CX - SEP_W / 2 + sepOffsetForSecond(s);
     lastClockSecond = s;
 
+    if (newX == oldX) {
+        return;
+    }
+
+    // 两线段同行同宽，仅翻转互不重叠的尾段（重叠区不动 → 零闪烁）
     gfx->startWrite();
-    gfx->fillRect(SEP_STRIP_X, SEP_STRIP_Y, SEP_STRIP_W, SEP_STRIP_H, C_BG);
-    drawSeparator();
+    if (newX > oldX) {
+        gfx->drawFastHLine(oldX, SEP_Y, newX - oldX, C_BG);
+        gfx->drawFastHLine(oldX + SEP_W, SEP_Y, newX - oldX, C_ACCENT);
+    } else {
+        gfx->drawFastHLine(newX + SEP_W, SEP_Y, oldX - newX, C_BG);
+        gfx->drawFastHLine(newX, SEP_Y, oldX - newX, C_ACCENT);
+    }
     gfx->endWrite();
 }
 
@@ -500,6 +577,162 @@ void UsageManager::drawMainPage() {
     gfx->drawFastHLine(16, 40, 208, C_BORDER);
     drawBody();
     gfx->endWrite();
+}
+
+// ---------- 纯时钟页（clock 场景）----------
+// 顶部小字日期星期 + 七段大字 HH:MM:SS（复用 SegFont7 字模/主题色/时间辅助）
+static constexpr int CLOCK_PAGE_CX = 120;
+static constexpr int CLOCK_PAGE_DATE_Y = 34;
+static constexpr int CLOCK_PAGE_TIME_Y = 96;
+static constexpr int CLOCK_PAGE_TIME_BAND_X = 8;
+static constexpr int CLOCK_PAGE_TIME_BAND_W = 224;
+
+static int clockPageLastSec = -1;
+static int clockPageLastDay = -1;
+static char clockPageShown[16] = {0};  // 上次绘制的时间串，逐字形差量更新
+
+static String clockPageTimeString() {
+    if (!timeSynced()) {
+        return "--:--:--";
+    }
+
+    const struct tm tmv = localTmNow();
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+
+    return String(buf);
+}
+
+// 按 32bit 字模行位图把置位段合并成 drawFastHLine
+static void drawSegRuns(int x, int y, uint32_t bits, uint16_t color) {
+    auto* gfx = DisplayManager::getGfx();
+    int k = 0;
+    while (k < SEG7_W) {
+        if (!(bits & (1u << (31 - k)))) {
+            k++;
+            continue;
+        }
+        int run = 0;
+        while (k + run < SEG7_W && (bits & (1u << (31 - (k + run))))) {
+            run++;
+        }
+        gfx->drawFastHLine(static_cast<int16_t>(x + k), static_cast<int16_t>(y), static_cast<int16_t>(run), color);
+        k += run;
+    }
+}
+
+// 像素差量重绘单个字形：仅翻转新旧字形的差异段（无清底 → 消除秒跳闪烁）
+static void redrawSegGlyphDiff(int x, int y, char oldCh, char newCh, uint16_t color) {
+    const auto idxOf = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') {
+            return ch - '0';
+        }
+        if (ch == '-') {
+            return SEG7_DASH;
+        }
+        if (ch == ':') {
+            return SEG7_COLON;
+        }
+        return -1;
+    };
+
+    const int iOld = idxOf(oldCh);
+    const int iNew = idxOf(newCh);
+
+    if (iOld == iNew) {
+        return;
+    }
+
+    auto* gfx = DisplayManager::getGfx();
+    gfx->startWrite();
+
+    for (int row = 0; row < SEG7_H; row++) {
+        const uint32_t o = (iOld >= 0) ? pgm_read_dword(&kSeg7Font[iOld][row]) : 0U;
+        const uint32_t n = (iNew >= 0) ? pgm_read_dword(&kSeg7Font[iNew][row]) : 0U;
+
+        drawSegRuns(x, y + row, o & ~n, C_BG);   // 旧有新无 → 擦除
+        drawSegRuns(x, y + row, n & ~o, color);  // 新有旧无 → 点亮
+    }
+
+    gfx->endWrite();
+}
+
+// 时间行逐字形更新：force=全量绘制（入场），否则只动变化的字形
+static void drawClockPageTime(bool force) {
+    static const int kGlyphW[8] = {32, 32, 12, 32, 32, 12, 32, 32};  // HH:MM:SS
+    const String s = clockPageTimeString();
+    const int startX = CLOCK_PAGE_CX - 216 / 2;
+
+    int x = startX;
+
+    for (int i = 0; i < 8; i++) {
+        if (force) {
+            drawSegDigit(x, CLOCK_PAGE_TIME_Y, s[i], C_WHITE);
+        } else {
+            redrawSegGlyphDiff(x, CLOCK_PAGE_TIME_Y, clockPageShown[i], s[i], C_WHITE);
+        }
+
+        clockPageShown[i] = s[i];
+        x += kGlyphW[i];
+    }
+}
+
+static void drawClockPageDate() {
+    auto* gfx = DisplayManager::getGfx();
+    gfx->fillRect(0, CLOCK_PAGE_DATE_Y - 2, 240, 18, C_BG);
+
+    String s;
+
+    if (timeSynced()) {
+        static const char* const kWeekday[7] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+        const struct tm tmv = localTmNow();
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02d %s", 1900 + tmv.tm_year, 1 + tmv.tm_mon, tmv.tm_mday,
+                 kWeekday[tmv.tm_wday % 7]);
+        s = buf;
+    } else {
+        s = "--";
+    }
+
+    u8g2().setFont(FONT_LABEL);
+    drawText(CLOCK_PAGE_CX - textWidth(s) / 2, CLOCK_PAGE_DATE_Y, s, C_SUB);
+}
+
+// 纯时钟页入场：从零绘制所有元素（场景切换契约）
+void UsageManager::drawClockPage() {
+    u8g2();
+    auto* gfx = DisplayManager::getGfx();
+    gfx->startWrite();
+    gfx->fillScreen(C_BG);
+    drawClockPageDate();
+    gfx->endWrite();
+
+    memset(clockPageShown, 0, sizeof(clockPageShown));
+    drawClockPageTime(true);  // 全量绘制并记录字形状态
+
+    clockPageLastSec = timeSynced() ? currentLocalSecond() : -1;
+    clockPageLastDay = timeSynced() ? localTmNow().tm_yday : -1;
+}
+
+// 秒级 tick：字形像素差量更新（无清底闪烁）；换日只重绘日期行
+void UsageManager::tickClockPage() {
+    if (!timeSynced()) {
+        return;
+    }
+
+    const struct tm tmv = localTmNow();
+
+    if (tmv.tm_yday != clockPageLastDay) {
+        clockPageLastDay = tmv.tm_yday;
+        drawClockPageDate();
+    }
+
+    if (tmv.tm_sec == clockPageLastSec) {
+        return;
+    }
+    clockPageLastSec = tmv.tm_sec;
+
+    drawClockPageTime(false);
 }
 
 void UsageManager::drawBootPage(bool fail) {

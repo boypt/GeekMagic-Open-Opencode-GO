@@ -6,6 +6,12 @@
     <title>Photo Album</title>
     <link rel="stylesheet" href="./css/pico.min.css" />
     <link rel="stylesheet" href="./css/style.css" />
+    <!-- Cropper.js：画布裁剪/缩放控件（CDN 引用，不占设备空间） -->
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/cropperjs@1.6.2/dist/cropper.min.css"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/cropperjs@1.6.2/dist/cropper.min.js"></script>
     <script src="./js/alpinejs.min.js" defer></script>
     <script src="./js/utils.js"></script>
     <script src="./js/themeSwitcher.js"></script>
@@ -27,19 +33,71 @@
             >
           </p>
           <form @submit.prevent="uploadImage">
-            <input type="file" x-ref="fileInput" required accept="image/*" />
-            <button type="submit" x-bind:disabled="uploading">Upload</button>
+            <input
+              type="file"
+              x-ref="fileInput"
+              required
+              accept="image/*"
+              multiple
+            />
+            <button type="submit" x-bind:disabled="uploading">
+              Upload selected
+            </button>
           </form>
           <template x-if="uploading">
             <span aria-busy="true" style="margin-left: 1em">Uploading...</span>
           </template>
           <p x-text="uploadMessage"></p>
 
+          <!-- 单图交互裁剪（Cropper.js）：拖动构图 / 滚轮缩放 / 旋转 -->
+          <template x-if="cropping">
+            <div style="margin-top: 1em">
+              <p>
+                <strong>Crop &amp; scale</strong>
+                <small
+                  >— 拖动移动、滚轮缩放、旋转构图，输出 240×240</small
+                >
+              </p>
+              <div
+                style="
+                  max-width: 360px;
+                  height: 320px;
+                  margin-bottom: 0.5em;
+                  background: #111;
+                "
+              >
+                <img x-ref="cropImage" style="max-width: 100%; display: block" />
+              </div>
+              <div style="display: flex; gap: 0.5em; flex-wrap: wrap">
+                <button type="button" @click="rotateCrop(-90)">
+                  ↺ Rotate
+                </button>
+                <button type="button" @click="rotateCrop(90)">
+                  ↻ Rotate
+                </button>
+                <button
+                  type="button"
+                  class="primary"
+                  @click="cropUpload()"
+                  x-bind:disabled="uploading"
+                >
+                  Crop &amp; Upload
+                </button>
+                <button type="button" @click="cropAuto()" x-bind:disabled="uploading">
+                  Auto fit
+                </button>
+                <button type="button" @click="closeCropper()">Cancel</button>
+              </div>
+            </div>
+          </template>
+
           <section style="margin-top: 2em">
             <h3>Images on device</h3>
             <div style="margin-bottom: 0.5em; display: flex; gap: 0.5em">
               <button @click="stopPlayback()">Back to Balance</button>
-              <button @click="playAll()">Play all</button>
+              <button @click="playAll()" title="Play all (auto carousel)">
+                Play all
+              </button>
             </div>
             <div x-show="listLoaded">
               <p>
@@ -61,8 +119,9 @@
                     <button
                       @click="playImage(img.name)"
                       style="margin-left: 1em"
+                      title="Play this image (fixed)"
                     >
-                      Show
+                      Play
                     </button>
                     <button
                       @click="deleteImage(img.name)"

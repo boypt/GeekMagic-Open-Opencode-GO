@@ -79,8 +79,8 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 2. **BearSSL OOM**：拉取时 free heap 仅 ~24KB。每次拉取重新 `String + X509List` 解析 CA 会挤到 `Unhandled C++ exception: OOM`；现已一次性解析常驻。**不要**在 webserver handler 里再开 TLS 连接（叠加请求缓冲必炸——`/ca/test` 因此被移除）。
 3. **rescue 误触发**：每次刷机/手动复位都算一次启动，旧阈值 3 太敏感。现已：阈值 10 + **只统计崩溃类复位**（Exception/Fatal/Watchdog），`External System`/`Power On`/`Software/System restart` 直接清零计数。若再进 rescue：连 AP 后 `curl -X POST http://192.168.4.1/api/v1/rescue/reset` 再 `/rescue/reboot`。
 4. **显示设置后屏幕残留启动屏**：`DisplayManager::setRotation()/applyPanelProfile()` 不得画启动屏（会覆盖主页面且 `mainPageDrawn` 不回退）；改完必须 `requestFullRedraw()`，由 `UsageManager::update()` 重画。
-5. **Web 静态资源缓存 24h**（`max-age=86400`）：改了网页/JS 后浏览器要硬刷新（Ctrl+Shift+R）才生效。
-6. **刷文件系统覆盖设备 config.json**（见"配置系统"）。
+5. **Web 静态资源缓存 24h**（`max-age=86400`）：改了网页/JS 后浏览器要硬刷新（Ctrl+Shift+R）才生效。图像处理遵循「CDN 引库」策略（零设备空间）：`jpeg-js`（JS 解码 JPEG，浏览器内建解码对 CMYK/YCCK JPG 反色）+ `cropperjs`（画布裁剪缩放控件），均为 jsDelivr/esm.sh 动态或标签引用，离线/内网需自建镜像。
+6. **刷文件系统覆盖设备 config.json**（见"配置系统"）。同理也会**清空设备上的 `/album` 相册库**（相册图只存在设备上，不在 `data/` 里）——`uploadfs` 前提醒用户重传图片，或先用 `GET /api/v1/album` + 逐个下载备份（无下载接口，重要图请留原图）。
 7. 上传时报 `Invalid head of packet`：重试即可；报 PermissionError：先关掉占用串口的 monitor。
 8. `connect()` 无超时参数（本核心），TLS 握手最坏约 15s，长链（4 证书 + RSA-4096）验证较重，首次偶发失败由重试兜底（日志 `Fetch recovered on attempt 2` 属正常）。
 9. **堆碎片：空闲总量够 ≠ 能分配**。实测 `free 22KB / max block 13KB`，任何 >13KB 的整体 `new` 必失败；且 park 释放的大洞会被小块分配切碎、再也拼不回去。**结论（已付过学费）**：80KB RAM 塞不下 GIF 解码器（对象+LZW 字典 ≥20KB），相关方案（vendored AnimatedGIF/字典池交接）已整体删除，相册改为静态 RGB565 图（零解码、~3.8KB 行缓冲）。新功能若需 >4KB 连续块，先想清楚碎片化与拉取互斥。

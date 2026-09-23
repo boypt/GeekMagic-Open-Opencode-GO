@@ -14,8 +14,18 @@ function wifiHandler() {
       try {
         const res = await apiFetch("/api/v1/wifi/scan");
         const nets = await res.json();
+        if (!res.ok || !Array.isArray(nets)) {
+          // 401 等错误返回的是 JSON 对象而非数组，需区分提示，避免误报为扫描失败
+          this.statusMsg =
+            res.status === 401 || res.status === 403
+              ? "Unauthorized: save a valid token on the Token page first"
+              : (nets && nets.message) || "Scan failed";
+          this.networks = [];
+          this.scanning = false;
+          return;
+        }
         // process: sort by rssi desc and enrich display fields
-        this.networks = (nets || [])
+        this.networks = nets
           .map((n) => {
             const rssi =
               typeof n.rssi === "number" ? n.rssi : parseInt(n.rssi) || 0;

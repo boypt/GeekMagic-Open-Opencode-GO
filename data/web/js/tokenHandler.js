@@ -12,7 +12,13 @@ function tokenHandler() {
     hasStoredToken: false,
 
     init() {
-      const stored = localStorage.getItem(storageKey) || "";
+      let stored = localStorage.getItem(storageKey) || "";
+      // 首次访问：自动使用 utils.js 里的默认 token（与 data/config.json 一致）并持久化，
+      // 免去用户手动到 Token 页填写。
+      if (!stored && typeof DEFAULT_API_TOKEN !== "undefined" && DEFAULT_API_TOKEN) {
+        stored = DEFAULT_API_TOKEN;
+        localStorage.setItem(storageKey, stored);
+      }
       this.token = stored;
       this.hasStoredToken = !!stored;
       this.statusMsg = stored

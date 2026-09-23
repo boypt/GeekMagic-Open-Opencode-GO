@@ -44,6 +44,34 @@
           driver.</small
         >
 
+        <fieldset>
+          <legend>Mirror</legend>
+          <label for="lcd-mirror-x">
+            <input
+              type="checkbox"
+              id="lcd-mirror-x"
+              role="switch"
+              x-model="mirrorX"
+              x-bind:disabled="loading"
+            />
+            Mirror horizontally (MADCTL MX)
+          </label>
+          <label for="lcd-mirror-y">
+            <input
+              type="checkbox"
+              id="lcd-mirror-y"
+              role="switch"
+              x-model="mirrorY"
+              x-bind:disabled="loading"
+            />
+            Mirror vertically (MADCTL MY)
+          </label>
+          <small
+            >Use these when text appears mirrored or upside down even after
+            choosing a rotation mode.</small
+          >
+        </fieldset>
+
         <div
           style="margin-top: 0.5em; display: flex; gap: 0.5em; flex-wrap: wrap"
         >
@@ -54,6 +82,13 @@
             x-bind:disabled="loading"
           >
             Save Rotation
+          </button>
+          <button
+            type="button"
+            @click="saveMirror()"
+            x-bind:disabled="loading"
+          >
+            Save Mirror
           </button>
           <button
             type="button"

@@ -24,9 +24,11 @@
 
 enum LogLevel { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR };
 
-static constexpr LogLevel LOG_MIN_LEVEL = LOG_WARN;
-static constexpr size_t LOG_BUFFER_MAX_ENTRIES = 20;
-static constexpr size_t LOG_ENTRY_MAX_LEN = 96;
+// TLS/JSON 需要大量 heap，环形日志缓冲从 20*96=1920B 削到 4*64=256B；
+// LOG_MIN_LEVEL=LOG_ERROR 时实际常驻仅按需分配一次 256B，保留错误日志与 API 读取能力
+static constexpr LogLevel LOG_MIN_LEVEL = LOG_ERROR;
+static constexpr size_t LOG_BUFFER_MAX_ENTRIES = 4;
+static constexpr size_t LOG_ENTRY_MAX_LEN = 64;
 
 class Logger {
    public:

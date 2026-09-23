@@ -233,6 +233,57 @@ static inline void ST7789_WriteCommand(uint8_t cmd) { g_lcdBus.writeCommand(cmd)
  */
 static inline void ST7789_WriteData(uint8_t data) { g_lcdBus.write(data); }
 
+// MADCTL 位定义（ST7789 0x36 命令）
+static constexpr uint8_t LCD_MADCTL_MX = 0x40;
+static constexpr uint8_t LCD_MADCTL_MV = 0x20;
+static constexpr uint8_t LCD_MADCTL_MY = 0x80;
+static constexpr uint8_t LCD_MADCTL_RGB = 0x00;
+
+/**
+ * @brief Re-send MADCTL (0x36) with runtime-configurable mirror bits
+ *
+ * Arduino_GFX 的 setRotation() 内部已经按 rotation 发过一次 MADCTL（0x36），
+ * 这里按当前 rotation 对应的默认 MADCTL 值重发一遍，再按
+ * ConfigManager 的 lcd_mirror_x/lcd_mirror_y 翻转 MX(0x40)/MY(0x80) 位。
+ * 所有后续绘制均按校正后的扫描方向进行，无需坐标补偿。
+ *
+ * @param rotation 当前 rotation 值（0-7），用于取得 Arduino_GFX 的默认 MADCTL 值
+ *
+ * @return void
+ */
+static void lcdApplyMirrorMADCTL(uint8_t rotation) {
+    // 与 Arduino_GFX Arduino_ST7789::setRotation 的默认 MADCTL 值一致
+    static constexpr uint8_t ROTATION_MADCTL[8] = {
+        LCD_MADCTL_RGB,                                       // 0: RGB
+        static_cast<uint8_t>(LCD_MADCTL_MX | LCD_MADCTL_MV),  // 1: MX|MV|RGB
+        static_cast<uint8_t>(LCD_MADCTL_MX | LCD_MADCTL_MY),  // 2: MX|MY|RGB
+        static_cast<uint8_t>(LCD_MADCTL_MY | LCD_MADCTL_MV),  // 3: MY|MV|RGB
+        LCD_MADCTL_MX,                                        // 4: MX|RGB
+        static_cast<uint8_t>(LCD_MADCTL_MX | LCD_MADCTL_MY | LCD_MADCTL_MV),  // 5: MX|MY|MV|RGB
+        LCD_MADCTL_MY,                                        // 6: MY|RGB
+        LCD_MADCTL_MV,                                        // 7: MV|RGB
+    };
+
+    uint8_t madctl = ROTATION_MADCTL[rotation & 0x07];
+
+    if (configManager.getLCDMirrorX()) {
+        madctl |= LCD_MADCTL_MX;
+    }
+    if (configManager.getLCDMirrorY()) {
+        madctl |= LCD_MADCTL_MY;
+    }
+
+    g_lcdBus.beginWrite();
+    ST7789_WriteCommand(ST7789_MEMORY_ACCESS_CONTROL);
+    ST7789_WriteData(madctl);
+    g_lcdBus.endWrite();
+
+    Logger::info(("MADCTL applied: 0x" + String(madctl, HEX) + " mirror_x=" + (configManager.getLCDMirrorX() ? "1" : "0") +
+                  " mirror_y=" + (configManager.getLCDMirrorY() ? "1" : "0"))
+                     .c_str(),
+                 "DisplayManager");
+}
+
 /**
  * @brief Run a vendor-specific initialization sequence for the ST7789 panel
  *
@@ -385,6 +436,7 @@ static void lcdEnsureInit() {
     delay(LCD_BEGIN_DELAY_MS);
 
     g_lcd.setRotation(rotation);
+    lcdApplyMirrorMADCTL(rotation);
 
     Logger::info(
         ("Width=" + String(g_lcd.width()) + " height=" + String(g_lcd.height()) + " rotation=" + String(rotation))
@@ -556,6 +608,7 @@ auto DisplayManager::begin() -> void { lcdEnsureInit(); }
  */
 auto DisplayManager::setRotation(uint8_t rotation, String currentIP) -> void {
     g_lcd.setRotation(rotation);
+    lcdApplyMirrorMADCTL(rotation);
     DisplayManager::drawStartup(currentIP);
 
     Logger::info(("Rotation set to " + String(rotation)).c_str(), "DisplayManager");

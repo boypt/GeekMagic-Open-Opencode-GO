@@ -33,6 +33,7 @@
 #include "ntp/NTPClient.h"
 #include "boot/RescueMode.h"
 #include "dashboard/DashboardManager.h"
+#include "opencodego/UsageManager.h"
 #include <array>
 
 #ifndef METRICS_URL
@@ -185,6 +186,8 @@ void setup() {
         DashboardManager::begin(METRICS_ENDPOINT);
     }
 
+    UsageManager::begin();
+
     // enable watchdog before going to loop()
     // 2 seconds should be way more than the main loop needs to do stuff
     EspClass::wdtEnable(WDTO_2S);
@@ -216,6 +219,10 @@ void loop() {
         !wifiManager->isApMode()) {
         DashboardManager::update();
     }
+
+    // UsageManager::update() 内部自管绘制时机：WiFi 就绪才轮询/局部重绘，
+    // 主页面绘制后每秒 tick 时钟（WiFi 掉线也走时），AP 模式只保持 boot 页
+    UsageManager::update();
 
     static unsigned long last_free_heap_log = 0;
     static constexpr unsigned long FREE_HEAP_LOG_INTERVAL_MS = 10000UL;

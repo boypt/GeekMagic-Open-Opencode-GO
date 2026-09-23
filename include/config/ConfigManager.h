@@ -53,6 +53,28 @@ class ConfigManager {
     void setLCDRotation(uint8_t newRotation);
     uint32_t getLCDSpiHz() const;
 
+    // ---- LCD 镜像翻转（MADCTL MX/MY 运行时可配）----
+    bool getLCDMirrorX() const { return lcd_mirror_x; }
+    bool getLCDMirrorY() const { return lcd_mirror_y; }
+    void setLCDMirrorX(bool enable) { lcd_mirror_x = enable; }
+    void setLCDMirrorY(bool enable) { lcd_mirror_y = enable; }
+
+    // ---- OpenCode Go 用量配置 ----
+    const char* getOpenCodeGoHost() const { return opencodego_host.c_str(); }
+    const char* getOpenCodeGoPath() const { return opencodego_path.c_str(); }
+    const char* getOpenCodeGoApiKey() const { return opencodego_api_key.c_str(); }
+    bool getVerifyTlsCert() const { return verify_tls_cert != 0; }
+    void setOpenCodeGoHost(const char* host) {
+        if (host != nullptr) opencodego_host = host;
+    }
+    void setOpenCodeGoPath(const char* path) {
+        if (path != nullptr) opencodego_path = path;
+    }
+    void setOpenCodeGoApiKey(const char* key) {
+        if (key != nullptr) opencodego_api_key = key;
+    }
+    void setVerifyTlsCert(bool enable) { verify_tls_cert = enable ? 1 : 0; }
+
    public:
     uint8_t getLCDRotationSafe() const { return lcd_rotation; }
     std::string ssid;
@@ -61,7 +83,17 @@ class ConfigManager {
     std::string filename;
     SecureStorage secure;
     uint8_t lcd_rotation = 4;
+
+    // LCD 镜像翻转（MADCTL MX/MY 位，默认关闭）
+    bool lcd_mirror_x = false;
+    bool lcd_mirror_y = false;
     std::string ntp_server;
+
+    // OpenCode Go 用量配置（api_key 走 SecureStorage，host/path/tls 开关走 config.json）
+    std::string opencodego_host;
+    std::string opencodego_path;
+    std::string opencodego_api_key;
+    uint8_t verify_tls_cert = 1;
 
     const char* getNtpServer() const { return ntp_server.c_str(); }
     void setNtpServer(const char* s) {

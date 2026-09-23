@@ -46,9 +46,19 @@ static constexpr int OTA_TEXT_Y_OFFSET = 80;
 static constexpr int OTA_LOADING_Y_OFFSET = 110;
 
 static void otaHandleStart(HTTPUpload& upload, int mode);
+static String updaterErrorString() {
+    StreamString out;
+    Update.printError(out);
+    out.trim();
+    return out;
+}
 static void otaHandleWrite(HTTPUpload& upload);
 static void otaHandleEnd(HTTPUpload& upload, int mode);
 static void otaHandleAborted(HTTPUpload& upload);
+void handleDisplayRotationGet(Webserver* webserver);
+void handleDisplayRotationSet(Webserver* webserver);
+void handleDisplayMirrorGet(Webserver* webserver);
+void handleDisplayMirrorSet(Webserver* webserver);
 void handleDeleteGif(Webserver* webserver);
 
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 15000;
@@ -95,14 +105,23 @@ void registerApiEndpoints(Webserver* webserver) {
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/ntp/config", HTTP_POST, [webserver]() { handleNtpConfigSet(webserver); });
 
-    // @openapi {get} /display/rotation version=v1 group=Display summary="Get display rotation" requiresAuth=true
+    // @openapi {get} /display/rotation version=v1 group=Display summary="Get display rotation and mirror settings" requiresAuth=true
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/display/rotation", HTTP_GET, [webserver]() { handleDisplayRotationGet(webserver); });
 
-    // @openapi {post} /display/rotation version=v1 group=Display summary="Set display rotation" requiresAuth=true
-    // requestBody=application/json requestBodySchema=rotation:integer example={"rotation":4}
+    // @openapi {post} /display/rotation version=v1 group=Display summary="Set display rotation (optionally with mirror flags)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=rotation:integer,lcd_mirror_x:boolean,lcd_mirror_y:boolean example={"rotation":4,"lcd_mirror_x":false,"lcd_mirror_y":false}
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/display/rotation", HTTP_POST, [webserver]() { handleDisplayRotationSet(webserver); });
+
+    // @openapi {get} /display/mirror version=v1 group=Display summary="Get display mirror (MADCTL MX/MY) settings" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/display/mirror", HTTP_GET, [webserver]() { handleDisplayMirrorGet(webserver); });
+
+    // @openapi {post} /display/mirror version=v1 group=Display summary="Set display mirror (MADCTL MX/MY) and apply immediately" requiresAuth=true
+    // requestBody=application/json requestBodySchema=lcd_mirror_x:boolean,lcd_mirror_y:boolean example={"lcd_mirror_x":true,"lcd_mirror_y":false}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/display/mirror", HTTP_POST, [webserver]() { handleDisplayMirrorSet(webserver); });
 
     // @openapi {post} /reboot version=v1 group=System summary="Reboot the device" requiresAuth=true
     // responses=200:application/json,401:application/json
@@ -172,6 +191,16 @@ void registerApiEndpoints(Webserver* webserver) {
     // @openapi {post} /logs/clear version=v1 group=System summary="Clear log buffer" requiresAuth=true
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/logs/clear", HTTP_POST, [webserver]() { handleLogsClear(webserver); });
+
+    // @openapi {get} /opencodego/config version=v1 group=OpenCodeGo summary="Get OpenCode Go usage config" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/opencodego/config", HTTP_GET, [webserver]() { handleOpenCodeGoConfigGet(webserver); });
+
+    // @openapi {post} /opencodego/config version=v1 group=OpenCodeGo summary="Set OpenCode Go usage config" requiresAuth=true
+    // requestBody=application/json requestBodySchema=opencodego_host:string,opencodego_path:string,opencodego_api_key:string,verify_tls_cert:integer
+    // example={"opencodego_host":"opencode.ai","opencodego_path":"/zen/go/v1/usage","opencodego_api_key":"sk-...","verify_tls_cert":1}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/opencodego/config", HTTP_POST, [webserver]() { handleOpenCodeGoConfigSet(webserver); });
 
     webserver->raw().onNotFound([webserver]() {
         if (webserver->raw().method() == HTTP_OPTIONS) {
@@ -839,6 +868,8 @@ void handleDisplayRotationGet(Webserver* webserver) {
 
     JsonDocument doc;
     doc["rotation"] = configManager.getLCDRotationSafe();
+    doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
+    doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
 
     String json;
     serializeJson(doc, json);
@@ -907,6 +938,15 @@ void handleDisplayRotationSet(Webserver* webserver) {
     }
 
     auto newRotation = static_cast<uint8_t>(rotation);
+
+    // 可选镜像翻转参数：POST 体中带 lcd_mirror_x / lcd_mirror_y（bool）则一并持久化
+    if (ddoc["lcd_mirror_x"].is<bool>()) {
+        configManager.setLCDMirrorX(ddoc["lcd_mirror_x"].as<bool>());
+    }
+    if (ddoc["lcd_mirror_y"].is<bool>()) {
+        configManager.setLCDMirrorY(ddoc["lcd_mirror_y"].as<bool>());
+    }
+
     configManager.setLCDRotation(newRotation);
     String currentIP = "unknown";
 
@@ -933,6 +973,8 @@ void handleDisplayRotationSet(Webserver* webserver) {
     JsonDocument doc;
     doc["status"] = "ok";
     doc["rotation"] = newRotation;
+    doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
+    doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
 
     String json;
     serializeJson(doc, json);
@@ -941,6 +983,111 @@ void handleDisplayRotationSet(Webserver* webserver) {
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 
     Logger::info(("Display rotation updated to " + String(newRotation)).c_str(), "API");
+}
+
+/**
+ * @brief Get display mirror (MADCTL MX/MY) configuration
+ */
+void handleDisplayMirrorGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
+    doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Set display mirror (MADCTL MX/MY) configuration and apply immediately
+ */
+void handleDisplayMirrorSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Missing JSON body";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    String body = webserver->raw().arg("plain");
+    JsonDocument ddoc;
+    DeserializationError err = deserializeJson(ddoc, body);
+
+    if (err || !(ddoc["lcd_mirror_x"].is<bool>() || ddoc["lcd_mirror_y"].is<bool>())) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Invalid JSON or missing lcd_mirror_x/lcd_mirror_y";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    if (ddoc["lcd_mirror_x"].is<bool>()) {
+        configManager.setLCDMirrorX(ddoc["lcd_mirror_x"].as<bool>());
+    }
+    if (ddoc["lcd_mirror_y"].is<bool>()) {
+        configManager.setLCDMirrorY(ddoc["lcd_mirror_y"].as<bool>());
+    }
+
+    // 立刻应用：重设 rotation（内部重发 MADCTL 并按镜像位翻转）
+    String currentIP = "unknown";
+    if (wifiManager != nullptr) {
+        currentIP = wifiManager->getIP().toString();
+    }
+
+    DisplayManager::setRotation(configManager.getLCDRotationSafe(), currentIP);
+
+    if (!configManager.save()) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Failed to save config";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+
+        return;
+    }
+
+    JsonDocument doc;
+    doc["status"] = "ok";
+    doc["lcd_mirror_x"] = configManager.getLCDMirrorX();
+    doc["lcd_mirror_y"] = configManager.getLCDMirrorY();
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+
+    Logger::info(("Display mirror updated: x=" + String(configManager.getLCDMirrorX() ? "1" : "0") +
+                  " y=" + String(configManager.getLCDMirrorY() ? "1" : "0"))
+                     .c_str(),
+                 "API");
 }
 
 /**
@@ -1390,7 +1537,7 @@ static void otaHandleStart(HTTPUpload& upload, int mode) {
 
     if (!Update.begin(place, mode)) {
         otaError = true;
-        otaStatus = Update.getErrorString();
+        otaStatus = updaterErrorString();
         Logger::error((String("Update.begin failed: ") + otaStatus).c_str(), "API::OTA");
     }
 }
@@ -1420,7 +1567,7 @@ static void otaHandleWrite(HTTPUpload& upload) {
 
         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
             otaError = true;
-            otaStatus = Update.getErrorString();
+            otaStatus = updaterErrorString();
             Logger::error((String("Write failed: ") + otaStatus).c_str(), "API::OTA");
         }
 
@@ -1459,7 +1606,7 @@ static void otaHandleEnd(HTTPUpload& /*upload*/, int mode) {
                                             true);
         } else {
             otaError = true;
-            otaStatus = Update.getErrorString();
+            otaStatus = updaterErrorString();
         }
     }
 }
@@ -1547,4 +1694,141 @@ void handleLogsClear(Webserver* webserver) {
 
     setCorsHeaders(webserver);
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Mask an OpenCode Go API key as sk-***<last4>
+ * @param key Full API key
+ *
+ * @return Masked key string, or empty string when key is empty
+ */
+static String maskOpenCodeGoApiKey(const String& key) {
+    if (key.isEmpty()) {
+        return "";
+    }
+    constexpr size_t TAIL_LEN = 4;
+    if (key.length() <= TAIL_LEN) {
+        return "sk-****";
+    }
+    return "sk-***" + key.substring(key.length() - TAIL_LEN);
+}
+
+/**
+ * @brief Get OpenCode Go usage configuration (api key masked)
+ */
+void handleOpenCodeGoConfigGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["opencodego_host"] = configManager.getOpenCodeGoHost();
+    doc["opencodego_path"] = configManager.getOpenCodeGoPath();
+    doc["opencodego_api_key"] = maskOpenCodeGoApiKey(String(configManager.getOpenCodeGoApiKey()));
+    doc["verify_tls_cert"] = configManager.getVerifyTlsCert() ? 1 : 0;
+    doc["api_key_configured"] = configManager.getOpenCodeGoApiKey()[0] != '\0';
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Set OpenCode Go usage configuration
+ */
+void handleOpenCodeGoConfigSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Missing JSON body";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    String body = webserver->raw().arg("plain");
+    JsonDocument ddoc;
+    DeserializationError err = deserializeJson(ddoc, body);
+
+    if (err) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Invalid JSON";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    const char* host = ddoc["opencodego_host"] | "";
+    const char* path = ddoc["opencodego_path"] | "";
+    const char* apiKey = ddoc["opencodego_api_key"] | "";
+
+    if (strlen(host) == 0 || strlen(path) == 0) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "opencodego_host and opencodego_path are required";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+
+        return;
+    }
+
+    configManager.setOpenCodeGoHost(host);
+    configManager.setOpenCodeGoPath(path);
+    // api_key 为空表示不修改已保存的 Key（避免 GET 回显打码值被误存回）
+    if (strlen(apiKey) != 0 && !String(apiKey).startsWith("sk-***")) {
+        configManager.setOpenCodeGoApiKey(apiKey);
+    }
+    if (ddoc["verify_tls_cert"].is<int>()) {
+        configManager.setVerifyTlsCert(ddoc["verify_tls_cert"].as<int>() != 0);
+    }
+
+    if (!configManager.save()) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Failed to save config";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
+
+        return;
+    }
+
+    JsonDocument doc;
+    doc["status"] = "ok";
+    doc["opencodego_host"] = configManager.getOpenCodeGoHost();
+    doc["opencodego_path"] = configManager.getOpenCodeGoPath();
+    doc["opencodego_api_key"] = maskOpenCodeGoApiKey(String(configManager.getOpenCodeGoApiKey()));
+    doc["verify_tls_cert"] = configManager.getVerifyTlsCert() ? 1 : 0;
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+
+    Logger::info("OpenCodeGo config updated", "API");
 }

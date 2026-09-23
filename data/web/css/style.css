@@ -229,3 +229,32 @@ details.dropdown ul li a:hover {
   width: 18px;
   height: 18px;
 }
+
+.opencodego-status {
+  margin-top: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5em;
+  font-size: small;
+}
+
+.opencodego-status.success {
+  background: rgba(76, 175, 80, 0.18);
+  color: #1b5e20;
+}
+
+.opencodego-status.error {
+  background: rgba(244, 67, 54, 0.18);
+  color: #b71c1c;
+}
+
+[data-theme="dark"] .opencodego-status.success {
+  color: #a5d6a7;
+}
+
+[data-theme="dark"] .opencodego-status.error {
+  color: #ef9a9a;
+}
+
+[x-cloak] {
+  display: none !important;
+}

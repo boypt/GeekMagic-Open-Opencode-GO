@@ -65,6 +65,33 @@ class ConfigManager {
     bool getLCDInitSd2() const { return lcd_init_sd2; }
     void setLCDInitSd2(bool enable) { lcd_init_sd2 = enable; }
 
+    // ---- WS2812 氛围灯（GPIO12，本机加装）----
+    bool getLedOn() const { return led_on; }
+    void setLedOn(bool on) { led_on = on; }
+    /// 0=常亮 solid 1=呼吸 breathe 2=彩虹 rainbow
+    uint8_t getLedMode() const { return led_mode; }
+    void setLedMode(int mode) { led_mode = (mode >= 0 && mode <= 2) ? static_cast<uint8_t>(mode) : 0; }
+    void getLedColor(uint8_t& r, uint8_t& g, uint8_t& b) const {
+        r = led_r;
+        g = led_g;
+        b = led_b;
+    }
+    void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+        led_r = r;
+        led_g = g;
+        led_b = b;
+    }
+    uint8_t getLedBrightness() const { return led_brightness; }
+    void setLedBrightness(int percent) {
+        if (percent < 1) {
+            percent = 1;
+        }
+        if (percent > 100) {
+            percent = 100;
+        }
+        led_brightness = static_cast<uint8_t>(percent);
+    }
+
     // ---- LCD 背光亮度（0..100 百分比，PWM 反相输出）----
     // 决策：下限钳到 1 而非 0，避免误设 0 后全黑只能靠 API 恢复；
     // 需要真关断的场景（如未来定时息屏）应走专门的 off 路径。
@@ -117,6 +144,14 @@ class ConfigManager {
 
     // LCD 背光亮度百分比（1..100），默认 78 ≈ 旧工程 BRIGHTNESS=800/1023
     uint8_t lcd_brightness = 78;
+
+    // ---- WS2812 氛围灯（GPIO12）----
+    bool led_on = false;
+    uint8_t led_mode = 0;  // 0=常亮 1=呼吸 2=彩虹
+    uint8_t led_r = 255;
+    uint8_t led_g = 140;
+    uint8_t led_b = 40;
+    uint8_t led_brightness = 60;
     std::string ntp_server;
 
     // OpenCode Go 用量配置（api_key 走 SecureStorage，host/path/tls 开关走 config.json）

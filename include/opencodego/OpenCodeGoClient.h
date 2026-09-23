@@ -230,25 +230,36 @@ OpenCodeGoHttpResponse readHttpResponse(WiFiClientSecure& client, uint32_t timeo
 // 单次请求：host/path/apiKey/verifyTlsCert 由参数传入
 bool fetchOpenCodeGoUsageOnce(OpenCodeGoUsage& out, const char* host, const char* path,
                               const char* apiKey, bool verifyTlsCert, uint32_t timeout_ms) {
+    // 低堆保护栏【必须在 WiFiClientSecure 构造之前】：其构造/引擎分配在低堆时
+    // 会以 bad_alloc -> abort 直接重启（实测 <~5.8KB 时触发）。跳过本条尝试留给下一轮
+    if (ESP.getFreeHeap() < 5500) {
+        out.error = "Low memory";
+        return false;
+    }
+
     WiFiClientSecure client;
     // TLS 缓冲区削减：BearSSL 默认 rx 16384 + tx 512 ≈ 17.3KB heap，改为
-    // 4096/512（≈5KB），给 instruction cache/stack/JSON 解析留 heap 余量。
+    // 1024/512（拉取峰值 ≈5KB 含引擎/thunk），与常驻的 16KB GIF LZW 字典池
+    // 共存（本机唯二大块头之一，勿再扩大）。MFLN 最小档 512 会被部分服务端
+    // 以 illegal_parameter 秒拒，1024 为实测可用档。
     // 说明：rx < 16384 依赖服务器支持 TLS MFLN (RFC 6066)；当前 OpenCode
     // 服务器已验证支持 MFLN。若切换 host 后握手失败（getLastSSLError 报
     // handshake/write error），说明对端不支持 MFLN：临时回退默认缓冲
     // （删掉本行，代价 heap +12KB，需同步减小其他内存占用）。
-    client.setBufferSizes(4096, 512);
+    client.setBufferSizes(1024, 512);
     applyTrustAnchors(client, verifyTlsCert);
     client.setTimeout(timeout_ms);  // Stream 超时单位为 ms（勿除以 1000）
 
     uint32_t t0 = millis();
+    Serial.printf("TLS: connect begin, free %u B, max block %u B\n", ESP.getFreeHeap(),
+                  ESP.getMaxFreeBlockSize());
     // 说明：本核心的 connect() 无超时参数，握手耗时由 BearSSL 内部约束
     // （长链验证最坏约 15s），readHttpResponse 侧另有 timeout_ms 兜底。
     if (!client.connect(host, 443)) {
         char sslErr[64] = {0};
         client.getLastSSLError(sslErr, sizeof(sslErr));
-        Serial.printf("TLS connect failed after %lu ms, ssl=%s\n",
-                      static_cast<unsigned long>(millis() - t0), sslErr);
+        Serial.printf("TLS connect failed after %lu ms, ssl=%s, free %u B\n",
+                      static_cast<unsigned long>(millis() - t0), sslErr, ESP.getFreeHeap());
         out.error = "Network error";
         client.stop();
         return false;

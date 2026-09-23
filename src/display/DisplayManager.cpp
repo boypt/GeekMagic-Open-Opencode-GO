@@ -22,13 +22,11 @@
 #include <array>
 #include <algorithm>
 #include <Arduino.h>
+#include <new>
 
 #include "project_version.h"
 #include "display/DisplayManager.h"
 #include "config/ConfigManager.h"
-#include "display/Gif.h"
-
-static Gif* g_gif = nullptr;
 
 extern ConfigManager configManager;
 
@@ -845,81 +843,6 @@ void DisplayManager::drawLoadingBar(float progress, int yPos, int barWidth, int 
     }
 
     yield();
-}
-
-/**
- * @brief Play a single GIF file in full screen mode (blocking)
- *
- * @param path Path to the GIF file on LittleFS
- * @param timeMs Duration to play the GIF in milliseconds (0 = play full GIF)
- * @return true if played successfully, false on error
- */
-auto DisplayManager::playGifFullScreen(const String& path, uint32_t timeMs) -> bool {
-    if (g_gif == nullptr) {
-        g_gif = new Gif();
-        if (g_gif == nullptr) {
-            Logger::error("Failed to allocate GIF decoder", "DisplayManager");
-            return false;
-        }
-    }
-
-    g_gif->stop();
-
-    if (!g_gif->begin()) {
-        return false;
-    }
-
-    DisplayManager::clearScreen();
-
-    g_gif->setLoopEnabled(timeMs == 0);
-
-    const bool started = g_gif->playOne(path);
-    if (!started) {
-        return false;
-    }
-
-    if (timeMs == 0) {
-        return true;
-    }
-
-    const uint32_t startMs = millis();
-    const uint32_t endMs = startMs + timeMs;
-
-    while (g_gif->isPlaying() && static_cast<int32_t>(millis() - endMs) < 0) {
-        g_gif->update();
-        yield();
-    }
-
-    if (g_gif->isPlaying()) {
-        g_gif->stop();
-    }
-
-    return true;
-}
-
-/**
- * @brief Stop GIF playback if playing
- *
- * @return true
- */
-auto DisplayManager::stopGif() -> bool {
-    if (g_gif != nullptr) {
-        g_gif->stop();
-    }
-
-    DisplayManager::clearScreen();
-
-    return true;
-}
-/**
- * @brief Update the GIF decoder (should be called regularly in loop)
- *
- * @return void
- */
-auto DisplayManager::update() -> void {
-    if (g_gif != nullptr) {
-        g_gif->update();
-    }
 }
 
 /**

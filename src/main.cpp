@@ -30,6 +30,9 @@
 #include "display/DisplayManager.h"
 #include "web/Webserver.h"
 #include "web/Api.h"
+#include "display/SceneManager.h"
+#include "led/AmbientLight.h"
+#include "display/Scenes.h"
 #include "ntp/NTPClient.h"
 #include "boot/RescueMode.h"
 #include "dashboard/DashboardManager.h"
@@ -180,13 +183,19 @@ void setup() {
 
     delay(LOADING_DELAY_MS);
 
-    DisplayManager::drawStartup(wifiManager->getIP().toString());
+    // 场景系统接管显示面：开机先显示 IP 画面（startup 场景），
+    // 展示片刻后自动进入 balance；后续切换统一走 SceneManager（退场重绘契约）
+    registerBuiltinScenes();
+    SceneManager::switchTo("startup");
 
     if (METRICS_ENDPOINT[0] != '\0' && WiFiManager::isConnected() && !wifiManager->isApMode()) {
         DashboardManager::begin(METRICS_ENDPOINT);
     }
 
     UsageManager::begin();
+
+    // WS2812 氛围灯（GPIO12）
+    AmbientLight::begin();
 
     // enable watchdog before going to loop()
     // 2 seconds should be way more than the main loop needs to do stuff
@@ -213,16 +222,17 @@ void loop() {
         ntpClient->loop();
     }
 
-    DisplayManager::update();
+    // WS2812 氛围灯效果 tick（独立于显示场景）
+    AmbientLight::update();
+
+    // 场景调度：仅驱动当前场景（startup / balance / album ...），
+    // 场景切换统一经 SceneManager::switchTo()（退场重绘）
+    SceneManager::update();
 
     if (METRICS_ENDPOINT[0] != '\0' && wifiManager != nullptr && WiFiManager::isConnected() &&
         !wifiManager->isApMode()) {
         DashboardManager::update();
     }
-
-    // UsageManager::update() 内部自管绘制时机：WiFi 就绪才轮询/局部重绘，
-    // 主页面绘制后每秒 tick 时钟（WiFi 掉线也走时），AP 模式只保持 boot 页
-    UsageManager::update();
 
     static unsigned long last_free_heap_log = 0;
     static constexpr unsigned long FREE_HEAP_LOG_INTERVAL_MS = 10000UL;

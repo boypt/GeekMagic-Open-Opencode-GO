@@ -31,6 +31,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 ## 硬件与显示
 
 - ST7789 240x240，SPI Mode3 40MHz，无 CS（引脚固化在 `include/config/ConfigManager.h`：MOSI=13 SCK=14 DC=0 RST=2，背光 GPIO5 低有效）。
+- **WS2812 氛围灯**（本机加装，上游无）：数据脚 **GPIO12**，默认 1 颗（`include/led/AmbientLight.h` 的 `WS2812_LED_COUNT`），效果 tick 在 main loop 与场景无关；控制见 `/api/v1/light` 与首页控制块。
 - 图形库是 **Arduino_GFX**（不是 TFT_eSPI）；面板初始化走 `src/display/DisplayManager.cpp::lcdRunVendorInit()`（厂商序列，含 gamma/电源/VCOM），另有 `lcdRunSd2Init()`（旧 sd2 精简序列）可切换。
 - **本面板色序是 BGR**：旧 sd2 用 TFT_eSPI 的 ST7789_2 驱动（240x240 自动定义 CGRAM_OFFSET → MADCTL 带 BGR 位 0x08），所以 `lcd_bgr` 默认 **true**。改这个之前先确认观感（红蓝互换是最明显症状）。
 - 亮度：GPIO5 反相 PWM（`analogWriteRange(1023)`，`analogWrite(pin, 1023 - duty)`），`lcd_brightness` 0-100。
@@ -46,6 +47,9 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 | `include/opencodego/SegFont7.h` | TFT_eSPI Font7 原字模解码的 1bpp 行位图（0-9 : -，32x48），像素级还原旧七段观感 |
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
+| `include/display/Scene.h` + `src/display/SceneManager.cpp` | 场景接口 + 调度器：显示面唯一切换入口 `switchTo()`（退场重绘契约：旧场景 exit 禁画/释放，新场景 enter 全量绘制；失败回滚重绘上一场景） |
+| `src/display/Scenes.cpp` | 内置场景：`startup`（开机 IP 画面）/ `balance`（额度+时钟）/ `album`（静态相册：param=文件名常驻单张、空=循环轮播 5s/张）/ `live`（实时推图：API 流式直绘、不落盘、常驻最后一帧）。**全手工切换：场景间无任何自动跳转**，一律 `switchTo` |
+| `src/display/Scenes.cpp`（AlbumScene/LiveScene） | 相册图片 = `/album/<name>.rgb565`（240x240 RGB565(LE) 115200B，Web 端 canvas 转换上传，jpg/png 等任意源图）；`POST /album/live` 同格式流式推帧（480B 行缓冲逐行直绘、不保存），推送时若不在 live 场景则自动接管屏幕 |
 | `src/config/ConfigManager.cpp` | `config.json`（LittleFS）+ SecureStorage（EEPROM NVS）双层配置 |
 | `src/boot/RescueMode.cpp` | boot-loop 保护（见"已知坑"） |
 | `src/web/Api.cpp` + `data/web/` | REST API + Web 配置页（pico.css + Alpine.js，无构建步骤） |
@@ -62,6 +66,9 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 - WiFi：`GET /wifi/scan|status`，`POST /wifi/connect`
 - NTP：`GET /ntp/status|config`，`POST /ntp/sync|config`
 - 显示：`GET/POST /display/rotation`（含 lcd_bgr/lcd_init_sd2/镜像）、`GET/POST /display/mirror`、`GET/POST /display/brightness`
+- 相册：`GET/POST/DELETE /album`（图片 = 240x240 RGB565 原始位图 `.rgb565`，Web 端转换上传；上传时校验整幅尺寸 115200B）；`POST /album/live`（multipart 流式推一帧实时显示、**不保存**——脚本/HA 推画面用；不在 live 场景时自动接管）
+- 灯光：`GET/POST /light`（WS2812 氛围灯：`on/mode(solid|breathe|rainbow)/r,g,b/brightness`，部分更新，持久化 config.json `led_*`）
+- 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动场景跳转，全手工**；live 推图自动接管是唯一例外
 - OpenCode Go：`GET/POST /opencodego/config`（body 字段名是 `opencodego_host/opencodego_path/opencodego_api_key`，不是 host/path）、`GET/POST/DELETE /opencodego/ca`（PEM 全文 `{"pem":"..."}`）
 - 系统：`POST /reboot`、`GET /logs`、`POST /ota/fw|fs|cancel`、`GET /ota/status`、`GET/POST /token/check|save`、GIF 若干
 - rescue 模式（AP `GeekMagic` @192.168.4.1，无鉴权）：`GET /rescue/status`，`POST /rescue/reset|reboot|token|ota`
@@ -76,6 +83,9 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 6. **刷文件系统覆盖设备 config.json**（见"配置系统"）。
 7. 上传时报 `Invalid head of packet`：重试即可；报 PermissionError：先关掉占用串口的 monitor。
 8. `connect()` 无超时参数（本核心），TLS 握手最坏约 15s，长链（4 证书 + RSA-4096）验证较重，首次偶发失败由重试兜底（日志 `Fetch recovered on attempt 2` 属正常）。
+9. **堆碎片：空闲总量够 ≠ 能分配**。实测 `free 22KB / max block 13KB`，任何 >13KB 的整体 `new` 必失败；且 park 释放的大洞会被小块分配切碎、再也拼不回去。**结论（已付过学费）**：80KB RAM 塞不下 GIF 解码器（对象+LZW 字典 ≥20KB），相关方案（vendored AnimatedGIF/字典池交接）已整体删除，相册改为静态 RGB565 图（零解码、~3.8KB 行缓冲）。新功能若需 >4KB 连续块，先想清楚碎片化与拉取互斥。
+10. **WiFiClientSecure 低堆会 abort 重启**：构造 + `setInsecure()` 一次性分配 ~6.4KB（引擎+thunk+缓冲），堆不足时 bad_alloc → `Abort called`（栈特征 `__unhandled_exception ← stack_thunk_add_ref`），且拉取重试路径会放大成重启循环。低堆保护栏（`free < 5500` 跳过本轮）**必须放在 `WiFiClientSecure` 构造之前**（`OpenCodeGoClient.h`）。
+11. **MFLN 档位**：TLS rx<16384 依赖 MFLN（RFC 6066）；**512 档会被服务端 illegal_parameter 秒拒**（11ms 失败），1024/512 实测可用，拉取峰值 ~8.5KB（当前空闲 ~19KB，宽裕）。
 
 ## 验证工作流
 

@@ -80,6 +80,14 @@ auto ConfigManager::load() -> bool {
     const int lcd_brightness_cfg = doc["lcd_brightness"] | (int)lcd_brightness;
     this->setLCDBrightness(lcd_brightness_cfg);
 
+    // WS2812 氛围灯
+    this->led_on = doc["led_on"] | led_on;
+    this->setLedMode(doc["led_mode"] | (int)led_mode);
+    this->led_r = doc["led_r"] | led_r;
+    this->led_g = doc["led_g"] | led_g;
+    this->led_b = doc["led_b"] | led_b;
+    this->setLedBrightness(doc["led_brightness"] | (int)led_brightness);
+
     String nvs_ssid = secure.get("wifi_ssid", "");
     String nvs_password = secure.get("wifi_password", "");
     String nvs_api_token = secure.get("api_token", "");
@@ -245,6 +253,12 @@ auto ConfigManager::save() -> bool {
     doc["lcd_bgr"] = lcd_bgr;
     doc["lcd_init_sd2"] = lcd_init_sd2;
     doc["lcd_brightness"] = lcd_brightness;
+    doc["led_on"] = led_on;
+    doc["led_mode"] = led_mode;
+    doc["led_r"] = led_r;
+    doc["led_g"] = led_g;
+    doc["led_b"] = led_b;
+    doc["led_brightness"] = led_brightness;
     if (!this->ntp_server.empty()) {
         doc["ntp_server"] = this->ntp_server.c_str();
     }

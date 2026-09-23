@@ -518,13 +518,28 @@ void UsageManager::begin() {
     ever_started = true;
     // 首次尽快轮询
     last_poll_ms = millis() - FAST_RETRY_MS;
+    Logger::info("UsageManager initialized", "OpenCodeGo");
+}
+
+// 场景入场：必须从零绘制所有元素（场景切换契约）
+void UsageManager::enterScene() {
+    mainPageDrawn = false;
+    lastClockMinute = -1;
+    lastClockSecond = -1;
+
     if (WiFiManager::isConnected()) {
         drawMainPage();
         mainPageDrawn = true;
     } else {
         drawBootPage(true);
     }
-    Logger::info("UsageManager initialized", "OpenCodeGo");
+}
+
+// 场景退场：复位局部更新状态，防止下次 tick 按旧基准补笔留残影
+void UsageManager::exitScene() {
+    mainPageDrawn = false;
+    lastClockMinute = -1;
+    lastClockSecond = -1;
 }
 
 void UsageManager::update() {
@@ -580,6 +595,8 @@ void UsageManager::update() {
     }
 
     Serial.printf("Free heap before fetch: %u B\n", ESP.getFreeHeap());
+    // 拉取峰值 ~8.5KB（MFLN 1024/512 + thunk）；低堆保护栏见 OpenCodeGoClient.h。
+    // 相册显示为流式送屏（~4KB 行缓冲），且与拉取经场景系统互斥，无需让路
     OpenCodeGoUsage fetched;
     bool ok = fetchOpenCodeGoUsage(fetched, configManager.getOpenCodeGoHost(),
                                    configManager.getOpenCodeGoPath(),

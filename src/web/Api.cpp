@@ -26,6 +26,13 @@
 #include "web/Webserver.h"
 #include "web/Api.h"
 #include "display/DisplayManager.h"
+#include "display/SceneManager.h"
+#include "led/AmbientLight.h"
+#include <Arduino_GFX_Library.h>
+#include <WiFiClient.h>
+
+/// 相册整幅尺寸：240x240 RGB565(LE)
+static constexpr size_t ALBUM_IMG_BYTES = 240UL * 240UL * 2UL;
 
 #include "config/ConfigManager.h"
 #include "wireless/WiFiManager.h"
@@ -159,29 +166,40 @@ void registerApiEndpoints(Webserver* webserver) {
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/ota/cancel", HTTP_POST, [webserver]() { handleOtaCancel(webserver); });
 
-    // @openapi {post} /gif version=v1 group=GIF summary="Upload a GIF" requiresAuth=true
+    // @openapi {post} /album version=v1 group=Album summary="Upload an album image (240x240 RGB565 raw, converted by the web client)" requiresAuth=true
     // requestBody=multipart/form-data responses=200:application/json,401:application/json
     webserver->raw().on(
-        "/api/v1/gif", HTTP_POST, [webserver]() { handleGifUpload(webserver); },
+        "/api/v1/album", HTTP_POST, [webserver]() { handleAlbumUploadDone(webserver); },
         [webserver]() { handleGifUpload(webserver); });
 
-    // @openapi {post} /gif/play version=v1 group=GIF summary="Play a GIF by name" requiresAuth=true
-    // requestBody=application/json requestBodySchema=name:string example={"name":"animation.gif"}
+    // @openapi {delete} /album version=v1 group=Album summary="Delete an album image by name" requiresAuth=true
+    // requestBody=application/json requestBodySchema=name:string example={"name":"photo.rgb565"}
     // responses=200:application/json,400:application/json,401:application/json,404:application/json
-    webserver->raw().on("/api/v1/gif/play", HTTP_POST, [webserver]() { handlePlayGif(webserver); });
+    webserver->raw().on("/api/v1/album", HTTP_DELETE, [webserver]() { handleDeleteGif(webserver); });
 
-    // @openapi {post} /gif/stop version=v1 group=GIF summary="Stop GIF playback" requiresAuth=true
+    // @openapi {get} /album version=v1 group=Album summary="List album images" requiresAuth=true
     // responses=200:application/json,401:application/json
-    webserver->raw().on("/api/v1/gif/stop", HTTP_POST, [webserver]() { handleStopGif(webserver); });
+    webserver->raw().on("/api/v1/album", HTTP_GET, [webserver]() { handleListGifs(webserver); });
 
-    // @openapi {delete} /gif version=v1 group=GIF summary="Delete a GIF by name" requiresAuth=true
-    // requestBody=application/json requestBodySchema=name:string example={"name":"animation.gif"}
-    // responses=200:application/json,400:application/json,401:application/json,404:application/json
-    webserver->raw().on("/api/v1/gif", HTTP_DELETE, [webserver]() { handleDeleteGif(webserver); });
+    // @openapi {post} /album/live version=v1 group=Album summary="Stream one live frame (240x240 RGB565, multipart) - drawn immediately, not saved" requiresAuth=true
+    // requestBody=multipart/form-data responses=200:application/json,401:application/json
+    webserver->raw().on(
+        "/api/v1/album/live", HTTP_POST, [webserver]() { handleLivePushDone(webserver); },
+        [webserver]() { handleLivePush(webserver); });
 
-    // @openapi {get} /gif version=v1 group=GIF summary="List GIFs" requiresAuth=true
-    // responses=200:application/json,401:application/json
-    webserver->raw().on("/api/v1/gif", HTTP_GET, [webserver]() { handleListGifs(webserver); });
+    // @openapi {get} /scene version=v1 group=Scene summary="Get current scene and available scenes" requiresAuth=true
+    webserver->raw().on("/api/v1/scene", HTTP_GET, [webserver]() { handleSceneGet(webserver); });
+
+    // @openapi {post} /scene version=v1 group=Scene summary="Switch display scene (old scene exits, new scene fully redraws)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=scene:string,param:string example={"scene":"gif","param":"animation.gif"}
+    webserver->raw().on("/api/v1/scene", HTTP_POST, [webserver]() { handleSceneSet(webserver); });
+
+    // @openapi {get} /light version=v1 group=Light summary="Get WS2812 ambient light settings" requiresAuth=true
+    webserver->raw().on("/api/v1/light", HTTP_GET, [webserver]() { handleLightGet(webserver); });
+
+    // @openapi {post} /light version=v1 group=Light summary="Set WS2812 ambient light (partial update)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=on:boolean,mode:string,r:integer,g:integer,b:integer,brightness:integer example={"on":true,"mode":"breathe","r":255,"g":140,"b":40,"brightness":60}
+    webserver->raw().on("/api/v1/light", HTTP_POST, [webserver]() { handleLightSet(webserver); });
 
     // @openapi {get} /token/check version=v1 group=Authentication summary="Check bearer token validity"
     // requiresAuth=true responses=200:application/json,401:application/json
@@ -449,7 +467,7 @@ void handleOtaCancel(Webserver* webserver) {
 }
 
 /**
- * @brief List GIF files and FS info
+ * @brief List album images and FS info
  * @param webserver Pointer to the Webserver instance
  *
  * @return void
@@ -466,11 +484,11 @@ void handleListGifs(Webserver* webserver) {
     size_t totalBytes = 0;
 
     if (LittleFS.begin()) {
-        Dir dir = LittleFS.openDir("/gif");
+        Dir dir = LittleFS.openDir("/album");
 
         while (dir.next()) {
             String name = dir.fileName();
-            if (name.endsWith(".gif") || name.endsWith(".GIF")) {
+            if (name.endsWith(".rgb565")) {
                 JsonObject fileObj = files.add<JsonObject>();
 
                 fileObj["name"] = name;            // NOLINT(readability-misplaced-array-index)
@@ -508,22 +526,22 @@ void handleListGifs(Webserver* webserver) {
  */
 void handleGifUploadStart(const String& currentFilename, File& gifFile, bool& uploadError) {
     uploadError = false;
-    Logger::info((String("UPLOAD_FILE_START for: ") + currentFilename).c_str(), "API::GIF");
+    Logger::info((String("UPLOAD_FILE_START for: ") + currentFilename).c_str(), "API::Album");
 
-    if (!LittleFS.exists("/gif")) {
-        Logger::info("/gif directory does not exist, creating...", "API::GIF");
-        if (!LittleFS.mkdir("/gif")) {
-            Logger::error("Failed to create /gif directory!", "API::GIF");
+    if (!LittleFS.exists("/album")) {
+        Logger::info("/album directory does not exist, creating...", "API::Album");
+        if (!LittleFS.mkdir("/album")) {
+            Logger::error("Failed to create /album directory!", "API::Album");
         }
     }
 
     gifFile = LittleFS.open(currentFilename, "w");
     if (!gifFile) {
         uploadError = true;
-        Logger::error((String("Impossible to open file: ") + currentFilename).c_str(), "API::GIF");
-        Logger::error("GIF UPLOAD Failed to open file", "API::GIF");
+        Logger::error((String("Impossible to open file: ") + currentFilename).c_str(), "API::Album");
+        Logger::error("GIF UPLOAD Failed to open file", "API::Album");
     } else {
-        Logger::info("File opened successfully for writing.", "API::GIF");
+        Logger::info("File opened successfully for writing.", "API::Album");
     }
 }
 
@@ -545,7 +563,7 @@ void handleGifUploadWrite(HTTPUpload& upload, File& gifFile, bool& uploadError) 
             size_t written = gifFile.write(upload.buf + total, toWrite);
 
             if (written == 0) {
-                Logger::error("Write returned 0 bytes!", "API::GIF");
+                Logger::error("Write returned 0 bytes!", "API::Album");
                 uploadError = true;
                 break;
             }
@@ -553,7 +571,7 @@ void handleGifUploadWrite(HTTPUpload& upload, File& gifFile, bool& uploadError) 
             total += written;
         }
     } else {
-        Logger::error("Cannot write, file not open or previous error", "API::GIF");
+        Logger::error("Cannot write, file not open or previous error", "API::Album");
     }
 }
 
@@ -564,12 +582,28 @@ void handleGifUploadWrite(HTTPUpload& upload, File& gifFile, bool& uploadError) 
  *
  * @return void
  */
-void handleGifUploadEnd(const String& currentFilename, File& gifFile) {
+void handleGifUploadEnd(const String& currentFilename, File& gifFile, bool& uploadError) {
     if (gifFile) {
         gifFile.close();
     }
 
-    Logger::info((String("Gif upload end: ") + currentFilename).c_str(), "API::GIF");
+    // 校验整幅尺寸：240x240 RGB565 = 115200B，残图/错格式直接拒绝
+    if (!uploadError) {
+        File check = LittleFS.open(currentFilename, "r");
+        const size_t size = check ? check.size() : 0;
+
+        if (check) {
+            check.close();
+        }
+
+        if (size != ALBUM_IMG_BYTES) {
+            LittleFS.remove(currentFilename);
+            uploadError = true;
+            Logger::error((String("Album upload size mismatch: ") + String(size)).c_str(), "API::Album");
+        }
+    }
+
+    Logger::info((String("Album upload end: ") + currentFilename).c_str(), "API::Album");
 }
 
 /**
@@ -581,19 +615,19 @@ void handleGifUploadEnd(const String& currentFilename, File& gifFile) {
  * @return void
  */
 void handleGifUploadAborted(const String& currentFilename, File& gifFile, bool& uploadError) {
-    Logger::warn("UPLOAD_FILE_ABORTED", "API::GIF");
+    Logger::warn("UPLOAD_FILE_ABORTED", "API::Album");
 
     if (gifFile) {
         gifFile.close();
 
-        Logger::warn("File closed after abort", "API::GIF");
+        Logger::warn("File closed after abort", "API::Album");
     }
 
     if (!currentFilename.isEmpty()) {
         if (LittleFS.remove(currentFilename)) {
-            Logger::warn((String("Removed incomplete file: ") + currentFilename).c_str(), "API::GIF");
+            Logger::warn((String("Removed incomplete file: ") + currentFilename).c_str(), "API::Album");
         } else {
-            Logger::error((String("Failed to remove incomplete file: ") + currentFilename).c_str(), "API::GIF");
+            Logger::error((String("Failed to remove incomplete file: ") + currentFilename).c_str(), "API::Album");
         }
     }
 
@@ -613,15 +647,15 @@ void sendGifUploadResult(Webserver* webserver, const String& currentFilename, bo
 
     if (uploadError) {
         doc["status"] = "error";
-        doc["message"] = "Error during GIF upload";
+        doc["message"] = "Image upload failed (need 240x240 RGB565)";
 
-        Logger::error("GIF UPLOAD Error during upload", "API::GIF");
+        Logger::error("GIF UPLOAD Error during upload", "API::Album");
     } else {
         doc["status"] = "success";
-        doc["message"] = "GIF uploaded successfully";
+        doc["message"] = "Image uploaded";
         doc["filename"] = currentFilename;
 
-        Logger::info((String("Gif upload success, filename: ") + currentFilename).c_str(), "API::GIF");
+        Logger::info((String("Image upload success, filename: ") + currentFilename).c_str(), "API::Album");
     }
 
     String json;
@@ -637,13 +671,64 @@ void sendGifUploadResult(Webserver* webserver, const String& currentFilename, bo
  *
  * @return void
  */
+// multipart 上传状态：upload 回调只收数据并记录结果，
+// HTTP 应答由请求完成时的 handleAlbumUploadDone() 统一发送（在回调里 send 会竞态空包）
+static File albumUploadFile;
+static bool albumUploadError = false;
+static bool albumUploadAuthed = true;
+static String albumUploadedName;
+
 void handleGifUpload(Webserver* webserver) {
     HTTPUpload& upload = webserver->raw().upload();
-    static File gifFile;
-    static bool uploadError = false;
 
-    if (upload.status == UPLOAD_FILE_START && !validateBearerToken(webserver)) {
-        uploadError = true;
+    if (upload.status == UPLOAD_FILE_START) {
+        albumUploadError = false;
+        albumUploadAuthed = validateBearerToken(webserver);
+        albumUploadedName = "";
+
+        if (!albumUploadAuthed) {
+            return;
+        }
+    }
+
+    if (!albumUploadAuthed) {
+        return;
+    }
+
+    String filename = upload.filename;
+    filename.replace("\\", "/");
+    filename = filename.substring(filename.lastIndexOf('/') + 1);
+    if (!filename.endsWith(".rgb565")) {
+        filename += ".rgb565";
+    }
+    String currentFilename = "/album/" + filename;
+
+    switch (upload.status) {
+        case UPLOAD_FILE_START:
+            handleGifUploadStart(currentFilename, albumUploadFile, albumUploadError);
+            break;
+        case UPLOAD_FILE_WRITE:
+            handleGifUploadWrite(upload, albumUploadFile, albumUploadError);
+            break;
+        case UPLOAD_FILE_END:
+            handleGifUploadEnd(currentFilename, albumUploadFile, albumUploadError);
+            albumUploadedName = currentFilename;
+            break;
+        case UPLOAD_FILE_ABORTED:
+            handleGifUploadAborted(currentFilename, albumUploadFile, albumUploadError);
+            albumUploadedName = currentFilename;
+            break;
+        default:
+            Logger::warn("Unknown upload status.", "API::Album");
+            break;
+    }
+}
+
+/**
+ * @brief 上传请求完成回调：统一发送上传结果应答
+ */
+void handleAlbumUploadDone(Webserver* webserver) {
+    if (!albumUploadAuthed) {
         JsonDocument doc;
 
         doc["status"] = "error";
@@ -652,38 +737,109 @@ void handleGifUpload(Webserver* webserver) {
         String json;
         serializeJson(doc, json);
         setCorsHeaders(webserver);
-
         webserver->raw().send(HTTP_CODE_UNAUTHORIZED, "application/json", json);
 
         return;
     }
 
-    String filename = upload.filename;
-    filename.replace("\\", "/");
-    filename = filename.substring(filename.lastIndexOf('/') + 1);
-    String currentFilename = "/gif/" + filename;
+    sendGifUploadResult(webserver, albumUploadedName, albumUploadError);
+}
 
-    switch (upload.status) {
-        case UPLOAD_FILE_START:
-            handleGifUploadStart(currentFilename, gifFile, uploadError);
-            break;
-        case UPLOAD_FILE_WRITE:
-            handleGifUploadWrite(upload, gifFile, uploadError);
-            break;
-        case UPLOAD_FILE_END:
-            handleGifUploadEnd(currentFilename, gifFile);
-            break;
-        case UPLOAD_FILE_ABORTED:
-            handleGifUploadAborted(currentFilename, gifFile, uploadError);
-            break;
-        default:
-            Logger::warn("Unknown upload status.", "API::GIF");
-            break;
+// ---- live 实时推图：multipart 分块流式直绘（不落盘、不整帧进 RAM）----
+// 帧 = 240x240 RGB565(LE) 115200B；行缓冲 480B 组装整行后立即写屏
+static bool s_liveAuthed = true;
+static bool s_liveAborted = false;
+static int s_liveRowY = 0;
+static int s_liveRowFill = 0;
+static uint8_t s_liveRow[480];
+
+static void livePushBytes(const uint8_t* data, size_t len) {
+    auto* tft = reinterpret_cast<Arduino_TFT*>(DisplayManager::getGfx());
+
+    for (size_t i = 0; i < len; i++) {
+        if (s_liveRowY >= 240) {
+            return;  // 超出整幅的余数忽略
+        }
+
+        s_liveRow[s_liveRowFill++] = data[i];
+
+        if (s_liveRowFill == 480) {
+            tft->startWrite();
+            tft->writeAddrWindow(0, s_liveRowY, 240, 1);
+            tft->writePixels(reinterpret_cast<uint16_t*>(s_liveRow), 240);
+            tft->endWrite();
+
+            s_liveRowFill = 0;
+            s_liveRowY++;
+        }
+    }
+}
+
+void handleLivePush(Webserver* webserver) {
+    HTTPUpload& upload = webserver->raw().upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        s_liveAuthed = validateBearerToken(webserver);
+        s_liveAborted = false;
+        s_liveRowY = 0;
+        s_liveRowFill = 0;
+
+        if (!s_liveAuthed) {
+            return;
+        }
+
+        // 首帧推送自动进入 live 场景（退场重绘契约）；后续帧仅覆盖画面
+        if (strcmp(SceneManager::currentName(), "live") != 0) {
+            SceneManager::switchTo("live");
+        }
+
+        return;
     }
 
-    if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
-        sendGifUploadResult(webserver, currentFilename, uploadError);
+    if (!s_liveAuthed) {
+        return;
     }
+
+    if (upload.status == UPLOAD_FILE_WRITE) {
+        livePushBytes(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        s_liveAborted = true;
+    }
+}
+
+/**
+ * @brief live 推图请求完成回调：统一发送应答
+ */
+void handleLivePushDone(Webserver* webserver) {
+    if (!s_liveAuthed) {
+        JsonDocument resp;
+
+        resp["status"] = "error";
+        resp["message"] = "Invalid or missing token";
+
+        String jsonOut;
+        serializeJson(resp, jsonOut);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_UNAUTHORIZED, "application/json", jsonOut);
+
+        return;
+    }
+
+    JsonDocument resp;
+
+    resp["status"] = s_liveAborted ? "error" : "ok";
+    resp["rows"] = s_liveRowY;
+
+    if (s_liveAborted) {
+        resp["message"] = "upload aborted";
+    }
+
+    String jsonOut;
+    serializeJson(resp, jsonOut);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", jsonOut);
 }
 
 /**
@@ -1363,20 +1519,118 @@ void handleOtaFinished(Webserver* webserver) {
 }
 
 /**
- * @brief Play a GIF from LittleFS full screen
- *
- * @param webserver Pointer to the Webserver instance
- *
- * @return void
+ * @brief Get current scene and available scenes
  */
-void handlePlayGif(Webserver* webserver) {
+void handleSceneGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["current"] = SceneManager::currentName();
+    doc["param"] = SceneManager::currentParam();
+
+    JsonArray scenes = doc["scenes"].to<JsonArray>();
+
+    for (int i = 0; i < SceneManager::sceneCount(); i++) {
+        scenes.add(SceneManager::sceneNameAt(i));
+    }
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Switch display scene (old scene exits, new scene fully redraws)
+ */
+void handleSceneSet(Webserver* webserver) {
     if (!requireBearerToken(webserver)) {
         return;
     }
 
     String body = webserver->raw().arg("plain");
+    JsonDocument ddoc;
+    DeserializationError err = deserializeJson(ddoc, body);
+    const char* scene = ddoc["scene"];
+    const char* param = ddoc["param"];
+
+    if (err || scene == nullptr || strlen(scene) == 0) {
+        JsonDocument resp;
+        resp["status"] = "error";
+        resp["message"] = "Invalid JSON or missing scene";
+
+        String jsonOut;
+        serializeJson(resp, jsonOut);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", jsonOut);
+
+        return;
+    }
+
+    const bool ok = SceneManager::switchTo(scene, param != nullptr ? param : "");
+
+    JsonDocument resp;
+    resp["status"] = ok ? "ok" : "error";
+    resp["current"] = SceneManager::currentName();
+
+    if (!ok) {
+        resp["message"] = "scene switch failed (unknown scene or scene refused)";
+    }
+
+    String jsonOut;
+    serializeJson(resp, jsonOut);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(ok ? HTTP_CODE_OK : HTTP_CODE_BAD_REQUEST, "application/json", jsonOut);
+
+    Logger::info((String("Scene switch to ") + String(scene) + (ok ? " ok" : " failed")).c_str(), "API");
+}
+
+/**
+ * @brief Get WS2812 ambient light settings
+ */
+void handleLightGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    static const char* const kModes[3] = {"solid", "breathe", "rainbow"};
+
     JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, body);
+    uint8_t r = 0;
+    uint8_t g = 0;
+    uint8_t b = 0;
+    configManager.getLedColor(r, g, b);
+
+    doc["on"] = configManager.getLedOn();
+    doc["mode"] = kModes[configManager.getLedMode() % 3];
+    doc["r"] = r;
+    doc["g"] = g;
+    doc["b"] = b;
+    doc["brightness"] = configManager.getLedBrightness();
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief Set WS2812 ambient light（部分更新：on / mode / r,g,b / brightness）
+ */
+void handleLightSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    String body = webserver->raw().arg("plain");
+    JsonDocument ddoc;
+    DeserializationError err = deserializeJson(ddoc, body);
 
     if (err) {
         JsonDocument resp;
@@ -1385,91 +1639,56 @@ void handlePlayGif(Webserver* webserver) {
         resp["message"] = "invalid json";
 
         String jsonOut;
-
         serializeJson(resp, jsonOut);
 
         setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", jsonOut);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", jsonOut);
 
         return;
     }
 
-    const char* name = doc["name"];
-    if (name == nullptr || strlen(name) == 0) {
-        JsonDocument resp;
-        resp["status"] = "error";
-        resp["message"] = "missing name";
-
-        String jsonOut;
-        serializeJson(resp, jsonOut);
-
-        setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", jsonOut);
-
-        return;
+    if (ddoc["on"].is<bool>()) {
+        AmbientLight::setOn(ddoc["on"].as<bool>());
     }
 
-    String filename(name);
-    filename.replace("\\", "/");
-    filename = filename.substring(filename.lastIndexOf('/') + 1);
+    if (ddoc["mode"].is<const char*>()) {
+        const String mode = String(ddoc["mode"].as<const char*>());
 
-    String path1 = String("/gifs/") + filename;
-    String path2 = String("/gif/") + filename;
-    String foundPath;
-
-    if (LittleFS.exists(path1)) {
-        foundPath = path1;
-    } else if (LittleFS.exists(path2)) {
-        foundPath = path2;
-    } else {
-        JsonDocument resp;
-
-        resp["status"] = "error";
-        resp["message"] = "file not found";
-
-        String jsonOut;
-        serializeJson(resp, jsonOut);
-
-        setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_NOT_FOUND, "application/json", jsonOut);
-
-        return;
+        if (mode == "solid") {
+            AmbientLight::setMode(0);
+        } else if (mode == "breathe") {
+            AmbientLight::setMode(1);
+        } else if (mode == "rainbow") {
+            AmbientLight::setMode(2);
+        }
     }
 
-    bool playOk = DisplayManager::playGifFullScreen(foundPath);
+    if (ddoc["r"].is<int>() || ddoc["g"].is<int>() || ddoc["b"].is<int>()) {
+        uint8_t r = 0;
+        uint8_t g = 0;
+        uint8_t b = 0;
+        configManager.getLedColor(r, g, b);
 
-    JsonDocument resp;
+        if (ddoc["r"].is<int>()) {
+            r = static_cast<uint8_t>(ddoc["r"].as<int>() & 0xFF);
+        }
+        if (ddoc["g"].is<int>()) {
+            g = static_cast<uint8_t>(ddoc["g"].as<int>() & 0xFF);
+        }
+        if (ddoc["b"].is<int>()) {
+            b = static_cast<uint8_t>(ddoc["b"].as<int>() & 0xFF);
+        }
 
-    resp["status"] = playOk ? "playing" : "error";
-    resp["file"] = foundPath;
-
-    String jsonOut;
-
-    serializeJson(resp, jsonOut);
-
-    setCorsHeaders(webserver);
-    webserver->raw().send(HTTP_CODE_OK, "application/json", jsonOut);
-}
-
-/**
- * @brief Stop currently playing GIF
- */
-void handleStopGif(Webserver* webserver) {
-    if (!requireBearerToken(webserver)) {
-        return;
+        AmbientLight::setColor(r, g, b);
     }
 
-    JsonDocument resp;
+    if (ddoc["brightness"].is<int>()) {
+        AmbientLight::setBrightness(ddoc["brightness"].as<int>());
+    }
 
-    const bool stopped = DisplayManager::stopGif();
+    configManager.save();
 
-    resp["status"] = stopped ? "stopped" : "error";
-
-    String jsonOut;
-    serializeJson(resp, jsonOut);
-
-    setCorsHeaders(webserver);
-    webserver->raw().send(HTTP_CODE_OK, "application/json", jsonOut);
+    handleLightGet(webserver);
 }
 
 /**
@@ -1547,7 +1766,7 @@ void handleDeleteGif(Webserver* webserver) {
         setCorsHeaders(webserver);
         webserver->raw().send(HTTP_CODE_OK, "application/json", jsonOut);
 
-        Logger::info((String("Removed file: ") + path).c_str(), "API::GIF");
+        Logger::info((String("Removed file: ") + path).c_str(), "API::Album");
     } else {
         JsonDocument resp;
         resp["status"] = "error";
@@ -1559,7 +1778,7 @@ void handleDeleteGif(Webserver* webserver) {
         setCorsHeaders(webserver);
         webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", jsonOut);
 
-        Logger::error((String("Failed to remove file: ") + path).c_str(), "API::GIF");
+        Logger::error((String("Failed to remove file: ") + path).c_str(), "API::Album");
     }
 }
 

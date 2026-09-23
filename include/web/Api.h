@@ -31,9 +31,14 @@ void handleOtaStatus(Webserver* webserver);
 void handleOtaCancel(Webserver* webserver);
 
 void handleGifUpload(Webserver* webserver);
+void handleAlbumUploadDone(Webserver* webserver);
+void handleLivePush(Webserver* webserver);
+void handleLivePushDone(Webserver* webserver);
 void handleListGifs(Webserver* webserver);
-void handlePlayGif(Webserver* webserver);
-void handleStopGif(Webserver* webserver);
+void handleSceneGet(Webserver* webserver);
+void handleSceneSet(Webserver* webserver);
+void handleLightGet(Webserver* webserver);
+void handleLightSet(Webserver* webserver);
 
 void handleWifiScan(Webserver* webserver);
 void handleWifiConnect(Webserver* webserver);

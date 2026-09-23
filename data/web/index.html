@@ -12,6 +12,8 @@
     <script src="./js/gifUploadHandler.js"></script>
     <script src="./js/otaUploadHandler.js"></script>
     <script src="./js/wifiHandler.js"></script>
+    <script src="./js/sceneHandler.js"></script>
+    <script src="./js/lightHandler.js"></script>
     <script src="./js/rebootHandler.js"></script>
     <script src="./js/main.js"></script>
   </head>
@@ -35,8 +37,8 @@
               Firmware / FS Update
             </button>
           </a>
-          <a href="./gif_upload.html">
-            <button type="button" class="secondary">Upload GIF</button>
+          <a href="./album.html">
+            <button type="button" class="secondary">Photo Album</button>
           </a>
           <a href="./token.html">
             <button type="button" class="secondary">API Token</button>
@@ -53,6 +55,83 @@
           <a href="./logs.html">
             <button type="button" class="secondary">Logs</button>
           </a>
+        </div>
+
+        <div x-data="sceneHandler()" x-init="init()" style="margin-top: 1.5em">
+          <p>
+            <strong>Scene:</strong> <span x-text="current || '-'"></span>
+          </p>
+          <div style="display: flex; gap: 0.5em; flex-wrap: wrap">
+            <button
+              type="button"
+              class="secondary"
+              @click="switchScene('balance')"
+              x-bind:disabled="loading"
+            >
+              Balance
+            </button>
+            <button
+              type="button"
+              class="secondary"
+              @click="switchScene('album')"
+              x-bind:disabled="loading"
+            >
+              Photo Album
+            </button>
+            <button
+              type="button"
+              class="secondary"
+              @click="switchScene('startup')"
+              x-bind:disabled="loading"
+            >
+              System Info
+            </button>
+          </div>
+          <p x-text="statusMsg"></p>
+        </div>
+
+        <div x-data="lightHandler()" x-init="init()" style="margin-top: 1.5em">
+          <p><strong>WS2812 Ambient Light</strong></p>
+          <label for="led-on">
+            <input
+              type="checkbox"
+              id="led-on"
+              role="switch"
+              x-model="on"
+              @change="applyLight()"
+            />
+            On
+          </label>
+          <label for="led-color">
+            Color
+            <input
+              type="color"
+              id="led-color"
+              x-model="colorHex"
+              @change="applyLight()"
+            />
+          </label>
+          <label for="led-mode">
+            Mode
+            <select id="led-mode" x-model="mode" @change="applyLight()">
+              <option value="solid">Solid</option>
+              <option value="breathe">Breathe</option>
+              <option value="rainbow">Rainbow</option>
+            </select>
+          </label>
+          <label for="led-brightness">
+            Brightness: <span x-text="brightness"></span>%
+            <input
+              type="range"
+              id="led-brightness"
+              min="1"
+              max="100"
+              step="1"
+              x-model.number="brightness"
+              @change="applyLight()"
+            />
+          </label>
+          <p x-text="statusMsg"></p>
         </div>
 
         <div x-data="rebootHandler()">

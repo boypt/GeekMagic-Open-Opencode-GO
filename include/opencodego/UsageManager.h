@@ -18,6 +18,11 @@ class UsageManager {
     static void begin();
     static void update();
 
+    // ---- 场景钩子（balance 场景经 SceneManager 调用）----
+    // enterScene() 入场契约：从零绘制所有元素；exitScene() 退场：复位局部更新状态
+    static void enterScene();
+    static void exitScene();
+
     // ---- 供 UI 层读取的状态 ----
     static bool hasData();
     static const String& lastError();

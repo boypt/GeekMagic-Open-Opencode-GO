@@ -720,7 +720,9 @@ auto DisplayManager::begin() -> void { lcdEnsureInit(); }
 auto DisplayManager::setRotation(uint8_t rotation, String currentIP) -> void {
     g_lcd.setRotation(rotation);
     lcdApplyMirrorMADCTL(rotation);
-    DisplayManager::drawStartup(currentIP);
+
+    // 运行时显示变更不再直接画启动屏（会覆盖主页），改为请求应用层整屏重绘
+    DisplayManager::requestFullRedraw();
 
     Logger::info(("Rotation set to " + String(rotation)).c_str(), "DisplayManager");
 }
@@ -736,8 +738,26 @@ auto DisplayManager::setRotation(uint8_t rotation, String currentIP) -> void {
 auto DisplayManager::applyPanelProfile() -> void {
     lcdEnsureInit();
 
-    String currentIP = "unknown";
-    DisplayManager::drawStartup(currentIP);
+    // 运行时显示变更不再直接画启动屏（会覆盖主页），改为请求应用层整屏重绘
+    DisplayManager::requestFullRedraw();
+}
+
+// ---------- 整屏重绘请求机制 ----------
+// 显示类 API（rotation / 面板 profile）改完硬件状态后置位，由 UsageManager::update()
+// 取走并重画主页面，避免 web 层与 UsageManager 直接耦合。
+static volatile bool s_fullRedrawRequested = false;
+
+auto DisplayManager::requestFullRedraw() -> void {
+    s_fullRedrawRequested = true;
+    Logger::info("Display: full redraw requested", "DisplayManager");
+}
+
+auto DisplayManager::consumeFullRedrawRequest() -> bool {
+    if (s_fullRedrawRequested) {
+        s_fullRedrawRequested = false;
+        return true;
+    }
+    return false;
 }
 
 /**

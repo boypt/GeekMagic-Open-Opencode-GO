@@ -535,6 +535,14 @@ void UsageManager::update() {
     const bool wifiReady = (wifiManager != nullptr) && !wifiManager->isApMode() &&
                            WiFiManager::isConnected();
 
+    // 显示设置（rotation / 面板 profile）变更后，应用层整屏重绘主页面
+    //（用缓存数据/占位符绘制；不看 wifiReady，重画后此时钟状态与服务端一致）
+    if (DisplayManager::consumeFullRedrawRequest()) {
+        drawMainPage();
+        mainPageDrawn = true;
+        Logger::info("UsageManager: main page redrawn", "OpenCodeGo");
+    }
+
     // 首次联网就绪时画主页面（同旧工程 onConnected hook）
     if (wifiReady && !mainPageDrawn) {
         drawMainPage();

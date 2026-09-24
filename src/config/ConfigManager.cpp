@@ -66,10 +66,6 @@ auto ConfigManager::load() -> bool {
     String password = doc["wifi_password"] | "";
     String api_token = doc["api_token"] | "";
     String ntp_server_cfg = doc["ntp_server"] | "";
-    String ocg_host = doc["opencodego_host"] | "";
-    String ocg_path = doc["opencodego_path"] | "";
-    String ocg_api_key = doc["opencodego_api_key"] | "";
-    uint8_t ocg_verify_tls = doc["verify_tls_cert"] | verify_tls_cert;
 
     this->lcd_rotation = doc["lcd_rotation"] | lcd_rotation;
     this->lcd_mirror_x = doc["lcd_mirror_x"] | lcd_mirror_x;
@@ -91,7 +87,6 @@ auto ConfigManager::load() -> bool {
     String nvs_ssid = secure.get("wifi_ssid", "");
     String nvs_password = secure.get("wifi_password", "");
     String nvs_api_token = secure.get("api_token", "");
-    String nvs_ocg_api_key = secure.get("opencodego_api_key", "");
 
     if ((ssid.length() != 0 && nvs_ssid.length() == 0) || (password.length() != 0 && nvs_password.length() == 0)) {
         secure.put("wifi_ssid", ssid.c_str());
@@ -128,29 +123,6 @@ auto ConfigManager::load() -> bool {
     } else {
         this->api_token = secure.get("api_token").c_str();
     }
-
-    // OpenCode Go 配置：api_key 仿 api_token 走 SecureStorage（config.json 有值则迁移/覆盖）
-    if (ocg_api_key.length() != 0 && ocg_api_key != nvs_ocg_api_key) {
-        secure.put("opencodego_api_key", ocg_api_key.c_str());
-        this->opencodego_api_key = secure.get("opencodego_api_key").c_str();
-
-        // Ensure we delete the api key from the json config after migrating
-        ConfigManager::save();
-
-        Logger::info(nvs_ocg_api_key.length() == 0 ? "OpenCodeGo API key migrated to SecureStorage"
-                                                   : "OpenCodeGo API key updated from config.json",
-                     "ConfigManager");
-    } else {
-        this->opencodego_api_key = secure.get("opencodego_api_key").c_str();
-    }
-
-    if (ocg_host.length() != 0) {
-        this->opencodego_host = ocg_host.c_str();
-    }
-    if (ocg_path.length() != 0) {
-        this->opencodego_path = ocg_path.c_str();
-    }
-    this->verify_tls_cert = (ocg_verify_tls != 0) ? 1 : 0;
 
     return true;
 }
@@ -262,16 +234,6 @@ auto ConfigManager::save() -> bool {
     if (!this->ntp_server.empty()) {
         doc["ntp_server"] = this->ntp_server.c_str();
     }
-
-    // OpenCode Go：host/path/tls 开关进 config.json，api_key 只进 SecureStorage
-    secure.put("opencodego_api_key", this->getOpenCodeGoApiKey());
-    if (!this->opencodego_host.empty()) {
-        doc["opencodego_host"] = this->opencodego_host.c_str();
-    }
-    if (!this->opencodego_path.empty()) {
-        doc["opencodego_path"] = this->opencodego_path.c_str();
-    }
-    doc["verify_tls_cert"] = this->verify_tls_cert;
 
     if (serializeJson(doc, file) == 0) {
         Logger::error("Failed to write config file", "ConfigManager");

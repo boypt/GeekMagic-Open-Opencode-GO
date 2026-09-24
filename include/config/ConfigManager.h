@@ -106,22 +106,6 @@ class ConfigManager {
         lcd_brightness = static_cast<uint8_t>(percent);
     }
 
-    // ---- OpenCode Go 用量配置 ----
-    const char* getOpenCodeGoHost() const { return opencodego_host.c_str(); }
-    const char* getOpenCodeGoPath() const { return opencodego_path.c_str(); }
-    const char* getOpenCodeGoApiKey() const { return opencodego_api_key.c_str(); }
-    bool getVerifyTlsCert() const { return verify_tls_cert != 0; }
-    void setOpenCodeGoHost(const char* host) {
-        if (host != nullptr) opencodego_host = host;
-    }
-    void setOpenCodeGoPath(const char* path) {
-        if (path != nullptr) opencodego_path = path;
-    }
-    void setOpenCodeGoApiKey(const char* key) {
-        if (key != nullptr) opencodego_api_key = key;
-    }
-    void setVerifyTlsCert(bool enable) { verify_tls_cert = enable ? 1 : 0; }
-
    public:
     uint8_t getLCDRotationSafe() const { return lcd_rotation; }
     std::string ssid;
@@ -153,12 +137,6 @@ class ConfigManager {
     uint8_t led_b = 40;
     uint8_t led_brightness = 60;
     std::string ntp_server;
-
-    // OpenCode Go 用量配置（api_key 走 SecureStorage，host/path/tls 开关走 config.json）
-    std::string opencodego_host;
-    std::string opencodego_path;
-    std::string opencodego_api_key;
-    uint8_t verify_tls_cert = 1;
 
     const char* getNtpServer() const { return ntp_server.c_str(); }
     void setNtpServer(const char* s) {

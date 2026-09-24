@@ -37,7 +37,7 @@ static constexpr size_t ALBUM_IMG_BYTES = 240UL * 240UL * 2UL;
 #include "config/ConfigManager.h"
 #include "wireless/WiFiManager.h"
 #include "ntp/NTPClient.h"
-#include "opencodego/OpenCodeGoClient.h"
+#include "opencodego/UsageManager.h"
 
 extern ConfigManager configManager;
 extern WiFiManager* wifiManager;
@@ -222,29 +222,15 @@ void registerApiEndpoints(Webserver* webserver) {
     // responses=200:application/json,401:application/json
     webserver->raw().on("/api/v1/logs/clear", HTTP_POST, [webserver]() { handleLogsClear(webserver); });
 
-    // @openapi {get} /opencodego/config version=v1 group=OpenCodeGo summary="Get OpenCode Go usage config" requiresAuth=true
+    // @openapi {get} /balance version=v1 group=Balance summary="Get latest pushed balance lines" requiresAuth=true
     // responses=200:application/json,401:application/json
-    webserver->raw().on("/api/v1/opencodego/config", HTTP_GET, [webserver]() { handleOpenCodeGoConfigGet(webserver); });
+    webserver->raw().on("/api/v1/balance", HTTP_GET, [webserver]() { handleBalanceGet(webserver); });
 
-    // @openapi {post} /opencodego/config version=v1 group=OpenCodeGo summary="Set OpenCode Go usage config" requiresAuth=true
-    // requestBody=application/json requestBodySchema=opencodego_host:string,opencodego_path:string,opencodego_api_key:string,verify_tls_cert:integer
-    // example={"opencodego_host":"opencode.ai","opencodego_path":"/zen/go/v1/usage","opencodego_api_key":"sk-...","verify_tls_cert":1}
+    // @openapi {post} /balance version=v1 group=Balance summary="Push balance lines from host (1..3 strings plus optional status)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=lines:array,status:string
+    // example={"lines":["5H 42%","WK 61%","MO 33%"],"status":"SYNC OK"}
     // responses=200:application/json,400:application/json,401:application/json
-    webserver->raw().on("/api/v1/opencodego/config", HTTP_POST, [webserver]() { handleOpenCodeGoConfigSet(webserver); });
-
-    // @openapi {get} /opencodego/ca version=v1 group=OpenCodeGo summary="Get custom TLS CA (PEM) config" requiresAuth=true
-    // responses=200:application/json,401:application/json
-    webserver->raw().on("/api/v1/opencodego/ca", HTTP_GET, [webserver]() { handleOpenCodeGoCaGet(webserver); });
-
-    // @openapi {post} /opencodego/ca version=v1 group=OpenCodeGo summary="Save custom TLS root CA PEM (validated, stored to /ca.pem)" requiresAuth=true
-    // requestBody=application/json requestBodySchema=pem:string
-    // example={"pem":"-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"}
-    // responses=200:application/json,400:application/json,401:application/json
-    webserver->raw().on("/api/v1/opencodego/ca", HTTP_POST, [webserver]() { handleOpenCodeGoCaSet(webserver); });
-
-    // @openapi {delete} /opencodego/ca version=v1 group=OpenCodeGo summary="Delete custom TLS CA (verification disabled when absent)" requiresAuth=true
-    // responses=200:application/json,401:application/json
-    webserver->raw().on("/api/v1/opencodego/ca", HTTP_DELETE, [webserver]() { handleOpenCodeGoCaDelete(webserver); });
+    webserver->raw().on("/api/v1/balance", HTTP_POST, [webserver]() { handleBalanceSet(webserver); });
 
 
     webserver->raw().onNotFound([webserver]() {
@@ -2096,203 +2082,20 @@ void handleLogsClear(Webserver* webserver) {
 }
 
 /**
- * @brief Mask an OpenCode Go API key as sk-***<last4>
- * @param key Full API key
+ * @brief POST /api/v1/balance — 上位机推送额度文本（推送契约，与上位机脚本共享）
  *
- * @return Masked key string, or empty string when key is empty
+ * body {"lines":["l1","l2","l3"], "status":"可选状态行"}（body < 1024B）
+ * lines 1..3 个字符串，渲染到三行额度槽位（超宽截断显示不断言）；
+ * status 缺省时状态行显示 UPD HH:MM。成功 → 200 {"ok":true} 并立即重绘。
  */
-static String maskOpenCodeGoApiKey(const String& key) {
-    if (key.isEmpty()) {
-        return "";
-    }
-    constexpr size_t TAIL_LEN = 4;
-    if (key.length() <= TAIL_LEN) {
-        return "sk-****";
-    }
-    return "sk-***" + key.substring(key.length() - TAIL_LEN);
-}
+static constexpr size_t BALANCE_BODY_MAX = 1024;
 
-/**
- * @brief Get OpenCode Go usage configuration (api key masked)
- */
-void handleOpenCodeGoConfigGet(Webserver* webserver) {
+void handleBalanceSet(Webserver* webserver) {
     if (!requireBearerToken(webserver)) {
         return;
     }
 
-    JsonDocument doc;
-    doc["opencodego_host"] = configManager.getOpenCodeGoHost();
-    doc["opencodego_path"] = configManager.getOpenCodeGoPath();
-    doc["opencodego_api_key"] = maskOpenCodeGoApiKey(String(configManager.getOpenCodeGoApiKey()));
-    doc["verify_tls_cert"] = configManager.getVerifyTlsCert() ? 1 : 0;
-    doc["api_key_configured"] = configManager.getOpenCodeGoApiKey()[0] != '\0';
-
-    String json;
-    serializeJson(doc, json);
-
-    setCorsHeaders(webserver);
-    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
-}
-
-/**
- * @brief Set OpenCode Go usage configuration
- */
-void handleOpenCodeGoConfigSet(Webserver* webserver) {
-    if (!requireBearerToken(webserver)) {
-        return;
-    }
-
-    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
-        JsonDocument doc;
-        doc["status"] = "error";
-        doc["message"] = "Missing JSON body";
-
-        String json;
-        serializeJson(doc, json);
-
-        setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
-
-        return;
-    }
-
-    String body = webserver->raw().arg("plain");
-    JsonDocument ddoc;
-    DeserializationError err = deserializeJson(ddoc, body);
-
-    if (err) {
-        JsonDocument doc;
-        doc["status"] = "error";
-        doc["message"] = "Invalid JSON";
-
-        String json;
-        serializeJson(doc, json);
-
-        setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
-
-        return;
-    }
-
-    const char* host = ddoc["opencodego_host"] | "";
-    const char* path = ddoc["opencodego_path"] | "";
-    const char* apiKey = ddoc["opencodego_api_key"] | "";
-
-    if (strlen(host) == 0 || strlen(path) == 0) {
-        JsonDocument doc;
-        doc["status"] = "error";
-        doc["message"] = "opencodego_host and opencodego_path are required";
-
-        String json;
-        serializeJson(doc, json);
-
-        setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
-
-        return;
-    }
-
-    configManager.setOpenCodeGoHost(host);
-    configManager.setOpenCodeGoPath(path);
-    // api_key 为空表示不修改已保存的 Key（避免 GET 回显打码值被误存回）
-    if (strlen(apiKey) != 0 && !String(apiKey).startsWith("sk-***")) {
-        configManager.setOpenCodeGoApiKey(apiKey);
-    }
-    if (ddoc["verify_tls_cert"].is<int>()) {
-        configManager.setVerifyTlsCert(ddoc["verify_tls_cert"].as<int>() != 0);
-    }
-
-    if (!configManager.save()) {
-        JsonDocument doc;
-        doc["status"] = "error";
-        doc["message"] = "Failed to save config";
-
-        String json;
-        serializeJson(doc, json);
-
-        setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
-
-        return;
-    }
-
-    JsonDocument doc;
-    doc["status"] = "ok";
-    doc["opencodego_host"] = configManager.getOpenCodeGoHost();
-    doc["opencodego_path"] = configManager.getOpenCodeGoPath();
-    doc["opencodego_api_key"] = maskOpenCodeGoApiKey(String(configManager.getOpenCodeGoApiKey()));
-    doc["verify_tls_cert"] = configManager.getVerifyTlsCert() ? 1 : 0;
-
-    String json;
-    serializeJson(doc, json);
-
-    setCorsHeaders(webserver);
-    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
-
-    Logger::info("OpenCodeGo config updated", "API");
-}
-
-/**
- * @brief TLS trust CA file path + temp file for atomic write
- */
-static constexpr const char* OC_CA_PATH = "/ca.pem";
-static constexpr const char* OC_CA_TMP_PATH = "/ca.pem.tmp";
-static constexpr size_t OC_CA_MAX_BYTES = 8192;
-
-/**
- * @brief GET /api/v1/opencodego/ca
- *
- * 返回当前 TLS 信任锚配置：custom（LittleFS /ca.pem，含完整 PEM）或
- * 未配置即不校验（setInsecure）。
- */
-void handleOpenCodeGoCaGet(Webserver* webserver) {
-    if (!requireBearerToken(webserver)) {
-        return;
-    }
-
-    JsonDocument doc;
-    size_t bytes = 0;
-    if (LittleFS.exists(OC_CA_PATH)) {
-        File f = LittleFS.open(OC_CA_PATH, "r");
-        if (f && f.size() > 0) {
-            bytes = f.size();
-            // 流式读入临时 String（PEM ~2KB），手写 JSON 需转义，借用
-            // ArduinoJson 序列化保证转义正确
-            String pem = f.readString();
-            f.close();
-            doc["source"] = "custom";
-            doc["bytes"] = bytes;
-            doc["pem"] = pem;
-        } else if (f) {
-            f.close();
-        }
-    }
-
-    if (bytes == 0) {
-        // 源码不再内置默认证书：未配置 /ca.pem 即不校验
-        doc["source"] = "none";
-        doc["bytes"] = 0;
-    }
-
-    String json;
-    serializeJson(doc, json);
-
-    setCorsHeaders(webserver);
-    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
-}
-
-/**
- * @brief POST /api/v1/opencodego/ca  body {"pem":"-----BEGIN CERTIFICATE-----..."}
- *
- * 校验 PEM 结构 + 可被 BearSSL 解析后写 /ca.pem；先写临时文件再改名，
- * 避免半截文件导致下次启动校验失败。
- */
-void handleOpenCodeGoCaSet(Webserver* webserver) {
-    if (!requireBearerToken(webserver)) {
-        return;
-    }
-
-    auto sendErr = [&](int code, const String& message) {
+    auto sendErr = [&](int code, const char* message) {
         JsonDocument doc;
         doc["status"] = "error";
         doc["message"] = message;
@@ -2307,111 +2110,88 @@ void handleOpenCodeGoCaSet(Webserver* webserver) {
         return;
     }
 
+    String body = webserver->raw().arg("plain");
+    if (body.length() >= BALANCE_BODY_MAX) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "body too large (max 1023 bytes)");
+        return;
+    }
+
     JsonDocument ddoc;
-    DeserializationError err = deserializeJson(ddoc, webserver->raw().arg("plain"));
+    DeserializationError err = deserializeJson(ddoc, body);
     if (err) {
         sendErr(HTTP_CODE_BAD_REQUEST, "Invalid JSON");
         return;
     }
 
-    // pem 字段可能是空串/null
-    if (!ddoc["pem"].is<const char*>()) {
-        sendErr(HTTP_CODE_BAD_REQUEST, "pem field is required");
+    if (!ddoc["lines"].is<JsonArray>()) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "lines must be an array of 1..3 strings");
         return;
     }
-
-    String pem = ddoc["pem"].as<String>();
-    pem.trim();
-    if (pem.length() == 0) {
-        sendErr(HTTP_CODE_BAD_REQUEST, "pem is empty");
+    JsonArray arr = ddoc["lines"].as<JsonArray>();
+    if (arr.size() < 1 || arr.size() > UsageManager::kBalanceLines) {
+        sendErr(HTTP_CODE_BAD_REQUEST, "lines must be an array of 1..3 strings");
         return;
     }
-    if (pem.length() > OC_CA_MAX_BYTES) {
-        sendErr(HTTP_CODE_BAD_REQUEST, "pem too large (max 8192 bytes)");
-        return;
-    }
-    if (pem.indexOf("-----BEGIN CERTIFICATE-----") < 0 || pem.indexOf("-----END CERTIFICATE-----") < 0) {
-        sendErr(HTTP_CODE_BAD_REQUEST, "pem missing BEGIN/END CERTIFICATE markers");
-        return;
-    }
-
-    // BearSSL 预解析校验：构造 X509List，BearSSL 对解析不了的 PEM 会静默
-    // 忽略，因此锚计数为 0 即视为无效直接拒绝
-    {
-        BearSSL::X509List testList;
-        testList.append(pem.c_str());
-        if (testList.getCount() == 0) {
-            sendErr(HTTP_CODE_BAD_REQUEST, "pem parse failed (no valid certificate found)");
-            Logger::warn("CA PEM rejected: BearSSL parse failed", "API");
+    for (JsonVariantConst v : arr) {
+        if (!v.is<const char*>()) {
+            sendErr(HTTP_CODE_BAD_REQUEST, "lines must be an array of 1..3 strings");
             return;
         }
     }
 
-    // 先写临时文件再改名，避免断电/半写导致 /ca.pem 损坏
-    if (LittleFS.exists(OC_CA_TMP_PATH)) {
-        LittleFS.remove(OC_CA_TMP_PATH);
+    bool hasStatus = false;
+    const char* status = "";
+    if (!ddoc["status"].isNull()) {
+        if (!ddoc["status"].is<const char*>()) {
+            sendErr(HTTP_CODE_BAD_REQUEST, "status must be a string");
+            return;
+        }
+        status = ddoc["status"].as<const char*>();
+        hasStatus = (status != nullptr && status[0] != '\0');
     }
-    File tmp = LittleFS.open(OC_CA_TMP_PATH, "w");
-    if (!tmp) {
-        sendErr(HTTP_CODE_INTERNAL_ERROR, "Failed to create temp file");
-        return;
+
+    const char* lines[UsageManager::kBalanceLines] = {nullptr, nullptr, nullptr};
+    size_t i = 0;
+    for (JsonVariantConst v : arr) {
+        lines[i++] = v.as<const char*>();
     }
-    size_t written = tmp.print(pem);
-    tmp.close();
-    if (written != pem.length()) {
-        LittleFS.remove(OC_CA_TMP_PATH);
-        sendErr(HTTP_CODE_INTERNAL_ERROR, "Failed to write temp file");
-        return;
-    }
-    if (LittleFS.exists(OC_CA_PATH)) {
-        LittleFS.remove(OC_CA_PATH);
-    }
-    if (!LittleFS.rename(OC_CA_TMP_PATH, OC_CA_PATH)) {
-        LittleFS.remove(OC_CA_TMP_PATH);
-        sendErr(HTTP_CODE_INTERNAL_ERROR, "Failed to commit /ca.pem");
-        return;
-    }
+
+    UsageManager::pushBalance(lines, static_cast<uint8_t>(arr.size()), status, hasStatus);
 
     JsonDocument doc;
-    doc["status"] = "ok";
-    doc["bytes"] = pem.length();
+    doc["ok"] = true;
     String json;
     serializeJson(doc, json);
-
     setCorsHeaders(webserver);
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 
-    Logger::info(("Custom TLS CA saved: /ca.pem (" + String(pem.length()) + " bytes)").c_str(), "API");
+    Logger::info("Balance push accepted", "API");
 }
 
 /**
- * @brief DELETE /api/v1/opencodego/ca — 删除 /ca.pem，回退内置 GTS Root R4
+ * @brief GET /api/v1/balance — 查询最近一次推送
+ *
+ * → {"lines":["l1","l2","l3"],"status":"...","ts":<epoch 或 0>,"age_s":<秒>}
+ * 未推送过的槽位返回 ""；未同步过 NTP 时 ts=0。
  */
-void handleOpenCodeGoCaDelete(Webserver* webserver) {
+void handleBalanceGet(Webserver* webserver) {
     if (!requireBearerToken(webserver)) {
         return;
     }
 
-    if (LittleFS.exists(OC_CA_PATH) && !LittleFS.remove(OC_CA_PATH)) {
-        JsonDocument doc;
-        doc["status"] = "error";
-        doc["message"] = "Failed to remove /ca.pem";
-        String json;
-        serializeJson(doc, json);
-        setCorsHeaders(webserver);
-        webserver->raw().send(HTTP_CODE_INTERNAL_ERROR, "application/json", json);
-        return;
-    }
-
     JsonDocument doc;
-    doc["status"] = "ok";
-    doc["source"] = "none";
+    JsonArray lines = doc["lines"].to<JsonArray>();
+    for (uint8_t i = 0; i < UsageManager::kBalanceLines; i++) {
+        lines.add(UsageManager::lineAt(i));
+    }
+    doc["status"] = UsageManager::statusText();
+    doc["ts"] = static_cast<unsigned long>(UsageManager::pushEpoch());
+    doc["age_s"] = static_cast<unsigned long>(UsageManager::pushAgeSec());
+
     String json;
     serializeJson(doc, json);
-
     setCorsHeaders(webserver);
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
-
-    Logger::info("Custom TLS CA deleted, verification disabled", "API");
 }
+
 

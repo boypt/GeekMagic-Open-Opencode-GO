@@ -1,20 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-// OpenCode Go 用量轮询 + 主界面绘制管理器（Phase 2，移植自旧工程
-// sd2-opencode-go-balance/src/main.cpp 的正式 UI）。
+// Balance 主界面绘制管理器（推送模式）：上位机经 POST /api/v1/balance
+// 推送三行额度文本 + 可选状态行，本模块只负责渲染，不再做任何出站拉取。
 // 仿 DashboardManager 的 begin()/update() 静态模式：
-//   begin()  画主页面（WiFi 未连接时画 boot 提示页）；
-//   update() 每秒 tick 时钟（分钟变化重绘时钟盒 / 秒变化只重绘秒摆条带），
-//            并按 5min 轮询（从未成功过数据时 30s 快速重试），
-//            数据成功后只局部重绘正文区，失败只重绘状态行 + 底部错误条。
-// 局部重绘策略与旧工程一致，无整屏重刷（boot 页除外）。
+//   begin()  标记启动（首帧绘制仍由 enterScene / 首次联网就绪触发）；
+//   update() 每秒 tick 时钟（分钟变化差量更新 HH/MM 字形 / 秒变化只摆动分隔线），
+//            并消费 DisplayManager::requestFullRedraw() 整屏重绘（推送到达时触发）。
+// 局部重绘策略与旧工程一致，无整屏重刷（整屏重绘/入场除外）。
+// 存储为静态定长 char 缓冲（零 String 常驻、零 >4KB 分配，见坑 #9）。
 
 #include <Arduino.h>
-#include "opencodego/OpenCodeGoClient.h"
+#include <time.h>
 
 class UsageManager {
    public:
+    // ---- 推送缓冲容量（含末尾 NUL）----
+    static constexpr size_t kBalanceLines = 3;
+    static constexpr size_t kLineCap = 64;    // 每行额度文本
+    static constexpr size_t kStatusCap = 48;  // 状态行文本
+
     static void begin();
     static void update();
 
@@ -23,12 +28,22 @@ class UsageManager {
     static void enterScene();
     static void exitScene();
 
-    // ---- 供 UI 层读取的状态 ----
-    static bool hasData();
-    static const String& lastError();
-    static const OpenCodeGoUsage& usage();
+    // ---- 上位机推送入口（POST /api/v1/balance 调用）----
+    // lines[0..nLines) 为 1..3 行文本（NULL 行视为空）；status 为可选状态行
+    // （hasStatus=false 或空串表示缺省 → 状态行显示 UPD HH:MM）。
+    // 拷贝截断至定长缓冲，记录时间戳并 requestFullRedraw()，调用方直接回 200。
+    static void pushBalance(const char* const* lines, uint8_t nLines, const char* status,
+                            bool hasStatus);
 
-    // ---- 界面绘制（移植自旧工程 main.cpp）----
+    // ---- 供 UI 层 / API 层读取的状态 ----
+    static bool hasPush();
+    static const char* lineAt(uint8_t i);  // ""（未推送槽位）或行文本，永不返回 NULL
+    static bool hasStatus();
+    static const char* statusText();  // "" 或状态行文本，永不返回 NULL
+    static time_t pushEpoch();        // 推送时刻 UTC epoch；推送时未同步则为 0
+    static uint32_t pushAgeSec();     // 距推送秒数；未推送过为 0
+
+    // ---- 界面绘制 ----
     static void drawBootPage(bool fail);
     static void drawMainPage();
 
@@ -39,7 +54,7 @@ class UsageManager {
    private:
     static void drawBody();
     static void drawUpdateRow();
-    static void drawQuotaRow(int y, const char* label, const OpenCodeGoWindow& w);
+    static void drawQuotaRow(int y, const char* text);
     static void drawClock();
     static void drawDateLine();
     static void drawSeparator();

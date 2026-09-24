@@ -5,12 +5,10 @@
 #include <U8g2_for_Adafruit_GFX.h>
 #include <time.h>
 
-#include "config/ConfigManager.h"
 #include "display/DisplayManager.h"
 #include "opencodego/OpenCodeLogo.h"
 #include "wireless/WiFiManager.h"
 
-extern ConfigManager configManager;
 extern WiFiManager* wifiManager;
 
 // Arduino_GFX 不继承 Adafruit_GFX，而 U8g2_for_Adafruit_GFX 解码器对显示对象
@@ -48,12 +46,13 @@ static U8G2_FOR_ADAFRUIT_GFX& u8g2() {
     return font;
 }
 
-// ---- 轮询节奏 ----
-static constexpr uint32_t POLL_INTERVAL_MS = 5UL * 60UL * 1000UL;  // 默认 5 分钟
-static constexpr uint32_t FAST_RETRY_MS = 30UL * 1000UL;           // 无数据时 30s 快速重试
-static constexpr uint32_t FETCH_TIMEOUT_MS = 15000;
-static constexpr uint32_t FETCH_RETRY_INTERVAL_MS = 10000UL;
-static constexpr int FETCH_MAX_ATTEMPTS = 3;
+// ---- 上位机推送缓冲（静态定长，零堆常驻；时间戳见 pushBalance）----
+static char s_lines[UsageManager::kBalanceLines][UsageManager::kLineCap] = {{0}};
+static char s_status[UsageManager::kStatusCap] = {0};
+static bool s_hasPush = false;
+static bool s_hasStatus = false;
+static time_t s_pushEpoch = 0;      // 推送时刻 UTC epoch；推送时 NTP 未同步则为 0
+static uint32_t s_pushMillis = 0;   // 推送时刻 millis（age_s 基准，未同步时也有效）
 
 // ---- 时区（同旧工程 src/config.h：北京时间 UTC+8）----
 // GeekMagic NTPClient 用 configTime(0, 0, ...) 同步，time(nullptr) 为 UTC epoch；
@@ -121,12 +120,7 @@ static constexpr int MM_Y = 150;     // MM 大字顶部（占 y 150..196）
 static constexpr int DATE_X = 4;     // 日期行紧贴左沿
 static constexpr int DATE_Y = 50;
 
-// ---- 缓存状态（供 UI 层读取）----
-static OpenCodeGoUsage usageData;
-static String lastErrorText;
-static time_t lastSuccessTime = 0;  // 本地时刻（已 +TZ_OFFSET_SEC）；0 = 从未成功
-static uint32_t last_poll_ms = 0;
-static bool has_data = false;
+// ---- 运行状态 ----
 static bool ever_started = false;
 
 // 上次绘制的本地分钟（hour*60+min）/ 秒；-1 = 尚未绘制
@@ -160,30 +154,32 @@ static String formatLocalTime(time_t t, const char* fmt) {
     return String(buf);
 }
 
-// OpenCode 接口返回 UTC 时间（如 "2026-08-28T15:42:25.791Z"）。
-// 同旧工程：mktime 按系统时区（GeekMagic 为 UTC）解释，再补回时区偏移。
-static bool parseIsoTime(const String& iso, time_t& out) {
-    if (iso.length() < 19) return false;
-
-    struct tm tmv = {};
-    tmv.tm_year = iso.substring(0, 4).toInt() - 1900;
-    tmv.tm_mon = iso.substring(5, 7).toInt() - 1;
-    tmv.tm_mday = iso.substring(8, 10).toInt();
-    tmv.tm_hour = iso.substring(11, 13).toInt();
-    tmv.tm_min = iso.substring(14, 16).toInt();
-    tmv.tm_sec = iso.substring(17, 19).toInt();
-
-    time_t t = mktime(&tmv) + TZ_OFFSET_SEC;
-    if (t <= 0) return false;
-    out = t;
-    return true;
+// ---------- 定长缓冲绘制工具（零堆：直接走 const char*，不经过 String）----------
+// 调用前须 u8g2().setFont(...)；测宽与绘制用同一字体。
+// 参数 y 为字形顶部（同旧 TFT_eSPI TL_DATUM），内部按当前字体 ascent 折算基线
+static int textWidthC(const char* s) {
+    return static_cast<int>(u8g2().getUTF8Width(s));
 }
 
-static String formatReset(const String& iso) {
-    if (iso.length() == 0) return "";
-    time_t t;
-    if (!parseIsoTime(iso, t)) return "R --";
-    return "R " + formatLocalTime(t, "%m-%d %H:%M");
+static void drawTextC(int x, int y, const char* s, uint16_t color) {
+    u8g2().setForegroundColor(color);
+    u8g2().drawUTF8(static_cast<int16_t>(x),
+                    static_cast<int16_t>(y + u8g2().getFontAscent()), s);
+}
+
+// UTF-8 安全截断：按显示宽度把 buf 就地截到 maxPx 内（不得溢出侵入相邻元素）。
+// 从尾部逐字符删除（跳过 10xxxxxx 后续字节），调用方保证 buf 以 NUL 结尾。
+static void truncateToFit(char* buf, int maxPx) {
+    while (buf[0] != '\0' && textWidthC(buf) > maxPx) {
+        size_t len = strlen(buf);
+        if (len == 0) break;
+        size_t cut = len - 1;
+        // 跳过 UTF-8 后续字节，找到字符起始字节
+        while (cut > 0 && (static_cast<uint8_t>(buf[cut]) & 0xC0) == 0x80) {
+            cut--;
+        }
+        buf[cut] = '\0';
+    }
 }
 
 // ---------- 界面工具 ----------
@@ -289,51 +285,36 @@ static void drawSegText(int cx, int topY, const String& s, uint16_t color) {
     }
 }
 
-// 颜色阈值 ≥50 绿 / ≥20 黄 / <20 红（同旧工程）
-static uint16_t barColorFor(int remaining) {
-    if (remaining >= 50) return C_GREEN;
-    if (remaining >= 20) return C_YELLOW;
-    return C_RED;
-}
-
-// ---------- 右栏额度行 ----------
-// 一行额度：标题/百分比在上，进度条居中，重置时间用小字放底部（同旧 drawQuotaRow）
-void UsageManager::drawQuotaRow(int y, const char* label, const OpenCodeGoWindow& w) {
+// ---------- 右栏额度行（推送纯文本，自适应字号）----------
+// 行内容 = 上位机推送整行文本（自带标签，设备零语义只排版），在
+// QUOTA_X0..QUOTA_X1 内右对齐（保持旧百分比的视觉锚点感）：
+//   FONT_PCT 能放下 → 大字；否则 FONT_MINI，仍超宽则 truncateToFit 截断。
+// 空槽（首次推送前）显示红色 "--" 占位；有内容为白色。
+// 版式：单行文本在 56px 行内光学居中（大字 y+18 / 小字 y+21，字形视觉
+// 中心落在行中线附近，略偏上）。旧进度条空槽已移除——推送模式无百分比
+// 可填，实心空槽只是视觉死重；空出的留白让行内呼吸，与左栏 HH/分隔线/MM
+// 的节奏对齐（行 1/2/3 文本分别落在 HH 带 / 分隔线 / MM 带高度）。
+// 行内除文本无任何装饰，页面气质由顶部分隔线与中缝竖线维持。
+void UsageManager::drawQuotaRow(int y, const char* text) {
     auto* gfx = DisplayManager::getGfx();
     gfx->fillRect(122, y, 112, ROW_H, C_BG);
 
-    u8g2().setFont(FONT_LABEL);
-    drawText(QUOTA_X0, y + 3, label, C_LABEL);
+    const bool empty = (text == nullptr || text[0] == '\0');
+    const char* shown = empty ? "--" : text;
+    const uint16_t color = empty ? C_RED : C_WHITE;
 
-    String pct = "--";
-    uint16_t pctColor = C_RED;
-    int remaining = 0;
-    if (w.present && w.valid) {
-        remaining = w.remaining();
-        pct = String(remaining) + "%";
-        pctColor = C_WHITE;
-    }
+    char fit[UsageManager::kLineCap];
+    strlcpy(fit, shown, sizeof(fit));
+
     u8g2().setFont(FONT_PCT);
-    int pw = textWidth(pct);
-    drawText(QUOTA_X1 - pw, y + 2, pct, pctColor);
-
-    gfx->fillRect(QUOTA_X0, y + 28, QUOTA_X1 - QUOTA_X0, 12, C_BORDER);
-    if (w.present && w.valid && remaining > 0) {
-        gfx->fillRect(QUOTA_X0, y + 28,
-                      static_cast<int32_t>(QUOTA_X1 - QUOTA_X0) * remaining / 100, 12,
-                      barColorFor(remaining));
+    if (textWidthC(fit) <= QUOTA_X1 - QUOTA_X0) {
+        drawTextC(QUOTA_X1 - textWidthC(fit), y + 18, fit, color);
+        return;
     }
 
     u8g2().setFont(FONT_MINI);
-    if (w.present && !w.valid) {
-        String inv = "INVALID";
-        drawText(QUOTA_X1 - textWidth(inv), y + 44, inv, C_RED);
-    } else {
-        String reset = formatReset(w.resetsAt);
-        if (reset.length() > 0) {
-            drawText(QUOTA_X1 - textWidth(reset), y + 44, reset, C_SUB);
-        }
-    }
+    truncateToFit(fit, QUOTA_X1 - QUOTA_X0);  // 当前字体即 MINI，测宽一致
+    drawTextC(QUOTA_X1 - textWidthC(fit), y + 21, fit, color);
 }
 
 // ---------- 左栏时钟区 ----------
@@ -504,66 +485,37 @@ void UsageManager::tickUi() {
 }
 
 // ---------- 右栏状态行 ----------
-// 错误串压缩为 ASCII 短串（同旧 shortUpdateError）
-static String shortUpdateError() {
-    if (lastErrorText.startsWith("Network")) return "Network";
-    if (lastErrorText.startsWith("WiFi")) return "WiFi";
-    if (lastErrorText.startsWith("HTTP")) return lastErrorText;  // "HTTP 429" 等已短
-    if (lastErrorText.startsWith("Server")) return "Server";
-    if (lastErrorText.startsWith("Response") || lastErrorText.startsWith("Empty") ||
-        lastErrorText.startsWith("Resp")) {
-        return "Resp";
-    }
-    if (lastErrorText.startsWith("Bad")) return "BadKey";
-    if (lastErrorText.startsWith("No Go") || lastErrorText.startsWith("NoPlan")) return "NoPlan";
-    if (lastErrorText.startsWith("No Key") || lastErrorText.startsWith("NoKey")) return "NoKey";
-    if (lastErrorText.length() <= 8) return lastErrorText;
-    return lastErrorText.substring(0, 8);
-}
-
-// 右栏顶部 slim 状态行，四态（同旧 drawUpdateRow）：
-//   无成功无错误 -> "NO UPDATE"
-//   无成功有错误 -> "ERR <lastError>"（截断至 mini 字体 112px 内，红色）
-//   有成功无错误 -> "UPDATE HH:MM"
-//   有成功有错误 -> "UPDATE HH:MM E:<short>"（截断保 112px 内，红色）
+// 右栏顶部 slim 状态行（推送模式，三态）：
+//   从未推送      -> "WAITING"
+//   有推送+状态行  -> 状态行文本（截断至 mini 字体 112px 内）
+//   有推送无状态行 -> "UPDATE HH:MM"（推送时刻本地时间；NTP 未同步时 "UPD --:--"）
 void UsageManager::drawUpdateRow() {
     auto* gfx = DisplayManager::getGfx();
     gfx->fillRect(122, STATUS_Y, 112, STATUS_H, C_BG);
 
     u8g2().setFont(FONT_MINI);
-    String upd;
-    uint16_t color = C_SUB;
-    bool hasErr = lastErrorText.length() > 0;
-    if (lastSuccessTime == 0 && !hasErr) {
-        upd = "NO UPDATE";
-    } else if (lastSuccessTime == 0 && hasErr) {
-        upd = "ERR " + lastErrorText;
-        while (upd.length() > 4 && textWidth(upd) > 112) {
-            upd.remove(upd.length() - 1);
-        }
-        color = C_RED;
-    } else if (!hasErr) {
-        upd = "UPDATE " + formatLocalTime(lastSuccessTime, "%H:%M");
+    char upd[UsageManager::kStatusCap];
+    if (!s_hasPush) {
+        strlcpy(upd, "WAITING", sizeof(upd));
+    } else if (s_hasStatus && s_status[0] != '\0') {
+        strlcpy(upd, s_status, sizeof(upd));
+    } else if (s_pushEpoch > 0) {
+        String t = "UPD " + formatLocalTime(s_pushEpoch + TZ_OFFSET_SEC, "%H:%M");
+        strlcpy(upd, t.c_str(), sizeof(upd));
     } else {
-        String base = "UPDATE " + formatLocalTime(lastSuccessTime, "%H:%M") + " E:";
-        String sh = shortUpdateError();
-        upd = base + sh;
-        while (sh.length() > 0 && textWidth(upd) > 112) {
-            sh.remove(sh.length() - 1);
-            upd = base + sh;
-        }
-        color = C_RED;
+        strlcpy(upd, "UPD --:--", sizeof(upd));
     }
-    drawText(QUOTA_X1 - textWidth(upd), STATUS_Y + 4, upd, color);
+    truncateToFit(upd, 112);
+    drawTextC(QUOTA_X1 - textWidthC(upd), STATUS_Y + 4, upd, C_SUB);
 }
 
 // ---------- 页面组装 ----------
 // 正文区域（状态行 + 额度栏 + 时钟栏 + 中缝竖线）；调用前须保证该区域已清底
 void UsageManager::drawBody() {
     drawUpdateRow();
-    drawQuotaRow(ROW_TOP, "5H", usageData.rolling);
-    drawQuotaRow(ROW_TOP + ROW_H, "WK.", usageData.weekly);
-    drawQuotaRow(ROW_TOP + ROW_H * 2, "MO.", usageData.monthly);
+    drawQuotaRow(ROW_TOP, s_lines[0]);
+    drawQuotaRow(ROW_TOP + ROW_H, s_lines[1]);
+    drawQuotaRow(ROW_TOP + ROW_H * 2, s_lines[2]);
     drawClock();
     DisplayManager::getGfx()->drawFastVLine(120, STATUS_Y, STATUS_H + ROW_H * 3, C_BORDER);
 }
@@ -746,12 +698,34 @@ void UsageManager::drawBootPage(bool fail) {
     drawText((240 - hw) / 2, 140, hint, fail ? C_RED : C_LABEL);
 }
 
-// ---------- 轮询 ----------
+// ---------- 推送接收（无轮询：数据源为 POST /api/v1/balance）----------
 void UsageManager::begin() {
     ever_started = true;
-    // 首次尽快轮询
-    last_poll_ms = millis() - FAST_RETRY_MS;
-    Logger::info("UsageManager initialized", "OpenCodeGo");
+    Logger::info("UsageManager initialized (push mode)", "Balance");
+}
+
+void UsageManager::pushBalance(const char* const* lines, uint8_t nLines, const char* status,
+                               bool hasStatus) {
+    for (uint8_t i = 0; i < kBalanceLines; i++) {
+        if (i < nLines && lines != nullptr && lines[i] != nullptr) {
+            strlcpy(s_lines[i], lines[i], kLineCap);
+        } else {
+            s_lines[i][0] = '\0';
+        }
+    }
+    if (hasStatus && status != nullptr && status[0] != '\0') {
+        strlcpy(s_status, status, kStatusCap);
+        s_hasStatus = true;
+    } else {
+        s_status[0] = '\0';
+        s_hasStatus = false;
+    }
+    s_hasPush = true;
+    s_pushMillis = millis();
+    s_pushEpoch = timeSynced() ? time(nullptr) : 0;
+    // 立即刷新显示：经整屏重绘由 update() 重画主页面（严禁绘制启动屏，见坑 #4）
+    DisplayManager::requestFullRedraw();
+    Logger::info("Balance push stored", "Balance");
 }
 
 // 场景入场：必须从零绘制所有元素（场景切换契约）
@@ -783,12 +757,12 @@ void UsageManager::update() {
     const bool wifiReady = (wifiManager != nullptr) && !wifiManager->isApMode() &&
                            WiFiManager::isConnected();
 
-    // 显示设置（rotation / 面板 profile）变更后，应用层整屏重绘主页面
-    //（用缓存数据/占位符绘制；不看 wifiReady，重画后此时钟状态与服务端一致）
+    // 显示设置（rotation / 面板 profile）变更或上位机推送后，应用层整屏重绘主页面
+    //（用推送缓冲/占位符绘制；不看 wifiReady；严禁绘制启动屏，见坑 #4）
     if (DisplayManager::consumeFullRedrawRequest()) {
         drawMainPage();
         mainPageDrawn = true;
-        Logger::info("UsageManager: main page redrawn", "OpenCodeGo");
+        Logger::info("UsageManager: main page redrawn", "Balance");
     }
 
     // 首次联网就绪时画主页面（同旧工程 onConnected hook）
@@ -797,89 +771,28 @@ void UsageManager::update() {
         mainPageDrawn = true;
     }
 
-    // 常驻时钟 tick：与网络/额度获取无关，放在最前，WiFi 掉线时也照样走时；
+    // 常驻时钟 tick：与推送无关，放在最后，WiFi 掉线时也照样走时；
     // 内部自行跳过未同步；boot 页/未画主页面期间不碰屏
     if (mainPageDrawn) {
         tickUi();
     }
-
-    if (!wifiReady) {
-        return;
-    }
-
-    // 从未成功过数据时用 FAST_RETRY，有数据后等满轮询周期（失败不清 has_data，同旧工程）
-    const uint32_t interval = has_data ? POLL_INTERVAL_MS : FAST_RETRY_MS;
-    const uint32_t now = millis();
-    if (now - last_poll_ms < interval) {
-        return;
-    }
-    last_poll_ms = now;
-
-    if (configManager.getOpenCodeGoApiKey()[0] == '\0' || configManager.getOpenCodeGoHost()[0] == '\0') {
-        // 未填 Key 时提示（同旧工程），等满一个周期后再查
-        lastErrorText = "No Key";
-        drawUpdateRow();
-        yield();
-        return;
-    }
-
-    if (WiFi.status() != WL_CONNECTED) {
-        return;
-    }
-
-    Serial.printf("Free heap before fetch: %u B\n", ESP.getFreeHeap());
-    // 拉取峰值 ~8.5KB（MFLN 1024/512 + thunk）；低堆保护栏见 OpenCodeGoClient.h。
-    // 相册显示为流式送屏（~4KB 行缓冲），且与拉取经场景系统互斥，无需让路
-    OpenCodeGoUsage fetched;
-    bool ok = fetchOpenCodeGoUsage(fetched, configManager.getOpenCodeGoHost(),
-                                   configManager.getOpenCodeGoPath(),
-                                   configManager.getOpenCodeGoApiKey(),
-                                   configManager.getVerifyTlsCert(),
-                                   FETCH_TIMEOUT_MS, FETCH_RETRY_INTERVAL_MS,
-                                   FETCH_MAX_ATTEMPTS);
-    Serial.printf("Free heap after fetch: %u B\n", ESP.getFreeHeap());
-
-    if (ok) {
-        usageData = fetched;  // 只在成功时提交，失败保留上次数据供显示
-        has_data = true;
-        lastErrorText = "";
-        lastSuccessTime = time(nullptr) + TZ_OFFSET_SEC;
-
-        Serial.printf("Quota: 5h %d%% / week %d%% / month %d%%\n",
-                      usageData.rolling.percent, usageData.weekly.percent,
-                      usageData.monthly.percent);
-
-        // 局部重绘：清空正文区（含底部错误条）+ 重画整块正文（含时钟），
-        // 与 drawMainPage 的 drawBody 完全一致，避免残影、避免整屏闪动
-        auto* gfx = DisplayManager::getGfx();
-        gfx->startWrite();
-        gfx->fillRect(0, 44, 240, 240 - 44, C_BG);
-        drawBody();
-        gfx->endWrite();
-        yield();
-    } else {
-        Serial.printf("Fetch failed after retries: %s (HTTP %d)\n",
-                      fetched.error.c_str(), fetched.http_code);
-        // 屏幕保留已显示的额度数据，仅更新状态行 + 底部错误条；
-        // 下次成功会自动重绘覆盖。startWrite/endWrite 严格配对
-        String e = fetched.error;
-        if (e.isEmpty()) e = "Fetch fail";
-        if (e.length() > 18) e = e.substring(0, 18);
-        lastErrorText = e;
-
-        auto* gfx = DisplayManager::getGfx();
-        gfx->startWrite();
-        drawUpdateRow();
-        gfx->fillRect(0, 226, 240, 14, C_BG);
-        u8g2().setFont(FONT_MINI);
-        String err = "ERR " + lastErrorText;
-        drawText((240 - textWidth(err)) / 2, 229, err, C_RED);
-        gfx->endWrite();
-        yield();
-    }
 }
 
-// ---- UI 层访问器 ----
-bool UsageManager::hasData() { return has_data; }
-const String& UsageManager::lastError() { return lastErrorText; }
-const OpenCodeGoUsage& UsageManager::usage() { return usageData; }
+// ---- UI 层 / API 层访问器（返回静态缓冲指针，调用方立即拷贝）----
+bool UsageManager::hasPush() { return s_hasPush; }
+
+const char* UsageManager::lineAt(uint8_t i) {
+    if (i >= kBalanceLines) return "";
+    return s_lines[i];
+}
+
+bool UsageManager::hasStatus() { return s_hasStatus; }
+
+const char* UsageManager::statusText() { return s_status; }
+
+time_t UsageManager::pushEpoch() { return s_pushEpoch; }
+
+uint32_t UsageManager::pushAgeSec() {
+    if (!s_hasPush) return 0;
+    return (millis() - s_pushMillis) / 1000UL;
+}

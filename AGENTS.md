@@ -31,7 +31,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 ## 硬件与显示
 
 - ST7789 240x240，SPI Mode3 40MHz，无 CS（引脚固化在 `include/config/ConfigManager.h`：MOSI=13 SCK=14 DC=0 RST=2，背光 GPIO5 低有效）。
-- **WS2812 氛围灯**（本机加装，上游无）：数据脚 **GPIO12**，默认 1 颗（`include/led/AmbientLight.h` 的 `WS2812_LED_COUNT`），效果 tick 在 main loop 与场景无关；控制见 `/api/v1/light` 与首页控制块。
+- **WS2812 氛围灯**（本机加装，上游无）：数据脚 **GPIO12**，默认 1 颗（`include/led/AmbientLight.h` 的 `WS2812_LED_COUNT`），效果 tick 在 main loop 与场景无关；控制见 `/api/v1/light` 与首页控制块。呼吸 = 余弦包络 + gamma2.2 的 **Q12 定点查表**（`s_breathEnvelopeQ12`，129 项对称、258B flash、0B RAM，不用 `pow()`）、10s 周期、相位由 `millis()` 派生（主循环繁忙不漂移）、每通道最终 8bit 值兜底 `>= BREATH_MIN_CHANNEL`(10)、**相同颜色不重复发帧**（WS2812 会保持最后锁存值，冗余帧只增加误码风险，见已知坑 12）。
 - 图形库是 **Arduino_GFX**（不是 TFT_eSPI）；面板初始化走 `src/display/DisplayManager.cpp::lcdRunVendorInit()`（厂商序列，含 gamma/电源/VCOM），另有 `lcdRunSd2Init()`（旧 sd2 精简序列）可切换。
 - **本面板色序是 BGR**：旧 sd2 用 TFT_eSPI 的 ST7789_2 驱动（240x240 自动定义 CGRAM_OFFSET → MADCTL 带 BGR 位 0x08），所以 `lcd_bgr` 默认 **true**。改这个之前先确认观感（红蓝互换是最明显症状）。推入的 16bpp 位图（相册/实时帧）在 `writePixels` 前做 **R/B 字段交换**补偿（`Scenes.cpp::drawImage`、`Api.cpp` 推帧行），UI 主题色则由两个文件里的 `rgb565()` 助手统一做同一交换（`UsageManager.cpp`、`Scenes.cpp`，源码里一律写真 RGB）。三者必须同一口径，否则屏上红蓝颠倒（logo 位图自带历史补偿值、不经助手；WS2812 不走 RGB565 不受影响）。
 - 亮度：GPIO5 反相 PWM（`analogWriteRange(1023)`，`analogWrite(pin, 1023 - duty)`），`lcd_brightness` 0-100。
@@ -43,12 +43,14 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 |---|---|
 | `src/main.cpp` | 启动流程：DisplayManager → WiFiManager → NTP → Webserver → `UsageManager::begin()`；loop 委托各 manager |
 | `src/opencodego/UsageManager.cpp` | 七段时钟、logo、三行额度、状态行渲染；数据源 = `POST /api/v1/balance` 的三段推送缓冲（`setRowLabel/setRowProgress/setRowReset` 写入，定长静态数组，零 String 抖动），推送到达即 `requestFullRedraw()`；额度行**三段式**：行上方左=标签（缺省回落 5H/WK./MO.）/右=百分比（中等字号，无值红 `--`）、中间=进度条（轨道左右 4px 等边距、填充绿≥50/黄≥20/红<20、无值空槽）、行下方右=重置日期（最小字号，缺省 `--`）。设备不解析语义 |
+| `include/opencodego/StockData.h` + `src/opencodego/StockData.cpp` | 股票场景推送缓冲：`Row{name[10], float change}` 定长 5 行静态数组（零堆、零 String），`setRows()` 整体替换并记 `millis()`，`clear()` 清空，`getRow()` 越界返回 false；`POST /api/v1/stock` 写入、stock 场景只读消费，涨跌方向由数值正负表达（设备零语义） |
 | `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（完整 URL `--upstream-url`，默认 `https://opencode.ai/zen/go/v1/usage` + Bearer + `x-opencode-session`），按**三段字段**推送（左上标签 `labels` / 进度条与右上百分比 `progress`=剩余% / 右下重置相对时长 `resets`）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check/--demo`（`--demo` 用本地随机数据测试、无需上游凭据），退出码 0/1/2/3 |
+| `tools/push_stock.py` | 上位机股票行情推送脚本（仅标准库）：请求 `hq.sinajs.cn/list=<代码,...>`，**必须带 `Referer: https://finance.sina.com.cn`**（缺失 → 403），响应声明 charset=GB18030（按 gb18030 解码，GBK 是其子集）；**按字段数判断布局**（≥10 字段=个股：昨收 `data[2]`、现价 `data[3]` 算涨跌幅；<10=指数：`data[3]` 已是百分比 —— 不可用 `sh60`/`sz` 前缀判断，`sz399001` 等指数会被误判），四舍五入 2 位小数；脏数据（停牌、昨收≤0、空行）跳过，全失败 rc=1 **不推送**（免得自动接管把垃圾推上屏）；`name` 推**新浪代码**（`sh600519`，保留 `sh`/`sz` 前缀，否则 `sh000001` 指数与 `sz000001` 个股无法区分），中文名只打主机日志（设备无中文字模）；最多 5 个标的，超出 rc=3 不静默截断；`--loop/--dry-run/--demo/--check/--insecure`；退出码 0 成功 / 1 行情失败 / 2 设备失败 / 3 参数错误 |
 | `include/opencodego/SegFont7.h` | TFT_eSPI Font7 原字模解码的 1bpp 行位图（0-9 : -，32x48），像素级还原旧七段观感 |
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
 | `include/display/Scene.h` + `src/display/SceneManager.cpp` | 场景接口 + 调度器：显示面唯一切换入口 `switchTo()`（退场重绘契约：旧场景 exit 禁画/释放，新场景 enter 全量绘制；失败回滚重绘上一场景） |
-| `src/display/Scenes.cpp` | 内置场景：`sysinfo`（系统信息：IP / WiFi SSID+RSSI / NTP 服务器+同步状态 / 芯片 ID / 运行时长 / 剩余堆 / 显示配置 / 固件版本 + 底部 UTC+8 时钟；**开机落点**，取代原 startup IP 画面；值变化时只擦写对应单行）/ `balance`（额度+时钟）/ `album`（静态相册：param=文件名常驻单张、空=循环轮播 5s/张）/ `clock`（纯时钟页）/ `live`（实时推图：API 流式直绘、不落盘、常驻最后一帧）。场景切换一律 `switchTo`；**唯二例外是推送自动接管**：`live` 推图 → live，额度推送 → balance |
+| `src/display/Scenes.cpp` | 内置场景：`sysinfo`（系统信息：IP / WiFi SSID+RSSI / NTP 服务器+同步状态 / 芯片 ID / 运行时长 / 剩余堆 / 显示配置 / 固件版本 + 底部 UTC+8 时钟；**开机落点**，取代原 startup IP 画面；值变化时只擦写对应单行）/ `balance`（额度+时钟）/ `album`（静态相册：param=文件名常驻单张、空=循环轮播 5s/张）/ `clock`（纯时钟页）/ `stock`（股票行情：标题 `STOCK` 居中 + 5 个固定槽位（简称 textSize 2 左对齐、涨跌幅右对齐，**正红涨 `#FF0000` / 正绿跌 `#00FF00`** / 中性灰，0 行时空态 `NO DATA`+`PUSH VIA API`，行文本按可用宽度以 `~` 截断过长名称）+ 底部 UTC+8 `HH:MM:SS` 秒表紧贴屏幕底部；数据源 = `StockData` 缓冲（`POST /api/v1/stock` 写入），时间戳或内容变化才重绘行带、秒变化只擦秒字段）/ `live`（实时推图：API 流式直绘、不落盘、常驻最后一帧）。场景切换一律 `switchTo`；**唯三例外是推送自动接管**：`live` 推图 → live，额度推送 → balance，股票推送 → stock |
 | `src/display/Scenes.cpp`（AlbumScene/LiveScene） | 相册图片 = `/album/<name>.rgb565`（240x240 RGB565(LE) 115200B，Web 端 canvas 转换上传，jpg/png 等任意源图）；`POST /album/live` 同格式流式推帧（480B 行缓冲逐行直绘、不保存），推送时若不在 live 场景则自动接管屏幕 |
 | `src/config/ConfigManager.cpp` | `config.json`（LittleFS）+ SecureStorage（EEPROM NVS）双层配置 |
 | `src/boot/RescueMode.cpp` | boot-loop 保护（见"已知坑"） |
@@ -58,6 +60,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 - `config.json`（LittleFS 根）：`api_token` 有值且与 NVS **不同**时**覆盖** NVS（便于刷机生效）；随后 `save()` 会把它从 JSON 删除（敏感信息只留 NVS）。
 - WiFi 凭据、API token 在 SecureStorage（EEPROM，XOR 混淆）；亮度/显示/NTP 等参数在 `config.json`。上游 host/path/key 已移出设备，归上位机脚本的参数/环境变量。
+- `SecureStorage::put()` 对**与 EEPROM 已提交值相同**的键直接返回（`_dirty` 标志区分「内存已改但 commit 未成功」，提交失败后同值仍会重试，绝不误判为已持久化），因此改亮度/颜色/显示等非敏感字段不再触发 NVS 序列化 + EEPROM sector 擦写 —— 既省 flash 磨损，也避免阻塞主循环几十 ms 漏掉 WS2812 的 20ms tick。
 - `data/config.json` 被上游 `.gitignore` 忽略（含 token，勿提交）。它被打进 littlefs 映像，所以**刷文件系统会覆盖设备上的 config.json**——新增持久化字段时记得同步加进去，否则刷完丢配置。
 - TLS：设备端**已无任何出站 TLS**（BearSSL/CA 文件/`verify_tls_cert`/MFLN 全部移除）；上游 HTTPS 由上位机脚本按**标准系统证书库**校验（`--insecure` 可关闭校验，无自定义 CA 选项）。
 
@@ -68,8 +71,9 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 - 显示：`GET/POST /display/rotation`（含 lcd_bgr/lcd_init_sd2/镜像）、`GET/POST /display/mirror`、`GET/POST /display/brightness`
 - 相册：`GET/POST/DELETE /album`（图片 = 240x240 RGB565 原始位图 `.rgb565`，Web 端转换上传；上传时校验整幅尺寸 115200B）；`POST /album/live`（multipart 流式推一帧实时显示、**不保存**——脚本/HA 推画面用；不在 live 场景时自动接管）
 - 灯光：`GET/POST /light`（WS2812 氛围灯：`on/mode(solid|breathe|rainbow)/r,g,b/brightness`，部分更新，持久化 config.json `led_*`）
-- 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动跳转，全手工**；推送自动接管是例外：live 推图→live、额度推送→balance |
+- 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动跳转，全手工**；推送自动接管是例外：live 推图→live、额度推送→balance、股票推送→stock |
 - 额度推送：`POST /balance`（body `{"labels":["5H","WK.","MO."],"progress":[58,null,91],"resets":["R2d4h",null,"R14d3h"],"status":"可选状态行"}`；三段字段均可选、出现时须**彼此等长**（1..3）、元素可 `null`；`progress` 元素为 0..100 剩余百分比（越界/类型错/长度不一致 → 400），缺省 `labels` 回落固件默认 `5H/WK./MO.`、缺省 `resets` 显示 `--`、缺省 `progress` 为空槽；body<1KB；成功 200 `{"ok":true}` 并立即重绘；**若当前不在 balance 场景则立即 `switchTo("balance")` 接管**）、`GET /balance`（`{labels,progress,resets,status,ts,age_s}`）。整行 `lines` 通道**已退役**——标签 / 百分比 / 重置三段分开推送，设备零语义照单渲染
+- 股票推送：`POST /stock`（body `{"rows":[{"name":"600519","change":1.23},...]}`，1..5 行；`name` 须 1..9 字节**可打印 ASCII**（固件无中文字模，汉字/控制字符一律 400）、`change` 须有限数且 `|change|≤100000`（字符串/NaN/Inf/越界 → 400）；`{"rows":[]}` 清空；body<1KB；成功 200 `{"ok":true}` 并立即重绘；**若当前不在 stock 场景则立即 `switchTo("stock")` 接管**）、`GET /stock`（`{rows:[{name,change}],ts,age_s}`）
 - 系统：`POST /reboot`、`GET /logs`、`POST /ota/fw|fs|cancel`、`GET /ota/status`、`GET/POST /token/check|save`
 - rescue 模式（AP `GeekMagic` @192.168.4.1，无鉴权）：`GET /rescue/status`，`POST /rescue/reset|reboot|token|ota`
 
@@ -86,12 +90,14 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 9. **GIF→相册重构的路径残留**：删除接口曾写死 `/gif/` 前缀，文件实际在 `/album/`，删除必 404 `file not found`。改存储目录/前缀时全仓 grep 旧前缀对齐（上传/列表/删除/场景四处）。
 10. **勿在设备端重新引入出站 TLS**：BearSSL/`WiFiClientSecure`/CA 校验/MFLN 等组件已整体移除（Flash 从 ~59% 降到 ~46%），历史坑（CA 解析 OOM、低堆 abort 重启、MFLN 512 档被拒、握手 15s）都随移除消失；上游 HTTPS 归上位机脚本。
 11. **LCD 上屏文案必须 ASCII**：Arduino_GFX 内建 6px 字体只覆盖 ASCII，固件里没有任何 CJK 字模（现有界面文案全是英文即因此）。给 LCD 文本写中文会取到字表越界字形（乱码，甚至读越界）——中文只出现在 Web 页（浏览器自带字体）。
+12. **WS2812 低亮度偶发「突然亮一下」：根因是传输误码，不是亮度曲线**。0 位被灯珠读成 1 → 字节变大 → 锁存更亮的一帧（持续一个刷新周期）。`Adafruit_NeoPixel 1.15.5` 在 ESP8266 的 0 位高脉冲目标 0.4µs 超出 WS2812B-**V5/V6** 规格（220~380ns），而老版 WS2812B 反而宽裕；且 ESP 3.3V 直驱 5V 灯珠时高电平余量很薄（V5 规格 VIH≈0.63×VDD≈3.15V，只剩 ~150mV），WiFi 发射电流尖峰与 bit-bang 中断窗口会放大误码概率。**本机 LED 是成品、硬件不可改**（加不了串联电阻/电平转换/去耦电容），所以代码侧只做缓解：每通道下限 `>= 10`（V5 实测 1~2 不亮、3~7 慢启动，10 是合理暗端下限）+ **相同颜色不重复发帧**（30% 亮度下全周期传输次数降到约 1/4，暗段/平台段冗余率约 98%）。低频偶发闪亮无法根除，根治需换 V6 灯珠或加 330Ω 串阻 + 74AHCT125 + 100nF/470~1000µF 去耦。**别再去调呼吸曲线**——曲线已做 gamma 感知校正且用户验收平滑。
 
 ## 验证工作流
 
 改动后标准闭环：`pio run` → `upload`（+ 必要时 `uploadfs`）→ pyserial 抓 40-95s 启动日志，确认
 `Clean boot (...)` 或 `Boot stable`、无 `Exception`、`UsageManager initialized`、`Free heap` 稳定无泄漏趋势。
 额度链路联调：`python3 tools/push_balance.py --dry-run` 看 payload → 带真参数推送 → 屏幕三行即时刷新、`GET /api/v1/balance` 可见 lines/ts。
+股票链路联调：`python3 tools/push_stock.py --dry-run` 看真实行情 payload（不需要设备参数）→ 带 `--device/--device-token` 推送 → 屏幕自动接管 stock 场景，`GET /api/v1/stock` 可见 rows/ts。
 无测试/CI，`pio run` + 真机日志即为验证。RAM ~62% / Flash ~46%（移除出站 TLS 后 Flash 大降），加库注意余量。
 
 ## 提交规范

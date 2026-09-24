@@ -212,16 +212,23 @@ class SystemInfoScene : public Scene {
     }
 
     auto drawDate() -> void {
-        char dateText[24];
+        char dateText[16];
         const time_t now = time(nullptr) + 8 * 3600;
         m_lastDay = static_cast<int>(now / 86400);
         struct tm localTime;
         gmtime_r(&now, &localTime);
+        // 完整日期与星期共 15 个 ASCII 字符；小字号控制在 90px，
+        // 仍保留 Arduino_GFX 的像素点阵观感。
         strftime(dateText, sizeof(dateText), "%Y-%m-%d  %a", &localTime);
         auto* gfx = DisplayManager::getGfx();
+        // Clear the full date band before redrawing so a longer previous value
+        // cannot leave glyph remnants. This is a fixed-area update, not a
+        // full-screen redraw, and the clock band starts at y=174.
+        gfx->fillRect(0, 140, 240, 30, C_BG);
+        // 8px 字形在独占带内垂直居中，并与下方大时钟保持间隔。
         gfx->setTextSize(1);
         gfx->setTextColor(C_ACCENT);
-        gfx->setCursor(120 - textWidthPx(dateText, 1) / 2, 164);
+        gfx->setCursor(120 - textWidthPx(dateText, 1) / 2, 151);
         gfx->print(dateText);
     }
 

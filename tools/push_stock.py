@@ -3,8 +3,8 @@
 """上位机股票行情推送脚本：读取新浪行情并推送到 GeekMagic 小屏。
 
 设备端不主动访问行情源；本脚本在 PC 上请求 ``hq.sinajs.cn``，按设备契约
-整理后 POST 到 ``/api/v1/stock``。行情响应是 GBK 编码，设备显示的标的是
-新浪代码（如 ``sh600519``），不推送中文名称。
+整理后 POST 到 ``/api/v1/stock``。新浪响应声明为 GB18030（GBK 的超集），
+按 GB18030 解码；设备显示的是新浪代码（如 ``sh600519``），不推送中文名称。
 
 设备契约（设备端固件实现，勿改）::
 
@@ -16,6 +16,14 @@
 
 ``--demo`` 用本地随机但合理的 5 组数据代替新浪行情，无需行情源即可测试
 设备推送与屏幕渲染。仅依赖 Python 标准库。
+
+``--loop`` 按北京时间判断 A 股交易时段：周一至周五 09:15–11:30、
+13:00–15:00 视为开市。09:15 起包含集合竞价，因为该阶段新浪现价也会变化，
+所以将它纳入开市窗口。节假日无法只靠星期推导，取数时读取个股行情日期
+作为兜底：若行情日期不是北京时间当天，即使处在时间窗内也按休市处理；
+指数没有日期字段，拿不到日期时只按时间窗判断。开市期间默认每 15 秒取数，
+约等于每分钟 4 次，必要时可通过 ``--open-interval`` 调大；休市期间仍会
+取数并推送，只是使用较长的 ``--interval``，避免屏幕数据长期不变。
 """
 
 import argparse
@@ -36,6 +44,11 @@ DEFAULT_SYMBOLS = "sh600519,sz000001,sh000001,sz399001,sh000300"
 MAX_ROWS = 5
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 SINA_REFERER = "https://finance.sina.com.cn"
+BEIJING_TZ_OFFSET_SEC = 8 * 3600
+# A 股交易时段；09:15 起包含集合竞价，指数与行情刷新仍可能发生变化。
+MARKET_WINDOWS = ((9 * 3600 + 15 * 60, 11 * 3600 + 30 * 60),
+                  (13 * 3600, 15 * 3600))
+WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 
 
 def eprint(*args):
@@ -60,7 +73,9 @@ def build_arg_parser():
     p.add_argument("--loop", action="store_true",
                    help="循环推送（默认单次推送后退出）")
     p.add_argument("--interval", type=int, default=300,
-                   help="循环推送间隔秒数（默认 300）")
+                   help="休市期间循环推送间隔秒数（默认 300）")
+    p.add_argument("--open-interval", type=int, default=15,
+                   help="开市期间循环推送间隔秒数（默认 15，约每分钟 4 次）")
     p.add_argument("--insecure", action="store_true",
                    help="新浪 TLS 不校验证书（默认按标准系统证书库校验）")
     p.add_argument("--check", action="store_true",
@@ -118,6 +133,52 @@ def round_change(value):
     return 0.0 if result == 0 else result
 
 
+def beijing_time_now():
+    """返回当前北京时间对应的 UTC 结构体，不依赖宿主机时区。"""
+    return time.gmtime(time.time() + BEIJING_TZ_OFFSET_SEC)
+
+
+def beijing_date(beijing_time_struct):
+    return "%04d-%02d-%02d" % (beijing_time_struct.tm_year,
+                               beijing_time_struct.tm_mon,
+                               beijing_time_struct.tm_mday)
+
+
+def is_market_open(beijing_time_struct, data_date=None, today=None):
+    """按北京时间结构体判断 A 股是否开市。
+
+    星期和交易时段是主判定；``data_date`` 是新浪个股行情日期，缺失时
+    忽略它，有值且不是北京时间当天时视为节假日或旧行情并判定休市。
+    该函数不读取系统时间，方便用固定结构体做纯函数测试。
+    """
+    if beijing_time_struct.tm_wday > 4:
+        return False
+    seconds = beijing_time_struct.tm_hour * 3600 + \
+        beijing_time_struct.tm_min * 60 + beijing_time_struct.tm_sec
+    in_window = any(start <= seconds <= end
+                    for start, end in MARKET_WINDOWS)
+    if not in_window:
+        return False
+    if not data_date:
+        return True
+    if today is None:
+        today = beijing_date(beijing_time_struct)
+    return data_date == today
+
+
+def market_state_text(beijing_time_struct, market_open, data_date=None):
+    clock = "%02d:%02d:%02d" % (
+        beijing_time_struct.tm_hour, beijing_time_struct.tm_min,
+        beijing_time_struct.tm_sec)
+    weekday = WEEKDAY_NAMES[beijing_time_struct.tm_wday]
+    if market_open:
+        return "开市中（%s %s，北京）" % (beijing_date(beijing_time_struct),
+                                           clock)
+    if data_date and data_date != beijing_date(beijing_time_struct):
+        return "休市（%s %s，北京，行情日期 %s）" % (weekday, clock, data_date)
+    return "休市（%s %s，北京）" % (weekday, clock)
+
+
 def parse_quote_data(code, data_str):
     """解析一条新浪数据，返回 (中文名称, 涨跌幅) 或 None。
 
@@ -151,8 +212,20 @@ def parse_quote_data(code, data_str):
         return None
 
 
-def parse_quote_line(line):
-    """解析 ``var hq_str_sh600519="...";``，返回 (code, 中文名, change)。"""
+def extract_data_date(data_str):
+    """从个股 data[30] 提取 YYYY-MM-DD；指数字段不足 31 个时返回 None。"""
+    fields = (data_str or "").split(",")
+    if len(fields) <= 30:
+        return None
+    value = fields[30].strip()
+    if (len(value) != 10 or value[4] != "-" or value[7] != "-" or
+            any(ch not in "0123456789" for ch in value[:4] + value[5:7] + value[8:])):
+        return None
+    return value
+
+
+def parse_quote_line_parts(line):
+    """解析行情行，返回 (code, 中文名, change, 个股行情日期)。"""
     line = (line or "").strip()
     prefix = "var hq_str_"
     if not line.startswith(prefix) or '"' not in line:
@@ -168,9 +241,18 @@ def parse_quote_line(line):
     if not code:
         return None
     parsed = parse_quote_data(code, data_str)
+    data_date = extract_data_date(data_str)
     if parsed is None:
-        return code, "", None
-    return code, parsed[0], parsed[1]
+        return code, "", None, data_date
+    return code, parsed[0], parsed[1], data_date
+
+
+def parse_quote_line(line):
+    """解析 ``var hq_str_sh600519="...";``，返回 (code, 中文名, change)。"""
+    parsed = parse_quote_line_parts(line)
+    if parsed is None:
+        return None
+    return parsed[:3]
 
 
 def http_request(url, method="GET", headers=None, body=None, timeout=15.0,
@@ -237,7 +319,7 @@ def make_sina_url(base_url, symbols):
 
 
 def fetch_quotes(sina_url, symbols, timeout, insecure, retries=2):
-    """请求新浪行情并返回设备 rows；无任何有效行时抛 RuntimeError。"""
+    """请求新浪行情并返回 (设备 rows, 第一条可提供日期的个股行情日期)。"""
     url = make_sina_url(sina_url, symbols)
     headers = {"User-Agent": USER_AGENT, "Referer": SINA_REFERER}
     wanted = set(symbols)
@@ -256,24 +338,29 @@ def fetch_quotes(sina_url, symbols, timeout, insecure, retries=2):
             continue
         if code == 200:
             rows = []
+            data_date = None
             seen = set()
             for line in (raw or "").splitlines():
-                parsed = parse_quote_line(line)
+                parsed = parse_quote_line_parts(line)
                 if parsed is None:
                     if line.strip():
                         eprint("跳过无法识别的新浪响应行: %s" % line[:120])
                     continue
-                code_name, display_name, change = parsed
+                code_name, display_name, change, quote_date = parsed
                 if code_name not in wanted or code_name in seen:
                     continue
                 seen.add(code_name)
+                # 只要个股提供合法日期就记录；即使该行价格因停牌被跳过，
+                # 日期仍可用于判断当前是否处于节假日。
+                if data_date is None and quote_date:
+                    data_date = quote_date
                 if not display_name or change is None:
                     eprint("跳过 %s：空行情或昨收/当前价无效" % code_name)
                     continue
                 eprint("%s %s: %+.2f%%" % (code_name, display_name, change))
                 rows.append({"name": code_name, "change": change})
             if rows:
-                return rows
+                return rows, data_date
             last_err = "Response error: 未解析到有效行情"
             eprint("新浪响应没有可用行情 (attempt %d): %s"
                    % (attempt, (raw or "")[:200]))
@@ -340,6 +427,8 @@ def validate_args(args):
     device_base = normalize_device_base(args.device)
     if args.interval <= 0:
         return "", symbols, "--interval 必须 > 0"
+    if args.open_interval <= 0:
+        return "", symbols, "--open-interval 必须 > 0"
     if args.timeout <= 0:
         return "", symbols, "--timeout 必须 > 0"
     if not args.sina_url.strip():
@@ -369,14 +458,16 @@ def deliver_payload(args, rows):
 
 
 def run_once(args, symbols):
+    """完成一轮，返回 (退出码, 第一条可提供日期的个股行情日期)。"""
     if args.demo:
-        return deliver_payload(args, build_demo_quotes(symbols))
+        return deliver_payload(args, build_demo_quotes(symbols)), None
     try:
-        rows = fetch_quotes(args.sina_url, symbols, args.timeout, args.insecure)
+        rows, data_date = fetch_quotes(args.sina_url, symbols, args.timeout,
+                                       args.insecure)
     except RuntimeError as ex:
         eprint("行情失败: %s" % ex)
-        return 1
-    return deliver_payload(args, rows)
+        return 1, None
+    return deliver_payload(args, rows), data_date
 
 
 def main(argv=None):
@@ -393,16 +484,37 @@ def main(argv=None):
             eprint("设备失败: %s" % ex)
             return 2
     if not args.loop:
-        return run_once(args, symbols)
+        return run_once(args, symbols)[0]
 
-    # 循环模式：单轮失败只报错不退出，下一轮继续
+    if args.demo:
+        print("启动：demo 模式（跳过开市判定）→ 固定使用 --interval=%ds；"
+              "开市间隔=%ds，休市间隔=%ds"
+              % (args.interval, args.open_interval, args.interval))
+    else:
+        startup_time = beijing_time_now()
+        startup_open = is_market_open(startup_time)
+        print("启动：%s；开市间隔=%ds，休市间隔=%ds"
+              % (market_state_text(startup_time, startup_open),
+                 args.open_interval, args.interval))
+
+    # 每轮重新取北京时间并结合本轮行情日期决定下一轮 sleep，不能在循环外
+    # 固定间隔，否则跨过 09:15/11:30/13:00 后仍会沿用旧节奏。
     rc = 0
     while True:
-        rc = run_once(args, symbols)
+        rc, data_date = run_once(args, symbols)
         if rc != 0:
-            eprint("本轮失败 (rc=%d)，%ds 后重试" % (rc, args.interval))
+            eprint("本轮失败 (rc=%d)，准备下一轮" % rc)
+        if args.demo:
+            wait = args.interval
+            print("demo 模式（跳过开市判定）→ %ds 后下一轮" % wait)
+        else:
+            now = beijing_time_now()
+            market_open = is_market_open(now, data_date=data_date)
+            wait = args.open_interval if market_open else args.interval
+            print("%s → %ds 后下一轮"
+                  % (market_state_text(now, market_open, data_date), wait))
         try:
-            time.sleep(args.interval)
+            time.sleep(wait)
         except KeyboardInterrupt:
             print("中断退出")
             return rc

@@ -180,6 +180,14 @@ class AlbumScene : public Scene {
                 break;
             }
 
+            // 本面板色序 BGR（MADCTL 带 BGR 位，见 DisplayManager::lcdApplyMirrorMADCTL）：
+            // .rgb565 契约是标准 RGB565(LE)，直推会红蓝互换——与 UI 调色板同口径做 R/B 字段交换补偿
+            const size_t px = static_cast<size_t>(IMG_W) * rows;
+            for (size_t i = 0; i < px; i++) {
+                const uint16_t v = band[i];
+                band[i] = static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
+            }
+
             tft->writeAddrWindow(0, y, IMG_W, rows);
             tft->writePixels(band, static_cast<uint32_t>(IMG_W) * rows);
             yield();

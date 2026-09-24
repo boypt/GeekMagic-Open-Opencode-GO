@@ -1,7 +1,7 @@
 # AGENTS.md — GeekMagic Open Opencode GO
 
 ESP8266 (esp12e) + ST7789 240x240 桌面小屏固件，基于 [Times-Z/GeekMagic-Open-Firmware](https://github.com/Times-Z/GeekMagic-Open-Firmware)（GPL-3.0）移植。
-主功能：显示上位机推送的额度文本（时钟 + 三行推送文本），并继承框架的 WiFi 配网 / NTP / Web 配置 / OTA / 救援模式。设备端零出站网络请求、无任何 TLS 组件，额度内容由上位机脚本 `tools/push_balance.py` 读上游后经 `POST /api/v1/balance` 推送，设备只排版渲染（零语义）。
+主功能：显示上位机推送的额度文本（时钟 + 三行推送文本），并继承框架的 WiFi 配网 / NTP / Web 配置 / OTA / 救援模式。设备端零出站网络请求、无任何 TLS 组件，额度内容由上位机脚本 `tools/push_auto.py` 读上游后经 `POST /api/v1/balance` 推送，股票行情经 `POST /api/v1/stock` 推送，设备只排版渲染（零语义）。
 
 ## 构建 / 烧录 / 调试
 
@@ -41,11 +41,10 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 | 模块 | 职责 |
 |---|---|
-| `src/main.cpp` | 启动流程：DisplayManager → WiFiManager → NTP → Webserver → `UsageManager::begin()`；loop 委托各 manager |
+| `src/main.cpp` | 启动流程：DisplayManager → WiFiManager → NTP → Webserver → `UsageManager::begin()` + `StockData::begin()`；loop 委托各 manager，**休眠时跳过 `AmbientLight::update()` 与 `SceneManager::update()`**（web/NTP/watchdog 仍必须跑，否则脚本无法唤醒） |
 | `src/opencodego/UsageManager.cpp` | 七段时钟、logo、三行额度、状态行渲染；数据源 = `POST /api/v1/balance` 的三段推送缓冲（`setRowLabel/setRowProgress/setRowReset` 写入，定长静态数组，零 String 抖动），推送到达即 `requestFullRedraw()`；额度行**三段式**：行上方左=标签（缺省回落 5H/WK./MO.）/右=百分比（中等字号，无值红 `--`）、中间=进度条（轨道左右 4px 等边距、填充绿≥50/黄≥20/红<20、无值空槽）、行下方右=重置日期（最小字号，缺省 `--`）。设备不解析语义 |
 | `include/opencodego/StockData.h` + `src/opencodego/StockData.cpp` | 股票场景推送缓冲：`Row{name[10], float change}` 定长 5 行静态数组（零堆、零 String），`setRows()` 整体替换并记 `millis()`，`clear()` 清空，`getRow()` 越界返回 false；`POST /api/v1/stock` 写入、stock 场景只读消费，涨跌方向由数值正负表达（设备零语义） |
-| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（完整 URL `--upstream-url`，默认 `https://opencode.ai/zen/go/v1/usage` + Bearer + `x-opencode-session`），按**三段字段**推送（左上标签 `labels` / 进度条与右上百分比 `progress`=剩余% / 右下重置相对时长 `resets`）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check/--demo`（`--demo` 用本地随机数据测试、无需上游凭据），退出码 0/1/2/3 |
-| `tools/push_stock.py` | 上位机股票行情推送脚本（仅标准库）：请求 `hq.sinajs.cn/list=<代码,...>`，**必须带 `Referer: https://finance.sina.com.cn`**（缺失 → 403），响应声明 charset=GB18030（按 gb18030 解码，GBK 是其子集）；**按字段数判断布局**（≥10 字段=个股：昨收 `data[2]`、现价 `data[3]` 算涨跌幅；<10=指数：`data[3]` 已是百分比 —— 不可用 `sh60`/`sz` 前缀判断，`sz399001` 等指数会被误判），四舍五入 2 位小数；脏数据（停牌、昨收≤0、空行）跳过，全失败 rc=1 **不推送**（免得自动接管把垃圾推上屏）；`name` 推**新浪代码**（`sh600519`，保留 `sh`/`sz` 前缀，否则 `sh000001` 指数与 `sz000001` 个股无法区分），中文名只打主机日志（设备无中文字模）；最多 5 个标的，超出 rc=3 不静默截断；`--dry-run/--demo/--check/--insecure`；**`--loop` 按北京时间自适应轮询**（周一至周五 09:15–11:30 与 13:00–15:00 判定开市，09:15 起含集合竞价；开市用 `--open-interval` 默认 15s，休市用 `--interval` 默认 300s 且**仍取数推送**以保持 `ts/age_s` 与最后价格新鲜；节假日无交易日历，用新浪个股 `data[30]` 行情日期≠今天则强制休市，避免长假期间高频请求；`--demo --loop` 跳过开市判定）；退出码 0 成功 / 1 行情失败 / 2 设备失败 / 3 参数错误 |
+| `tools/push_auto.py` | 上位机总控脚本（合并了原 `push_balance.py` + `push_stock.py`，仅标准库）：**额度** 读 OpenCode Go 用量（`--upstream-url` 默认 `https://opencode.ai/zen/go/v1/usage` + Bearer + `x-opencode-session`，按 `labels/progress/resets` 三段字段推 `POST /api/v1/balance`）＋**股票** 读新浪 `hq.sinajs.cn/list=<代码,...>`（**必须带 `Referer: https://finance.sina.com.cn`**，按 gb18030 解码，**按字段数判断布局**：≥10 字段=个股用 `data[2]`/`data[3]` 算涨跌幅，<10=指数 `data[3]` 已是百分比；`name` 推带 `sh`/`sz` 前缀的新浪代码，中文名只打日志；最多 5 个标的）推 `POST /api/v1/stock`。**调度层 = 生成器式可挂起 handler + 闹钟注册表 + 显式状态机，无 asyncio/线程/事件循环**：handler 可 `yield` `FetchStock/FetchBalance/PostDevice/PostSleep/Log/Wait/Register/Unregister/EnterState` 九种任务，调度器推进并把结果喂回；闹钟规格 `Every/DailyAt/After`；**按状态注册** —— `AWAKE_OPEN`（股票 15s + 额度 15min + 15:30 开市结束 + 00:00 入睡）、`BALANCE_WINDOW`（额度 60s + 窗口 5min 结束，**不注册股票 tick**）、`AWAKE_CLOSED`（额度 300s + 09:20 开市检查 + 00:00 入睡）、`SLEEPING`（**只有 keepalive 10min + 08:00 唤醒，不注册任何数据闹钟 → 夜间零出站是结构性保证**）。**时间策略**：00:00~08:00 调 `POST /api/v1/display/sleep {"on":true}` 黑屏休眠（期间不取数不推送，每 `--sleep-keepalive` 重申，08:00 唤醒并立即推一次额度）；开市（周一至周五 09:20~15:30，节假日以新浪个股 `data[30]` 行情日期≠今天兜底）每 `--open-interval`(15s) 推股票，每 `--balance-every`(15min) 切额度页 `--balance-window`(5min)；非开市每 `--closed-interval`(300s) 推额度。补漏：handler 跨多个周期时跳过积压节拍并记日志；非法状态转移抛错。`Clock` 抽象（`RealClock` 用 `threading.Event().wait` 可被 Ctrl-C 打断 / `VirtualClock` 供测试），`--self-test` 虚拟时钟瞬时验 14 条策略；`--check` 输出设备 balance/stock/sleep 三份状态；`--demo` 跳过开市判定；`--dry-run` 零网络；`--no-sleep` 关休眠；退出码 0/1/2/3 |
 | `include/opencodego/SegFont7.h` | TFT_eSPI Font7 原字模解码的 1bpp 行位图（0-9 : -，32x48），像素级还原旧七段观感 |
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
@@ -68,7 +67,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 - WiFi：`GET /wifi/scan|status`，`POST /wifi/connect`
 - NTP：`GET /ntp/status|config`，`POST /ntp/sync|config`
-- 显示：`GET/POST /display/rotation`（含 lcd_bgr/lcd_init_sd2/镜像）、`GET/POST /display/mirror`、`GET/POST /display/brightness`
+- 显示：`GET/POST /display/rotation`（含 lcd_bgr/lcd_init_sd2/镜像）、`GET/POST /display/mirror`、`GET/POST /display/brightness`；`GET/POST /display/sleep`（`{"on":true}` 休眠：清屏置黑 + 反相背光 PWM 全灭 + 氛围灯**非持久化**挂起 `AmbientLight::suspend()`，且 `loop()` 跳过场景与灯效刷新、但保留 web/NTP/watchdog；`{"on":false}` 唤醒恢复背光与灯效并 `SceneManager::redrawCurrent()` 全量重绘。状态**不落配置**、重启即醒，由 `tools/push_auto.py` 按 00:00~08:00 时段断言，重复调用幂等）
 - 相册：`GET/POST/DELETE /album`（图片 = 240x240 RGB565 原始位图 `.rgb565`，Web 端转换上传；上传时校验整幅尺寸 115200B）；`POST /album/live`（multipart 流式推一帧实时显示、**不保存**——脚本/HA 推画面用；不在 live 场景时自动接管）
 - 灯光：`GET/POST /light`（WS2812 氛围灯：`on/mode(solid|breathe|rainbow)/r,g,b/brightness`，部分更新，持久化 config.json `led_*`）
 - 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动跳转，全手工**；推送自动接管是例外：live 推图→live、额度推送→balance、股票推送→stock |
@@ -96,8 +95,8 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 改动后标准闭环：`pio run` → `upload`（+ 必要时 `uploadfs`）→ pyserial 抓 40-95s 启动日志，确认
 `Clean boot (...)` 或 `Boot stable`、无 `Exception`、`UsageManager initialized`、`Free heap` 稳定无泄漏趋势。
-额度链路联调：`python3 tools/push_balance.py --dry-run` 看 payload → 带真参数推送 → 屏幕三行即时刷新、`GET /api/v1/balance` 可见 lines/ts。
-股票链路联调：`python3 tools/push_stock.py --dry-run` 看真实行情 payload（不需要设备参数）→ 带 `--device/--device-token` 推送 → 屏幕自动接管 stock 场景，`GET /api/v1/stock` 可见 rows/ts。
+调度策略自测：`python3 tools/push_auto.py --self-test`（虚拟时钟瞬时跑完 14 条：开市 15s 节拍 / 15 分钟进额度窗口 / 窗口 5 分钟回股票 / 休市 300s / 休眠进入·keepalive·静默零出站·唤醒 / 非法转移抛错 / 漏节拍跳过）。
+联调：`--demo --loop --dry-run` 看将要发生的调用 → 加 `--device/--device-token` 真跑（缺 `--upstream-key` 时跳过额度、只推股票，属正常）→ `--check` 核对设备端 balance/stock/sleep 三份状态。
 无测试/CI，`pio run` + 真机日志即为验证。RAM ~62% / Flash ~46%（移除出站 TLS 后 Flash 大降），加库注意余量。
 
 ## 提交规范

@@ -63,10 +63,14 @@ static uint32_t s_pushMillis = 0;   // 推送时刻 millis（age_s 基准，未�
 static constexpr uint32_t TZ_OFFSET_SEC = 8UL * 3600UL;
 static constexpr time_t TIME_MIN_VALID = 1600000000;  // 同 NTPClient REASONABLE_EPOCH
 
-// ---- 主题色（旧工程 Sd2Theme.h C_* 暗色主题，标准 RGB565 数值，Arduino_GFX 直接可用）----
+// ---- 主题色（源值按直觉写真 RGB；本助手负责面板 BGR 色序的 R/B 字段交换）----
+// 本面板 lcd_bgr=true → MADCTL 带 BGR 位，送入的标准 RGB565 会被面板反着
+// 解释 R/B。位图路径（logo / 相册 / 实时帧）在写入前各自做了同一交换，
+// 主题色经此助手保持同一口径，否则屏上红蓝会颠倒。
 static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-    return static_cast<uint16_t>((static_cast<uint16_t>(r & 0xF8) << 8) |
-                                 (static_cast<uint16_t>(g & 0xFC) << 3) | (b >> 3));
+    const uint16_t v = static_cast<uint16_t>((static_cast<uint16_t>(r & 0xF8) << 8) |
+                                              (static_cast<uint16_t>(g & 0xFC) << 3) | (b >> 3));
+    return static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
 }
 static constexpr uint16_t C_BG = rgb565(0x00, 0x00, 0x00);
 static constexpr uint16_t C_BORDER = rgb565(0x28, 0x32, 0x49);

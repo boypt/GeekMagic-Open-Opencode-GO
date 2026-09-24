@@ -37,8 +37,11 @@
 extern WiFiManager* wifiManager;
 extern ConfigManager configManager;
 
+// 源值写真 RGB；打包后做面板 BGR 色序的 R/B 字段交换（与 UsageManager::rgb565
+// 及 logo/相册位图路径同一口径，否则本面板屏上红蓝颠倒）。
 static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
-    return static_cast<uint16_t>(((r & 0xF8U) << 8) | ((g & 0xFCU) << 3) | (b >> 3));
+    const uint16_t v = static_cast<uint16_t>(((r & 0xF8U) << 8) | ((g & 0xFCU) << 3) | (b >> 3));
+    return static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
 }
 
 // Arduino_GFX 的内建 6px 字体没有测量 API，按其实际字宽做像素级截断。

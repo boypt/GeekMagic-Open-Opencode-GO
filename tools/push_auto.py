@@ -14,7 +14,7 @@ urllib 调用只发生在 handler yield 的 Fetch*/Post* 任务中。
 
 每状态闹钟表::
 
-    AWAKE_OPEN     Every(stock,15s), Every(balance_due,900s),
+    AWAKE_OPEN     Every(stock,300s), Every(balance_due,900s),
                    DailyAt(market_check,15:30), DailyAt(sleep_at,00:00)
     BALANCE_WINDOW Every(balance_refresh,300s), After(window_end,300s),
                    DailyAt(sleep_at,00:00)
@@ -1149,8 +1149,8 @@ def build_arg_parser():
                             "（用于测试取数链路；加 --demo 则用本地随机数据）")
 
     policy = parser.add_argument_group("时间策略")
-    policy.add_argument("--open-interval", type=int, default=15,
-                        help="开市股票间隔秒数，默认 15")
+    policy.add_argument("--open-interval", type=int, default=300,
+                        help="开市股票间隔秒数，默认 300（5 分钟）")
     policy.add_argument("--closed-interval", type=int, default=300,
                         help="非开市额度间隔秒数，默认 300")
     policy.add_argument("--balance-every", type=int, default=900,

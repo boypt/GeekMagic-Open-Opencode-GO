@@ -152,6 +152,7 @@ auto SecureStorage::begin() -> bool {
     Logger::info("EEPROM init start", "SecureStorage");
 
     EEPROM.begin(static_cast<int>(_eepromSize));
+    _dirty = false;
 
     if (!loadToMemory()) {
         Logger::warn("No existing NVS data found, initializing new storage", "SecureStorage");
@@ -278,10 +279,12 @@ auto const SecureStorage::flushToEEPROM() -> bool {
 
     if (!EEPROM.commit()) {
         Logger::error("EEPROM commit failed", "SecureStorage");
+        _dirty = true;
 
         return false;
     }
 
+    _dirty = false;
     Logger::info(("NVS commit success size " + String(written)).c_str(), "SecureStorage");
 
     return true;
@@ -302,7 +305,17 @@ auto SecureStorage::put(const char* key, const char* value) -> bool {
         };
     }
 
+    // 非敏感配置保存也会反复写入相同凭据；已在 EEPROM 且提交成功时直接返回，
+    // 避免 NVS 序列化和 sector commit 阻塞主循环并磨损 flash。
+    if (!_dirty && value != nullptr) {
+        const char* storedValue = _doc[key];
+        if (storedValue != nullptr && strcmp(storedValue, value) == 0) {
+            return true;
+        }
+    }
+
     _doc[key] = value;
+    _dirty = true;
 
     return flushToEEPROM();
 }
@@ -322,6 +335,7 @@ auto SecureStorage::remove(const char* key) -> bool {
     }
 
     _doc.remove(key);
+    _dirty = true;
 
     return flushToEEPROM();
 }

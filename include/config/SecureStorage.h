@@ -40,6 +40,8 @@ class SecureStorage {
     bool flushToEEPROM();
     JsonDocument _doc;
     bool _ready = false;
+    // 标记内存中的 NVS 是否尚未成功提交；失败后必须允许同值重试，不能误判为已持久化。
+    bool _dirty = false;
 };
 
 #endif  // SECURE_STORAGE_H

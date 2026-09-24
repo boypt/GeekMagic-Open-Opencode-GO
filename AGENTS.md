@@ -48,7 +48,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
 | `include/display/Scene.h` + `src/display/SceneManager.cpp` | 场景接口 + 调度器：显示面唯一切换入口 `switchTo()`（退场重绘契约：旧场景 exit 禁画/释放，新场景 enter 全量绘制；失败回滚重绘上一场景） |
-| `src/display/Scenes.cpp` | 内置场景：`startup`（开机 IP 画面）/ `balance`（额度+时钟）/ `album`（静态相册：param=文件名常驻单张、空=循环轮播 5s/张）/ `live`（实时推图：API 流式直绘、不落盘、常驻最后一帧）。**全手工切换：场景间无任何自动跳转**，一律 `switchTo` |
+| `src/display/Scenes.cpp` | 内置场景：`startup`（开机 IP 画面）/ `balance`（额度+时钟）/ `album`（静态相册：param=文件名常驻单张、空=循环轮播 5s/张）/ `live`（实时推图：API 流式直绘、不落盘、常驻最后一帧）。场景切换一律 `switchTo`；**唯二例外是推送自动接管**：`live` 推图 → live，额度推送 → balance |
 | `src/display/Scenes.cpp`（AlbumScene/LiveScene） | 相册图片 = `/album/<name>.rgb565`（240x240 RGB565(LE) 115200B，Web 端 canvas 转换上传，jpg/png 等任意源图）；`POST /album/live` 同格式流式推帧（480B 行缓冲逐行直绘、不保存），推送时若不在 live 场景则自动接管屏幕 |
 | `src/config/ConfigManager.cpp` | `config.json`（LittleFS）+ SecureStorage（EEPROM NVS）双层配置 |
 | `src/boot/RescueMode.cpp` | boot-loop 保护（见"已知坑"） |
@@ -68,8 +68,8 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 - 显示：`GET/POST /display/rotation`（含 lcd_bgr/lcd_init_sd2/镜像）、`GET/POST /display/mirror`、`GET/POST /display/brightness`
 - 相册：`GET/POST/DELETE /album`（图片 = 240x240 RGB565 原始位图 `.rgb565`，Web 端转换上传；上传时校验整幅尺寸 115200B）；`POST /album/live`（multipart 流式推一帧实时显示、**不保存**——脚本/HA 推画面用；不在 live 场景时自动接管）
 - 灯光：`GET/POST /light`（WS2812 氛围灯：`on/mode(solid|breathe|rainbow)/r,g,b/brightness`，部分更新，持久化 config.json `led_*`）
-- 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动场景跳转，全手工**；live 推图自动接管是唯一例外
-- 额度推送：`POST /balance`（body `{"lines":["l1","l2","l3"],"status":"可选状态行"}`，body<1KB；非法 JSON 或字段类型错 → 400；成功 200 `{"ok":true}` 并立即重绘）、`GET /balance`（`{lines,status,ts,age_s}` 查最近一次推送，未推送行为空串）。行文本内容由上位机全权决定
+- 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动跳转，全手工**；推送自动接管是例外：live 推图→live、额度推送→balance |
+- 额度推送：`POST /balance`（body `{"lines":["l1","l2","l3"],"status":"可选状态行"}`，body<1KB；非法 JSON 或字段类型错 → 400；成功 200 `{"ok":true}` 并立即重绘；**若当前不在 balance 场景则立即 `switchTo("balance")` 接管**）、`GET /balance`（`{lines,status,ts,age_s}` 查最近一次推送，未推送行为空串）。行文本内容由上位机全权决定
 - 系统：`POST /reboot`、`GET /logs`、`POST /ota/fw|fs|cancel`、`GET /ota/status`、`GET/POST /token/check|save`
 - rescue 模式（AP `GeekMagic` @192.168.4.1，无鉴权）：`GET /rescue/status`，`POST /rescue/reset|reboot|token|ota`
 

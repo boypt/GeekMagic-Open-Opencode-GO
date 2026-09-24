@@ -753,12 +753,12 @@ static void livePushBytes(const uint8_t* data, size_t len) {
             tft->startWrite();
             tft->writeAddrWindow(0, s_liveRowY, 240, 1);
             // 同 AlbumScene：标准 RGB565(LE) 直推在本面板红蓝互换，做 R/B 字段交换补偿
-        auto* px = reinterpret_cast<uint16_t*>(s_liveRow);
-        for (int i = 0; i < 240; i++) {
-            const uint16_t v = px[i];
-            px[i] = static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
-        }
-        tft->writePixels(reinterpret_cast<uint16_t*>(s_liveRow), 240);
+            auto* px = reinterpret_cast<uint16_t*>(s_liveRow);
+            for (int i = 0; i < 240; i++) {
+                const uint16_t v = px[i];
+                px[i] = static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
+            }
+            tft->writePixels(reinterpret_cast<uint16_t*>(s_liveRow), 240);
             tft->endWrite();
 
             s_liveRowFill = 0;
@@ -2163,6 +2163,11 @@ void handleBalanceSet(Webserver* webserver) {
     }
 
     UsageManager::pushBalance(lines, static_cast<uint8_t>(arr.size()), status, hasStatus);
+
+    // 同 live 推图：推送到达即接管 balance 场景（退场重绘契约）；已在 balance 则不动
+    if (strcmp(SceneManager::currentName(), "balance") != 0) {
+        SceneManager::switchTo("balance");
+    }
 
     JsonDocument doc;
     doc["ok"] = true;

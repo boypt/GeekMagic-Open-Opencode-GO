@@ -11,9 +11,14 @@ POST 到设备的 ``/api/v1/balance`` 接口显示。
 
     POST http://<device>/api/v1/balance
     Authorization: Bearer <device 的 api_token>
-    {"lines": ["l1","l2","l3"], "status": "可选状态行"}  -> 200 {"ok":true}
+    {"labels":   ["5H", "WK.", "MO."],        # 可选：左上标签（null/缺省 → 固件默认 5H/WK./MO.）
+     "progress": [58, null, 91],               # 可选：进度条填充 + 右上百分比（剩余%，0..100，null=空槽）
+     "resets":   ["R2d4h", null, "R14d3h"],    # 可选：右下距重置相对时长（null/缺省 → "--"）
+     "status": "可选状态行"}  -> 200 {"ok":true}
     GET  http://<device>/api/v1/balance
-      -> {"lines":[...],"status":"...","ts":...,"age_s":...}
+      -> {"labels":[...],"progress":[...],"resets":[...],"status":"...","ts":...,"age_s":...}
+
+三段字段与行等长（1..3）；设备零语义照单渲染。整行 ``lines`` 通道已退役。
 
 上游协议（移植自 include/opencodego/OpenCodeGoClient.h，只读参考）::
 
@@ -26,17 +31,11 @@ POST 到设备的 ``/api/v1/balance`` 接口显示。
     remaining = max(100 - percent, 0)（与 cc-switch 提取器一致）；
     status=="invalid" 视为无效窗口；resetsAt 为 ISO8601 UTC 时间。
 
-行渲染（推送纯文本行，设备端自适应字号渲染、零语义）：
-三行标签为 ``5H`` / ``WK.`` / ``MO.``，每行 = 标签 + 剩余百分比
-（``remaining%``）+ 距重置相对时长（``R2d4h`` / ``R9h20m`` / ``R12m``，
-到期 ``Rnow``）。单行 ≤16 ASCII（设备右栏 112px：约 ≤15 字符走大字）::
-
-    5H   76% R2d4h
-    WK.  55% R9h20m
-    MO.  91% R14d3h
-
-缺失窗口显示 ``--``，invalid 窗口显示 ``INVALID``。status 行沿用旧
-``UPDATE HH:MM`` 语义（推送成功时刻，本地时间）。
+三段渲染（设备零语义，分字段推送）：
+``labels`` = 左上标签（``5H`` / ``WK.`` / ``MO.``）、``progress`` = 进度条
+填充百分比（剩余额度 0..100，无数据为 null）、``resets`` = 右下距重置相对
+时长（``R2d4h`` / ``R9h20m`` / ``R14d3h``，到期 ``Rnow``，无数据为 null）。
+status 行沿用旧 ``UPDATE HH:MM`` 语义（推送成功时刻，本地时间）。
 
 中文用法示例::
 
@@ -80,7 +79,6 @@ import urllib.error
 import urllib.request
 
 SESSION_PREFIX = "push-balance"
-MAX_LINE_LEN = 24
 MAX_STATUS_LEN = 24
 # 上游 resetsAt 是 UTC ISO8601；旧固件按 UTC+8 显示，这里同样 +8h。
 TZ_OFFSET_SEC = 8 * 3600
@@ -201,38 +199,50 @@ def format_reset(iso):
         return ""
 
 
-def format_window_line(label, win):
-    """单个窗口 -> 一行 ≤16 ASCII（label + 剩余百分比/占位 + 相对 reset），设备端自适应字号渲染。"""
+def window_reset(win):
+    """单个窗口 -> 距重置相对时长（如 'R2d4h'）；无有效数据返回 None（屏上显示 "--"）。"""
     if not isinstance(win, dict) or not win:
-        return "%-3s --" % label
-    status = str(win.get("status", ""))
-    if status == "invalid":
-        return "%-3s INVALID" % label
+        return None
+    if str(win.get("status", "")) == "invalid":
+        return None
+    return format_reset(str(win.get("resetsAt", "") or "")) or None
+
+
+def window_progress(win):
+    """单个窗口 -> 进度条填充值（0..100 剩余百分比）；无有效数据返回 None（空槽）。"""
+    if not isinstance(win, dict) or not win:
+        return None
+    if str(win.get("status", "")) == "invalid":
+        return None
     try:
         percent = int(win.get("percent", 0))
     except (TypeError, ValueError):
-        return "%-3s --" % label
-    remaining = max(100 - percent, 0)
-    reset = format_reset(str(win.get("resetsAt", "") or ""))
-    line = "%-3s %3d%%" % (label, remaining)
-    if reset:
-        line += " " + reset
-    return line[:MAX_LINE_LEN]
+        return None
+    return max(100 - percent, 0)
 
 
 def build_payload(usage):
-    """上游 usage dict -> (lines[3], status)。"""
+    """上游 usage dict -> (labels[3], progress[3], resets[3], status)。
+
+    三段分别推送：左上标签 / 进度条填充百分比（剩余额度）/ 右下重置相对时长。
+    """
     rolling = (usage or {}).get("rolling", {})
     weekly = (usage or {}).get("weekly", {})
     monthly = (usage or {}).get("monthly", {})
-    lines = [
-        format_window_line("5H", rolling),
-        format_window_line("WK.", weekly),
-        format_window_line("MO.", monthly),
+    labels = ["5H", "WK.", "MO."]
+    progress = [
+        window_progress(rolling),
+        window_progress(weekly),
+        window_progress(monthly),
+    ]
+    resets = [
+        window_reset(rolling),
+        window_reset(weekly),
+        window_reset(monthly),
     ]
     lt = time.gmtime(time.time() + TZ_OFFSET_SEC)
     status = "UPDATE %02d:%02d" % (lt.tm_hour, lt.tm_min)
-    return lines, status[:MAX_STATUS_LEN]
+    return labels, progress, resets, status[:MAX_STATUS_LEN]
 
 
 def http_request(url, method="GET", headers=None, body=None, timeout=15.0,
@@ -331,11 +341,13 @@ def fetch_upstream(host, path, key, timeout, ssl_context, retries=2):
     raise RuntimeError(last_err or "上游请求失败")
 
 
-def push_device(device_base, token, lines, status, timeout, retries=2):
+def push_device(device_base, token, labels, progress, resets, status, timeout,
+                retries=2):
     """POST /api/v1/balance。成功返回 True；失败抛异常。"""
     url = device_base + "/api/v1/balance"
     headers = {"Authorization": "Bearer " + token}
-    payload = {"lines": lines, "status": status}
+    payload = {"labels": labels, "progress": progress, "resets": resets,
+               "status": status}
     last_err = None
     for attempt in range(1, retries + 2):
         try:
@@ -398,27 +410,30 @@ def validate_args(args):
     return device_base, ""
 
 
-def deliver_payload(args, lines, status, tag=""):
+def deliver_payload(args, labels, progress, resets, status, tag=""):
     """dry-run 只打印 payload；否则推送到设备。返回 0 / 2。"""
+    payload = {"labels": labels, "progress": progress, "resets": resets,
+               "status": status}
     if args.dry_run:
-        print(json.dumps({"lines": lines, "status": status},
-                         indent=2, ensure_ascii=False))
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     try:
         push_device(normalize_device_base(args.device), args.device_token,
-                    lines, status, args.timeout)
+                    labels, progress, resets, status, args.timeout)
     except RuntimeError as ex:
         eprint("设备失败: %s" % ex)
         return 2
-    print("%s已推送: %s | %s" % (tag, " / ".join(lines), status))
+    print("%s已推送: %s | %s | %s | %s" % (tag, labels, progress, resets,
+                                            status))
     return 0
 
 
 def run_once(args, ssl_context):
     if args.demo:
-        lines, status = build_payload(build_demo_usage())
+        labels, progress, resets, status = build_payload(build_demo_usage())
         status = "DEMO " + status.replace("UPDATE ", "")   # 屏上可辨认是随机数据
-        return deliver_payload(args, lines, status, tag="[demo] ")
+        return deliver_payload(args, labels, progress, resets, status,
+                               tag="[demo] ")
     try:
         usage = fetch_upstream(args.upstream_host, args.upstream_path,
                                args.upstream_key, args.timeout, ssl_context)

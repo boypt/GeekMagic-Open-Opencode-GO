@@ -2129,22 +2129,6 @@ void handleBalanceSet(Webserver* webserver) {
         return;
     }
 
-    if (!ddoc["lines"].is<JsonArray>()) {
-        sendErr(HTTP_CODE_BAD_REQUEST, "lines must be an array of 1..3 strings");
-        return;
-    }
-    JsonArray arr = ddoc["lines"].as<JsonArray>();
-    if (arr.size() < 1 || arr.size() > UsageManager::kBalanceLines) {
-        sendErr(HTTP_CODE_BAD_REQUEST, "lines must be an array of 1..3 strings");
-        return;
-    }
-    for (JsonVariantConst v : arr) {
-        if (!v.is<const char*>()) {
-            sendErr(HTTP_CODE_BAD_REQUEST, "lines must be an array of 1..3 strings");
-            return;
-        }
-    }
-
     bool hasStatus = false;
     const char* status = "";
     if (!ddoc["status"].isNull()) {
@@ -2156,13 +2140,106 @@ void handleBalanceSet(Webserver* webserver) {
         hasStatus = (status != nullptr && status[0] != '\0');
     }
 
-    const char* lines[UsageManager::kBalanceLines] = {nullptr, nullptr, nullptr};
-    size_t i = 0;
-    for (JsonVariantConst v : arr) {
-        lines[i++] = v.as<const char*>();
+    // 三段字段（labels / progress / resets）均可选：出现时须 1..3 且彼此等长，
+    // 元素可 null。整行 lines 通道已退役——标签/百分比/重置分开推送，
+    // 设备零语义照单渲染（缺省：标签回落 5H/WK./MO.、重置显示 "--"、进度空槽）。
+    const char* labels[UsageManager::kBalanceLines] = {nullptr, nullptr, nullptr};
+    const char* resets[UsageManager::kBalanceLines] = {nullptr, nullptr, nullptr};
+    int progress[UsageManager::kBalanceLines] = {-1, -1, -1};
+
+    auto parseStrings = [&](const char* field, const char** out, int& count) -> bool {
+        count = 0;
+        if (ddoc[field].isNull()) {
+            return true;
+        }
+        const String badArray = String(field) + " must be an array of 1..3 strings or null";
+        if (!ddoc[field].is<JsonArray>()) {
+            sendErr(HTTP_CODE_BAD_REQUEST, badArray.c_str());
+            return false;
+        }
+        JsonArray a = ddoc[field].as<JsonArray>();
+        if (a.size() < 1 || a.size() > UsageManager::kBalanceLines) {
+            sendErr(HTTP_CODE_BAD_REQUEST, badArray.c_str());
+            return false;
+        }
+        for (JsonVariantConst v : a) {
+            if (!v.isNull() && !v.is<const char*>()) {
+                const String badEntry = String(field) + " entries must be string or null";
+                sendErr(HTTP_CODE_BAD_REQUEST, badEntry.c_str());
+                return false;
+            }
+        }
+        uint8_t k = 0;
+        for (JsonVariantConst v : a) {
+            out[k++] = v.isNull() ? nullptr : v.as<const char*>();
+        }
+        count = static_cast<int>(a.size());
+        return true;
+    };
+
+    auto parseProgress = [&](int* out, int& count) -> bool {
+        count = 0;
+        if (ddoc["progress"].isNull()) {
+            return true;
+        }
+        if (!ddoc["progress"].is<JsonArray>()) {
+            sendErr(HTTP_CODE_BAD_REQUEST, "progress must be an array of 1..3 ints (0..100) or null");
+            return false;
+        }
+        JsonArray a = ddoc["progress"].as<JsonArray>();
+        if (a.size() < 1 || a.size() > UsageManager::kBalanceLines) {
+            sendErr(HTTP_CODE_BAD_REQUEST, "progress must be an array of 1..3 ints (0..100) or null");
+            return false;
+        }
+        uint8_t k = 0;
+        for (JsonVariantConst v : a) {
+            if (v.isNull()) {
+                out[k++] = -1;
+                continue;
+            }
+            if (!v.is<int>()) {
+                sendErr(HTTP_CODE_BAD_REQUEST, "progress entries must be int 0..100 or null");
+                return false;
+            }
+            int p = v.as<int>();
+            if (p < 0 || p > 100) {
+                sendErr(HTTP_CODE_BAD_REQUEST, "progress entries must be int 0..100 or null");
+                return false;
+            }
+            out[k++] = p;
+        }
+        count = static_cast<int>(a.size());
+        return true;
+    };
+
+    int nLabels = 0;
+    int nProgress = 0;
+    int nResets = 0;
+    if (!parseStrings("labels", labels, nLabels) || !parseProgress(progress, nProgress) ||
+        !parseStrings("resets", resets, nResets)) {
+        return;
+    }
+    uint8_t rowCount = 0;
+    const int counts[3] = {nLabels, nProgress, nResets};
+    for (int c : counts) {
+        if (c == 0) {
+            continue;  // 字段缺省
+        }
+        if (rowCount == 0) {
+            rowCount = static_cast<uint8_t>(c);
+        } else if (static_cast<int>(rowCount) != c) {
+            sendErr(HTTP_CODE_BAD_REQUEST, "labels/progress/resets must have equal length");
+            return;
+        }
     }
 
-    UsageManager::pushBalance(lines, static_cast<uint8_t>(arr.size()), status, hasStatus);
+    for (uint8_t r = 0; r < rowCount; r++) {
+        UsageManager::setRowLabel(r, labels[r]);
+        UsageManager::setRowProgress(r, progress[r]);
+        UsageManager::setRowReset(r, resets[r]);
+    }
+
+    UsageManager::pushBalance(rowCount, status, hasStatus);
 
     // 同 live 推图：推送到达即接管 balance 场景（退场重绘契约）；已在 balance 则不动
     if (strcmp(SceneManager::currentName(), "balance") != 0) {
@@ -2182,8 +2259,9 @@ void handleBalanceSet(Webserver* webserver) {
 /**
  * @brief GET /api/v1/balance — 查询最近一次推送
  *
- * → {"lines":["l1","l2","l3"],"status":"...","ts":<epoch 或 0>,"age_s":<秒>}
- * 未推送过的槽位返回 ""；未同步过 NTP 时 ts=0。
+ * → {"labels":[...],"progress":[...],"resets":[...],"status":"...",
+ *    "ts":<epoch 或 0>,"age_s":<秒>}
+ * 空串 / null 表示该行无数据；未同步过 NTP 时 ts=0。
  */
 void handleBalanceGet(Webserver* webserver) {
     if (!requireBearerToken(webserver)) {
@@ -2191,9 +2269,18 @@ void handleBalanceGet(Webserver* webserver) {
     }
 
     JsonDocument doc;
-    JsonArray lines = doc["lines"].to<JsonArray>();
+    JsonArray labels = doc["labels"].to<JsonArray>();
+    JsonArray progress = doc["progress"].to<JsonArray>();
+    JsonArray resets = doc["resets"].to<JsonArray>();
     for (uint8_t i = 0; i < UsageManager::kBalanceLines; i++) {
-        lines.add(UsageManager::lineAt(i));
+        labels.add(UsageManager::rowLabel(i));
+        const int v = UsageManager::rowProgress(i);
+        if (v < 0) {
+            progress.add(nullptr);
+        } else {
+            progress.add(v);
+        }
+        resets.add(UsageManager::rowReset(i));
     }
     doc["status"] = UsageManager::statusText();
     doc["ts"] = static_cast<unsigned long>(UsageManager::pushEpoch());

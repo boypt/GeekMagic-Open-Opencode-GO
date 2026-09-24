@@ -47,10 +47,13 @@ static U8G2_FOR_ADAFRUIT_GFX& u8g2() {
 }
 
 // ---- 上位机推送缓冲（静态定长，零堆常驻；时间戳见 pushBalance）----
-static char s_lines[UsageManager::kBalanceLines][UsageManager::kLineCap] = {{0}};
+static char s_rowLabels[UsageManager::kBalanceLines][UsageManager::kRowLabelCap] = {{0}};
+static char s_rowResets[UsageManager::kBalanceLines][UsageManager::kRowResetCap] = {{0}};
+static uint8_t s_rowCount = 0;
 static char s_status[UsageManager::kStatusCap] = {0};
 static bool s_hasPush = false;
 static bool s_hasStatus = false;
+static int s_rowProgress[UsageManager::kBalanceLines] = {-1, -1, -1};
 static time_t s_pushEpoch = 0;      // 推送时刻 UTC epoch；推送时 NTP 未同步则为 0
 static uint32_t s_pushMillis = 0;   // 推送时刻 millis（age_s 基准，未同步时也有效）
 
@@ -90,14 +93,17 @@ static const uint8_t* const FONT_MINI = u8g2_font_6x10_tf;
 //   ┌─ logo(居中) ──────────────────────┐ y=1
 //   ├─ 横线 y=40 ───────────────────────┤
 //   │ 日期 MM-DD WKD │ 状态行 UPDATE 22:00 │ y=44
-//   │  HH  (46px)    │ 5H    行 y=58     │
-//   │  ───────       │ WEEK  行 y=114    │
-//   │  MM  (46px)    │ MONTH 行 y=170    │
+//   │  HH  (46px)    │ 5H    组 y=64     │
+//   │  ───────       │ WEEK  组 y=126    │
+//   │  MM  (46px)    │ MONTH 组 y=188    │
 //   └─ 错误条 y=226..240 ────────────────┘
 static constexpr int QUOTA_X0 = 124;  // 内容左边界
 static constexpr int QUOTA_X1 = 232;  // 右对齐基准
-static constexpr int ROW_H = 56;      // 三行额度行高
-static constexpr int ROW_TOP = 58;    // 第一行额度顶部 y（其上是状态行）
+// 额度区采用「组高 + 组间距」排布：组内三要素紧凑，组间留白。
+static constexpr int GROUP_TOP = 64;   // 状态行结束后留 6px
+static constexpr int GROUP_H = 46;     // 文字 / 轨道 / 重置文字的组高
+static constexpr int GROUP_GAP = 16;   // 组间留白，明显大于组内 2~4px
+static constexpr int ROW_BLOCK_BOTTOM = GROUP_TOP + GROUP_H * 3 + GROUP_GAP * 2;
 static constexpr int STATUS_Y = 44;   // 右栏顶部状态行顶部 y
 static constexpr int STATUS_H = 14;   // 状态行高度（slim）
 
@@ -285,36 +291,71 @@ static void drawSegText(int cx, int topY, const String& s, uint16_t color) {
     }
 }
 
-// ---------- 右栏额度行（推送纯文本，自适应字号）----------
-// 行内容 = 上位机推送整行文本（自带标签，设备零语义只排版），在
-// QUOTA_X0..QUOTA_X1 内右对齐（保持旧百分比的视觉锚点感）：
-//   FONT_PCT 能放下 → 大字；否则 FONT_MINI，仍超宽则 truncateToFit 截断。
-// 空槽（首次推送前）显示红色 "--" 占位；有内容为白色。
-// 版式：单行文本在 56px 行内光学居中（大字 y+18 / 小字 y+21，字形视觉
-// 中心落在行中线附近，略偏上）。旧进度条空槽已移除——推送模式无百分比
-// 可填，实心空槽只是视觉死重；空出的留白让行内呼吸，与左栏 HH/分隔线/MM
-// 的节奏对齐（行 1/2/3 文本分别落在 HH 带 / 分隔线 / MM 带高度）。
-// 行内除文本无任何装饰，页面气质由顶部分隔线与中缝竖线维持。
-void UsageManager::drawQuotaRow(int y, const char* text) {
+// ---------- 右栏额度行（三段式）----------
+// labels/resets/progress 均由 API 写入定长缓冲；设备只按位置排版，不解析字符串。
+// 空标签才回落到旧版固定标签，这是无标签数据时的显示兜底，不是语义解析。
+void UsageManager::drawQuotaRow(int y, uint8_t index) {
     auto* gfx = DisplayManager::getGfx();
-    gfx->fillRect(122, y, 112, ROW_H, C_BG);
+    gfx->fillRect(122, y, 112, GROUP_H, C_BG);
 
-    const bool empty = (text == nullptr || text[0] == '\0');
-    const char* shown = empty ? "--" : text;
-    const uint16_t color = empty ? C_RED : C_WHITE;
+    const bool inPayload = index < s_rowCount;
+    const int progress = inPayload ? rowProgress(index) : -1;
+    const char* label = inPayload ? rowLabel(index) : "";
+    if (label[0] == '\0') {
+        label = (index == 0) ? "5H" : (index == 1 ? "WK." : "MO.");
+    }
+    const int contentX = 126;
+    const int contentX1 = 230;
+    const int contentW = contentX1 - contentX;
 
-    char fit[UsageManager::kLineCap];
-    strlcpy(fit, shown, sizeof(fit));
+    // 上方：左侧标签，右侧精确百分比；两者按同一基线绘制，不按各自顶边对齐。
+    // drawTextC 的 y 是字形顶部并会加当前字体 ascent，这里先反算顶部位置。
+    char labelFit[UsageManager::kRowLabelCap];
+    strlcpy(labelFit, label, sizeof(labelFit));
+    u8g2().setFont(FONT_LABEL);
+    truncateToFit(labelFit, contentW);
 
+    char pct[12];
+    const bool hasProgress = inPayload && progress >= 0;
+    if (hasProgress) {
+        snprintf(pct, sizeof(pct), "%u%%", static_cast<unsigned>(progress));
+    } else {
+        strlcpy(pct, "--", sizeof(pct));
+    }
+    const int labelAscent = u8g2().getFontAscent();
     u8g2().setFont(FONT_PCT);
-    if (textWidthC(fit) <= QUOTA_X1 - QUOTA_X0) {
-        drawTextC(QUOTA_X1 - textWidthC(fit), y + 18, fit, color);
-        return;
+    truncateToFit(pct, contentW);
+    const int pctAscent = u8g2().getFontAscent();
+
+    const int textBaseline = y + 12;
+    u8g2().setFont(FONT_LABEL);
+    drawTextC(contentX, textBaseline - labelAscent, labelFit, C_LABEL);
+    u8g2().setFont(FONT_PCT);
+    drawTextC(contentX1 - textWidthC(pct), textBaseline - pctAscent, pct,
+              hasProgress ? C_WHITE : C_RED);
+
+    // 中间：轨道紧跟文字，组内保持紧凑。
+    const int trackX = 126;
+    const int trackW = 104;
+    const int trackY = y + 16;
+    const int trackH = 12;
+    gfx->fillRect(trackX, trackY, trackW, trackH, C_BORDER);
+    if (hasProgress && progress > 0) {
+        const int fillW = (trackW * progress + 50) / 100;
+        const uint16_t fillColor = progress >= 50 ? C_GREEN : (progress >= 20 ? C_YELLOW : C_RED);
+        gfx->fillRect(trackX, trackY, fillW, trackH, fillColor);
     }
 
+    // 下方：重置值由 API 提供；缺失时仅显示占位。
+    const char* reset = inPayload ? rowReset(index) : "";
+    if (reset[0] == '\0') {
+        reset = "--";
+    }
     u8g2().setFont(FONT_MINI);
-    truncateToFit(fit, QUOTA_X1 - QUOTA_X0);  // 当前字体即 MINI，测宽一致
-    drawTextC(QUOTA_X1 - textWidthC(fit), y + 21, fit, color);
+    char resetFit[UsageManager::kRowResetCap];
+    strlcpy(resetFit, reset, sizeof(resetFit));
+    truncateToFit(resetFit, contentW);
+    drawTextC(contentX1 - textWidthC(resetFit), y + 31, resetFit, C_SUB);
 }
 
 // ---------- 左栏时钟区 ----------
@@ -513,11 +554,11 @@ void UsageManager::drawUpdateRow() {
 // 正文区域（状态行 + 额度栏 + 时钟栏 + 中缝竖线）；调用前须保证该区域已清底
 void UsageManager::drawBody() {
     drawUpdateRow();
-    drawQuotaRow(ROW_TOP, s_lines[0]);
-    drawQuotaRow(ROW_TOP + ROW_H, s_lines[1]);
-    drawQuotaRow(ROW_TOP + ROW_H * 2, s_lines[2]);
+    drawQuotaRow(GROUP_TOP, 0);
+    drawQuotaRow(GROUP_TOP + GROUP_H + GROUP_GAP, 1);
+    drawQuotaRow(GROUP_TOP + (GROUP_H + GROUP_GAP) * 2, 2);
     drawClock();
-    DisplayManager::getGfx()->drawFastVLine(120, STATUS_Y, STATUS_H + ROW_H * 3, C_BORDER);
+    DisplayManager::getGfx()->drawFastVLine(120, STATUS_Y, ROW_BLOCK_BOTTOM - STATUS_Y, C_BORDER);
 }
 
 void UsageManager::drawMainPage() {
@@ -704,14 +745,13 @@ void UsageManager::begin() {
     Logger::info("UsageManager initialized (push mode)", "Balance");
 }
 
-void UsageManager::pushBalance(const char* const* lines, uint8_t nLines, const char* status,
-                               bool hasStatus) {
-    for (uint8_t i = 0; i < kBalanceLines; i++) {
-        if (i < nLines && lines != nullptr && lines[i] != nullptr) {
-            strlcpy(s_lines[i], lines[i], kLineCap);
-        } else {
-            s_lines[i][0] = '\0';
-        }
+void UsageManager::pushBalance(uint8_t rowCount, const char* status, bool hasStatus) {
+    s_rowCount = rowCount > kBalanceLines ? kBalanceLines : rowCount;
+    // 清除本次行数之外的旧字段，避免短推送后显示上一次残留。
+    for (uint8_t i = s_rowCount; i < kBalanceLines; i++) {
+        s_rowLabels[i][0] = '\0';
+        s_rowResets[i][0] = '\0';
+        s_rowProgress[i] = -1;
     }
     if (hasStatus && status != nullptr && status[0] != '\0') {
         strlcpy(s_status, status, kStatusCap);
@@ -781,14 +821,48 @@ void UsageManager::update() {
 // ---- UI 层 / API 层访问器（返回静态缓冲指针，调用方立即拷贝）----
 bool UsageManager::hasPush() { return s_hasPush; }
 
-const char* UsageManager::lineAt(uint8_t i) {
-    if (i >= kBalanceLines) return "";
-    return s_lines[i];
+const char* UsageManager::statusText() { return s_status; }
+
+void UsageManager::setRowLabel(uint8_t index, const char* label) {
+    if (index >= kBalanceLines) return;
+    if (label == nullptr || label[0] == '\0') {
+        s_rowLabels[index][0] = '\0';
+    } else {
+        strlcpy(s_rowLabels[index], label, kRowLabelCap);
+    }
+}
+
+void UsageManager::setRowReset(uint8_t index, const char* reset) {
+    if (index >= kBalanceLines) return;
+    if (reset == nullptr || reset[0] == '\0') {
+        s_rowResets[index][0] = '\0';
+    } else {
+        strlcpy(s_rowResets[index], reset, kRowResetCap);
+    }
 }
 
 bool UsageManager::hasStatus() { return s_hasStatus; }
 
-const char* UsageManager::statusText() { return s_status; }
+const char* UsageManager::rowLabel(uint8_t index) {
+    if (index >= kBalanceLines) return "";
+    return s_rowLabels[index];
+}
+
+int UsageManager::rowProgress(uint8_t index) {
+    if (index >= kBalanceLines) return -1;
+    return s_rowProgress[index];
+}
+
+const char* UsageManager::rowReset(uint8_t index) {
+    if (index >= kBalanceLines) return "";
+    return s_rowResets[index];
+}
+
+void UsageManager::setRowProgress(uint8_t index, int value) {
+    if (index >= kBalanceLines) return;
+    // value<0 = 本行无进度数据：存 -1（空槽）。否则钳到 0..100。
+    s_rowProgress[index] = value < 0 ? -1 : (value > 100 ? 100 : value);
+}
 
 time_t UsageManager::pushEpoch() { return s_pushEpoch; }
 

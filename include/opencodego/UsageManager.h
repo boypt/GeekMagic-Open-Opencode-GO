@@ -17,8 +17,9 @@ class UsageManager {
    public:
     // ---- 推送缓冲容量（含末尾 NUL）----
     static constexpr size_t kBalanceLines = 3;
-    static constexpr size_t kLineCap = 64;    // 每行额度文本
-    static constexpr size_t kStatusCap = 48;  // 状态行文本
+    static constexpr size_t kRowLabelCap = 8;   // label 最多 7 字节
+    static constexpr size_t kRowResetCap = 16;  // reset 最多 15 字节
+    static constexpr size_t kStatusCap = 48;
 
     static void begin();
     static void update();
@@ -29,19 +30,22 @@ class UsageManager {
     static void exitScene();
 
     // ---- 上位机推送入口（POST /api/v1/balance 调用）----
-    // lines[0..nLines) 为 1..3 行文本（NULL 行视为空）；status 为可选状态行
-    // （hasStatus=false 或空串表示缺省 → 状态行显示 UPD HH:MM）。
-    // 拷贝截断至定长缓冲，记录时间戳并 requestFullRedraw()，调用方直接回 200。
-    static void pushBalance(const char* const* lines, uint8_t nLines, const char* status,
-                            bool hasStatus);
+    // labels/progress/resets 由 API 在调用前逐项写入；status 为可选状态行。
+    // 记录行数、状态行、时间戳并 requestFullRedraw()，调用方直接回 200。
+    static void pushBalance(uint8_t rowCount, const char* status, bool hasStatus);
 
     // ---- 供 UI 层 / API 层读取的状态 ----
     static bool hasPush();
-    static const char* lineAt(uint8_t i);  // ""（未推送槽位）或行文本，永不返回 NULL
     static bool hasStatus();
-    static const char* statusText();  // "" 或状态行文本，永不返回 NULL
-    static time_t pushEpoch();        // 推送时刻 UTC epoch；推送时未同步则为 0
-    static uint32_t pushAgeSec();     // 距推送秒数；未推送过为 0
+    static const char* statusText();
+    static void setRowLabel(uint8_t index, const char* label);
+    static void setRowReset(uint8_t index, const char* reset);
+    static void setRowProgress(uint8_t index, int value);
+    static const char* rowLabel(uint8_t index);  // ""（未设置）永不返回 NULL
+    static int rowProgress(uint8_t index);
+    static const char* rowReset(uint8_t index);  // ""（未设置）永不返回 NULL
+    static time_t pushEpoch();
+    static uint32_t pushAgeSec();
 
     // ---- 界面绘制 ----
     static void drawBootPage(bool fail);
@@ -54,7 +58,7 @@ class UsageManager {
    private:
     static void drawBody();
     static void drawUpdateRow();
-    static void drawQuotaRow(int y, const char* text);
+    static void drawQuotaRow(int y, uint8_t index);
     static void drawClock();
     static void drawDateLine();
     static void drawSeparator();

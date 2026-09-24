@@ -42,8 +42,8 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 | 模块 | 职责 |
 |---|---|
 | `src/main.cpp` | 启动流程：DisplayManager → WiFiManager → NTP → Webserver → `UsageManager::begin()`；loop 委托各 manager |
-| `src/opencodego/UsageManager.cpp` | 七段时钟、logo、三行额度、状态行渲染；数据源 = `POST /api/v1/balance` 推送缓冲（静态定长 char 数组，零 String 抖动），推送到达即 `requestFullRedraw()`；额度行为纯文本自适应字号（能放大字 helvB12 则大字，超宽降级 6x10，右对齐截断），设备不解析语义 |
-| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（Bearer + `x-opencode-session`），格式化 3 行 ≤16 ASCII 文本（label + 剩余% + 距重置相对时长）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check/--demo`（`--demo` 用本地随机数据测试、无需上游凭据），退出码 0/1/2/3 |
+| `src/opencodego/UsageManager.cpp` | 七段时钟、logo、三行额度、状态行渲染；数据源 = `POST /api/v1/balance` 的三段推送缓冲（`setRowLabel/setRowProgress/setRowReset` 写入，定长静态数组，零 String 抖动），推送到达即 `requestFullRedraw()`；额度行**三段式**：行上方左=标签（缺省回落 5H/WK./MO.）/右=百分比（中等字号，无值红 `--`）、中间=进度条（轨道左右 4px 等边距、填充绿≥50/黄≥20/红<20、无值空槽）、行下方右=重置日期（最小字号，缺省 `--`）。设备不解析语义 |
+| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（Bearer + `x-opencode-session`），按**三段字段**推送（左上标签 `labels` / 进度条与右上百分比 `progress`=剩余% / 右下重置相对时长 `resets`）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check/--demo`（`--demo` 用本地随机数据测试、无需上游凭据），退出码 0/1/2/3 |
 | `include/opencodego/SegFont7.h` | TFT_eSPI Font7 原字模解码的 1bpp 行位图（0-9 : -，32x48），像素级还原旧七段观感 |
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
@@ -69,7 +69,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 - 相册：`GET/POST/DELETE /album`（图片 = 240x240 RGB565 原始位图 `.rgb565`，Web 端转换上传；上传时校验整幅尺寸 115200B）；`POST /album/live`（multipart 流式推一帧实时显示、**不保存**——脚本/HA 推画面用；不在 live 场景时自动接管）
 - 灯光：`GET/POST /light`（WS2812 氛围灯：`on/mode(solid|breathe|rainbow)/r,g,b/brightness`，部分更新，持久化 config.json `led_*`）
 - 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动跳转，全手工**；推送自动接管是例外：live 推图→live、额度推送→balance |
-- 额度推送：`POST /balance`（body `{"lines":["l1","l2","l3"],"status":"可选状态行"}`，body<1KB；非法 JSON 或字段类型错 → 400；成功 200 `{"ok":true}` 并立即重绘；**若当前不在 balance 场景则立即 `switchTo("balance")` 接管**）、`GET /balance`（`{lines,status,ts,age_s}` 查最近一次推送，未推送行为空串）。行文本内容由上位机全权决定
+- 额度推送：`POST /balance`（body `{"labels":["5H","WK.","MO."],"progress":[58,null,91],"resets":["R2d4h",null,"R14d3h"],"status":"可选状态行"}`；三段字段均可选、出现时须**彼此等长**（1..3）、元素可 `null`；`progress` 元素为 0..100 剩余百分比（越界/类型错/长度不一致 → 400），缺省 `labels` 回落固件默认 `5H/WK./MO.`、缺省 `resets` 显示 `--`、缺省 `progress` 为空槽；body<1KB；成功 200 `{"ok":true}` 并立即重绘；**若当前不在 balance 场景则立即 `switchTo("balance")` 接管**）、`GET /balance`（`{labels,progress,resets,status,ts,age_s}`）。整行 `lines` 通道**已退役**——标签 / 百分比 / 重置三段分开推送，设备零语义照单渲染
 - 系统：`POST /reboot`、`GET /logs`、`POST /ota/fw|fs|cancel`、`GET /ota/status`、`GET/POST /token/check|save`
 - rescue 模式（AP `GeekMagic` @192.168.4.1，无鉴权）：`GET /rescue/status`，`POST /rescue/reset|reboot|token|ota`
 

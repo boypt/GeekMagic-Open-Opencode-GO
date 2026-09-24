@@ -224,11 +224,12 @@ class SystemInfoScene : public Scene {
         // Clear the full date band before redrawing so a longer previous value
         // cannot leave glyph remnants. This is a fixed-area update, not a
         // full-screen redraw, and the clock band starts at y=174.
-        gfx->fillRect(0, 140, 240, 30, C_BG);
-        // 8px 字形在独占带内垂直居中，并与下方大时钟保持间隔。
+        // 下移日期并收紧独占带：日期字形 166~173，时钟字形从 181 开始，视觉间隔约 7px。
+        // 仍不触及信息行末行和时钟从 y=174 开始的清屏边界。
+        gfx->fillRect(0, 150, 240, 24, C_BG);
         gfx->setTextSize(1);
         gfx->setTextColor(C_ACCENT);
-        gfx->setCursor(120 - textWidthPx(dateText, 1) / 2, 151);
+        gfx->setCursor(120 - textWidthPx(dateText, 1) / 2, 166);
         gfx->print(dateText);
     }
 
@@ -303,8 +304,11 @@ class AlbumScene : public Scene {
             collectDir();
 
             if (m_count == 0) {
+                // 空相册是有效的停留状态；上传后重新切入场景即可再次收集图片。
                 Logger::warn("AlbumScene: album is empty", "Scene");
-                return false;
+                drawEmptyState();
+                m_lastMs = millis();
+                return true;
             }
         }
 
@@ -344,10 +348,32 @@ class AlbumScene : public Scene {
     static constexpr uint32_t SHOW_MS_PER_IMAGE = 5000U;
     static constexpr size_t IMG_BYTES = static_cast<size_t>(IMG_W) * IMG_H * 2;
 
+    static constexpr uint16_t C_EMPTY_BG = rgb565(0x00, 0x00, 0x00);
+    static constexpr uint16_t C_EMPTY_SUB = rgb565(0x8A, 0x94, 0xB8);
+    static constexpr uint16_t C_EMPTY_ACCENT = rgb565(0x4D, 0x6B, 0xFE);
+
     char m_items[ALBUM_MAX][40] = {{0}};
     int m_count = 0;
     int m_index = 0;
     uint32_t m_lastMs = 0;
+
+    auto drawEmptyState() -> void {
+        auto* gfx = DisplayManager::getGfx();
+        gfx->fillScreen(C_EMPTY_BG);
+
+        // 文案保持 ASCII：内建字体没有 CJK 字模；两行居中，避免空态像故障画面。
+        const char* title = "ALBUM EMPTY";
+        const char* hint = "UPLOAD VIA WEB";
+        gfx->setTextSize(2);
+        gfx->setTextColor(C_EMPTY_SUB);
+        gfx->setCursor(120 - textWidthPx(title, 2) / 2, 108);
+        gfx->print(title);
+
+        gfx->setTextSize(1);
+        gfx->setTextColor(C_EMPTY_ACCENT);
+        gfx->setCursor(120 - textWidthPx(hint, 1) / 2, 136);
+        gfx->print(hint);
+    }
 
     auto collectDir() -> void {
         Dir dir = LittleFS.openDir("/album");

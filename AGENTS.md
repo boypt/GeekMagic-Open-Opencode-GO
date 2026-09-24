@@ -1,7 +1,7 @@
 # AGENTS.md — GeekMagic Open Opencode GO
 
 ESP8266 (esp12e) + ST7789 240x240 桌面小屏固件，基于 [Times-Z/GeekMagic-Open-Firmware](https://github.com/Times-Z/GeekMagic-Open-Firmware)（GPL-3.0）移植。
-主功能：OpenCode Go 额度显示（时钟 + 5H/WEEK/MONTH 三行），并继承框架的 WiFi 配网 / NTP / Web 配置 / OTA / 救援模式。
+主功能：显示上位机推送的额度文本（时钟 + 三行推送文本），并继承框架的 WiFi 配网 / NTP / Web 配置 / OTA / 救援模式。设备端零出站网络请求、无任何 TLS 组件，额度内容由上位机脚本 `tools/push_balance.py` 读上游后经 `POST /api/v1/balance` 推送，设备只排版渲染（零语义）。
 
 ## 构建 / 烧录 / 调试
 
@@ -19,7 +19,7 @@ import serial, time
 s = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.3)
 s.setDTR(False); s.setRTS(True); time.sleep(0.15); s.setRTS(False)   # 复位沿
 time.sleep(0.3); s.reset_input_buffer()
-# 读 40-95s ...   （启动流程约 15s 出主页面；拉取在联网后立即发生）
+# 读 40-95s ...   （启动流程约 15s 出主页面）
 ```
 
 - 设备通常在 STA 模式可从开发机直连（日志里 `WiFiManager: IP : x.x.x.x`），Bearer token 见 `data/config.json` 的 `api_token`。curl 调试很方便：
@@ -42,8 +42,8 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 | 模块 | 职责 |
 |---|---|
 | `src/main.cpp` | 启动流程：DisplayManager → WiFiManager → NTP → Webserver → `UsageManager::begin()`；loop 委托各 manager |
-| `include/opencodego/OpenCodeGoClient.h` | HTTPS 拉取用量（BearSSL + 自定义 CA）、解析三窗口、3 次退避重试、`dechunkInPlace` 单缓冲响应解析 |
-| `src/opencodego/UsageManager.cpp` | UI + 轮询调度：七段时钟、logo、三行额度、状态行；5min 轮询 / 无数据 30s fast retry；局部重绘 |
+| `src/opencodego/UsageManager.cpp` | 七段时钟、logo、三行额度、状态行渲染；数据源 = `POST /api/v1/balance` 推送缓冲（静态定长 char 数组，零 String 抖动），推送到达即 `requestFullRedraw()`；额度行为纯文本自适应字号（能放大字 helvB12 则大字，超宽降级 6x10，右对齐截断），设备不解析语义 |
+| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（Bearer + `x-opencode-session`），格式化 3 行 ≤16 ASCII 文本（label + 剩余% + 距重置相对时长）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check`，退出码 0/1/2/3 |
 | `include/opencodego/SegFont7.h` | TFT_eSPI Font7 原字模解码的 1bpp 行位图（0-9 : -，32x48），像素级还原旧七段观感 |
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
@@ -56,10 +56,10 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 ## 配置系统（语义容易记反，注意）
 
-- `config.json`（LittleFS 根）：`api_token` / `opencodego_api_key` 有值且与 NVS **不同**时**覆盖** NVS（便于刷机生效）；随后 `save()` 会把它们从 JSON 删除（敏感信息只留 NVS）。
-- WiFi 凭据、API token、OpenCode Key 在 SecureStorage（EEPROM，XOR 混淆）；host/path/亮度/显示参数在 `config.json`。
+- `config.json`（LittleFS 根）：`api_token` 有值且与 NVS **不同**时**覆盖** NVS（便于刷机生效）；随后 `save()` 会把它从 JSON 删除（敏感信息只留 NVS）。
+- WiFi 凭据、API token 在 SecureStorage（EEPROM，XOR 混淆）；亮度/显示/NTP 等参数在 `config.json`。上游 host/path/key 已移出设备，归上位机脚本的参数/环境变量。
 - `data/config.json` 被上游 `.gitignore` 忽略（含 token，勿提交）。它被打进 littlefs 映像，所以**刷文件系统会覆盖设备上的 config.json**——新增持久化字段时记得同步加进去，否则刷完丢配置。
-- TLS 信任：**源码无内置证书**。`/ca.pem`（LittleFS）存在且 `verify_tls_cert=1` 时用它做链校验，否则 `setInsecure()`（默认即不校验）。当前 host（`bwe.134133.xyz`，Let's Encrypt）的信任锚是 **ISRG Root X1**。
+- TLS：设备端**已无任何出站 TLS**（BearSSL/CA 文件/`verify_tls_cert`/MFLN 全部移除）；上游 HTTPS 校验由上位机脚本按系统证书库处理（`--ca-file` / `--insecure` 可调）。
 
 ## API 端点（全部 `/api/v1/...`，Bearer token 保护，rescue 模式除外）
 
@@ -69,29 +69,29 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 - 相册：`GET/POST/DELETE /album`（图片 = 240x240 RGB565 原始位图 `.rgb565`，Web 端转换上传；上传时校验整幅尺寸 115200B）；`POST /album/live`（multipart 流式推一帧实时显示、**不保存**——脚本/HA 推画面用；不在 live 场景时自动接管）
 - 灯光：`GET/POST /light`（WS2812 氛围灯：`on/mode(solid|breathe|rainbow)/r,g,b/brightness`，部分更新，持久化 config.json `led_*`）
 - 场景：`GET /scene`（当前场景+参数+列表）、`POST /scene`（`{"scene":"album","param":"red.rgb565"}`，退场重绘契约，失败自动回滚重绘上一场景）。**无自动场景跳转，全手工**；live 推图自动接管是唯一例外
-- OpenCode Go：`GET/POST /opencodego/config`（body 字段名是 `opencodego_host/opencodego_path/opencodego_api_key`，不是 host/path）、`GET/POST/DELETE /opencodego/ca`（PEM 全文 `{"pem":"..."}`）
-- 系统：`POST /reboot`、`GET /logs`、`POST /ota/fw|fs|cancel`、`GET /ota/status`、`GET/POST /token/check|save`、GIF 若干
+- 额度推送：`POST /balance`（body `{"lines":["l1","l2","l3"],"status":"可选状态行"}`，body<1KB；非法 JSON 或字段类型错 → 400；成功 200 `{"ok":true}` 并立即重绘）、`GET /balance`（`{lines,status,ts,age_s}` 查最近一次推送，未推送行为空串）。行文本内容由上位机全权决定
+- 系统：`POST /reboot`、`GET /logs`、`POST /ota/fw|fs|cancel`、`GET /ota/status`、`GET/POST /token/check|save`
 - rescue 模式（AP `GeekMagic` @192.168.4.1，无鉴权）：`GET /rescue/status`，`POST /rescue/reset|reboot|token|ota`
 
 ## 已知坑（都踩过，别再踩）
 
 1. **ESP8266 IROM 只支持 32-bit 对齐访问**：直接 `*(const uint8_t*)` 读 flash 常量会 `Exception (3)` LoadStoreError（excvaddr=符号地址）。必须走 `pgm_read_byte/word`，并保持 `-DNON32XFER_HANDLER` 兜底。u8g2 的裸指针解引用靠 `IromAccess.h` 重定义宏修正。
-2. **BearSSL OOM**：拉取时 free heap 仅 ~24KB。每次拉取重新 `String + X509List` 解析 CA 会挤到 `Unhandled C++ exception: OOM`；现已一次性解析常驻。**不要**在 webserver handler 里再开 TLS 连接（叠加请求缓冲必炸——`/ca/test` 因此被移除）。
-3. **rescue 误触发**：每次刷机/手动复位都算一次启动，旧阈值 3 太敏感。现已：阈值 10 + **只统计崩溃类复位**（Exception/Fatal/Watchdog），`External System`/`Power On`/`Software/System restart` 直接清零计数。若再进 rescue：连 AP 后 `curl -X POST http://192.168.4.1/api/v1/rescue/reset` 再 `/rescue/reboot`。
-4. **显示设置后屏幕残留启动屏**：`DisplayManager::setRotation()/applyPanelProfile()` 不得画启动屏（会覆盖主页面且 `mainPageDrawn` 不回退）；改完必须 `requestFullRedraw()`，由 `UsageManager::update()` 重画。
-5. **Web 静态资源缓存 24h**（`max-age=86400`）：改了网页/JS 后浏览器要硬刷新（Ctrl+Shift+R）才生效。图像处理遵循「CDN 引库」策略（零设备空间）：`jpeg-js`（JS 解码 JPEG，浏览器内建解码对 CMYK/YCCK JPG 反色）+ `cropperjs`（画布裁剪缩放控件），均为 jsDelivr/esm.sh 动态或标签引用，离线/内网需自建镜像。
-6. **刷文件系统覆盖设备 config.json**（见"配置系统"）。同理也会**清空设备上的 `/album` 相册库**（相册图只存在设备上，不在 `data/` 里）——`uploadfs` 前提醒用户重传图片，或先用 `GET /api/v1/album` + 逐个下载备份（无下载接口，重要图请留原图）。
-7. 上传时报 `Invalid head of packet`：重试即可；报 PermissionError：先关掉占用串口的 monitor。
-8. `connect()` 无超时参数（本核心），TLS 握手最坏约 15s，长链（4 证书 + RSA-4096）验证较重，首次偶发失败由重试兜底（日志 `Fetch recovered on attempt 2` 属正常）。
-9. **堆碎片：空闲总量够 ≠ 能分配**。实测 `free 22KB / max block 13KB`，任何 >13KB 的整体 `new` 必失败；且 park 释放的大洞会被小块分配切碎、再也拼不回去。**结论（已付过学费）**：80KB RAM 塞不下 GIF 解码器（对象+LZW 字典 ≥20KB），相关方案（vendored AnimatedGIF/字典池交接）已整体删除，相册改为静态 RGB565 图（零解码、~3.8KB 行缓冲）。新功能若需 >4KB 连续块，先想清楚碎片化与拉取互斥。
-10. **WiFiClientSecure 低堆会 abort 重启**：构造 + `setInsecure()` 一次性分配 ~6.4KB（引擎+thunk+缓冲），堆不足时 bad_alloc → `Abort called`（栈特征 `__unhandled_exception ← stack_thunk_add_ref`），且拉取重试路径会放大成重启循环。低堆保护栏（`free < 5500` 跳过本轮）**必须放在 `WiFiClientSecure` 构造之前**（`OpenCodeGoClient.h`）。
-11. **MFLN 档位**：TLS rx<16384 依赖 MFLN（RFC 6066）；**512 档会被服务端 illegal_parameter 秒拒**（11ms 失败），1024/512 实测可用，拉取峰值 ~8.5KB（当前空闲 ~19KB，宽裕）。
+2. **rescue 误触发**：每次刷机/手动复位都算一次启动，旧阈值 3 太敏感。现已：阈值 10 + **只统计崩溃类复位**（Exception/Fatal/Watchdog），`External System`/`Power On`/`Software/System restart` 直接清零计数。若再进 rescue：连 AP 后 `curl -X POST http://192.168.4.1/api/v1/rescue/reset` 再 `/rescue/reboot`。
+3. **显示设置后屏幕残留启动屏**：`DisplayManager::setRotation()/applyPanelProfile()` 不得画启动屏（会覆盖主页面且 `mainPageDrawn` 不回退）；改完必须 `requestFullRedraw()`，由 `UsageManager::update()` 重画。
+4. **Web 静态资源缓存 24h**（`max-age=86400`）：改了网页/JS 后浏览器要硬刷新（Ctrl+Shift+R）才生效。图像处理遵循「CDN 引库」策略（零设备空间）：`jpeg-js`（JS 解码 JPEG，浏览器内建解码对 CMYK/YCCK JPG 反色）+ `cropperjs`（画布裁剪缩放控件），均为 jsDelivr/esm.sh 动态或标签引用，离线/内网需自建镜像。
+5. **刷文件系统覆盖设备 config.json**（见"配置系统"）。同理也会**清空设备上的 `/album` 相册库**（相册图只存在设备上，不在 `data/` 里）——`uploadfs` 前提醒用户重传图片，或先用 `GET /api/v1/album` + 逐个下载备份（无下载接口，重要图请留原图）。
+6. 上传时报 `Invalid head of packet`：重试即可；报 PermissionError：先关掉占用串口的 monitor。
+7. **堆碎片：空闲总量够 ≠ 能分配**。实测 `free 22KB / max block 13KB`，任何 >13KB 的整体 `new` 必失败；且 park 释放的大洞会被小块分配切碎、再也拼不回去。**结论（已付过学费）**：80KB RAM 塞不下 GIF 解码器（对象+LZW 字典 ≥20KB），相关方案（vendored AnimatedGIF/字典池交接）已整体删除，相册改为静态 RGB565 图（零解码、~3.8KB 行缓冲）。新功能若需 >4KB 连续块，先想清楚碎片化。
+8. **Alpine `x-if` 里的元素在条件为真前不在 DOM**：`$refs.xxx` 取到 `undefined`（症状 `TypeError: Cannot set properties of undefined (setting 'src')`）。必须先置条件 + `await this.$nextTick()` 再取 ref（相册单图裁剪上传曾因此全挂）。要 ref 恒在用 `x-show`。
+9. **GIF→相册重构的路径残留**：删除接口曾写死 `/gif/` 前缀，文件实际在 `/album/`，删除必 404 `file not found`。改存储目录/前缀时全仓 grep 旧前缀对齐（上传/列表/删除/场景四处）。
+10. **勿在设备端重新引入出站 TLS**：BearSSL/`WiFiClientSecure`/CA 校验/MFLN 等组件已整体移除（Flash 从 ~59% 降到 ~46%），历史坑（CA 解析 OOM、低堆 abort 重启、MFLN 512 档被拒、握手 15s）都随移除消失；上游 HTTPS 归上位机脚本。
 
 ## 验证工作流
 
 改动后标准闭环：`pio run` → `upload`（+ 必要时 `uploadfs`）→ pyserial 抓 40-95s 启动日志，确认
-`Clean boot (...)` 或 `Boot stable`、无 `Exception`、`UsageManager initialized`、拉取 `HTTP 200` + `Quota: ...`、`Free heap` 稳定无泄漏趋势。
-无测试/CI，`pio run` + 真机日志即为验证。RAM ~56% / Flash ~59%，加库注意余量。
+`Clean boot (...)` 或 `Boot stable`、无 `Exception`、`UsageManager initialized`、`Free heap` 稳定无泄漏趋势。
+额度链路联调：`python3 tools/push_balance.py --dry-run` 看 payload → 带真参数推送 → 屏幕三行即时刷新、`GET /api/v1/balance` 可见 lines/ts。
+无测试/CI，`pio run` + 真机日志即为验证。RAM ~62% / Flash ~46%（移除出站 TLS 后 Flash 大降），加库注意余量。
 
 ## 提交规范
 

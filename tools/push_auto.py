@@ -1144,6 +1144,9 @@ def build_arg_parser():
                        help="逗号分隔新浪代码，最多 5 个（也可用 SYMBOLS）")
     stock.add_argument("--sina-url", default=os.environ.get("SINA_URL", DEFAULT_SINA_URL),
                        help="新浪 URL 前缀（也可用 SINA_URL）")
+    stock.add_argument("--stock-dry-run", action="store_true",
+                       help="只真实拉取并打印股票行情 payload，不连接设备"
+                            "（用于测试取数链路；加 --demo 则用本地随机数据）")
 
     policy = parser.add_argument_group("时间策略")
     policy.add_argument("--open-interval", type=int, default=15,
@@ -1195,7 +1198,8 @@ def validate_args(args):
             return device_base, symbols, "--%s 必须 > 0" % name.replace("_", "-")
     if not (args.sina_url or "").strip():
         return device_base, symbols, "缺少 --sina-url（或环境变量 SINA_URL）"
-    if args.check or not args.dry_run:
+    # --stock-dry-run 只测取数，不需要设备地址与 token
+    if args.check or not (args.dry_run or args.stock_dry_run):
         if not device_base:
             return device_base, symbols, "缺少 --device（或环境变量 DEVICE）"
         if not args.device_token:
@@ -1208,6 +1212,42 @@ def validate_args(args):
 def show_dry_run(endpoint, payload):
     print("[dry-run] POST %s" % endpoint)
     print(json.dumps(payload, ensure_ascii=False))
+
+
+def stock_dry_run(args, symbols):
+    """真实拉取股票行情并打印 payload，全程不连接设备。
+
+    与 ``--dry-run`` 的区别：后者跟随时间策略、且用本地随机数据代替取数；
+    这里是真的请求新浪，用来单独验证取数链路、字段解析与开市判定。
+    """
+    if args.demo:
+        rows = [{"name": symbol, "change": round_change(random.uniform(-5.0, 5.0))}
+                for symbol in symbols]
+        data_date = None
+    else:
+        try:
+            rows, data_date = fetch_quotes(args.sina_url, symbols,
+                                           args.timeout, args.insecure)
+        except Exception as ex:
+            eprint("行情失败: %s" % ex)
+            return 1
+
+    now_bj = time.gmtime(time.time() + 8 * 3600)
+    weekday = "周一至周五" if now_bj.tm_wday <= 4 else "周末"
+    open_now = is_market_open(now_bj, data_date=data_date)
+    print("北京时间 %s（%s）" % (time.strftime("%Y-%m-%d %H:%M:%S", now_bj), weekday))
+    print("行情日期 %s → 开市判定：%s" % (data_date or "(取不到)",
+                                          "开市" if open_now else "休市"))
+    for row in rows:
+        if row["change"] > 0:
+            tone = "涨 → 屏上正红"
+        elif row["change"] < 0:
+            tone = "跌 → 屏上正绿"
+        else:
+            tone = "平 → 屏上中性白"
+        print("  %-10s %+7.2f%%  %s" % (row["name"], row["change"], tone))
+    show_dry_run("/api/v1/stock", {"rows": rows})
+    return 0
 
 
 def run_balance(args, device_base):
@@ -1479,6 +1519,8 @@ def main(argv=None):
         except (RuntimeError, OSError) as ex:
             eprint("设备失败: %s" % ex)
             return 2
+    if args.stock_dry_run:
+        return stock_dry_run(args, symbols)
     scheduler = Scheduler(args, device_base, symbols, clock=RealClock())
     try:
         scheduler.start()

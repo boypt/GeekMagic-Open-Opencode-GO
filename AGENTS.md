@@ -33,7 +33,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 - ST7789 240x240，SPI Mode3 40MHz，无 CS（引脚固化在 `include/config/ConfigManager.h`：MOSI=13 SCK=14 DC=0 RST=2，背光 GPIO5 低有效）。
 - **WS2812 氛围灯**（本机加装，上游无）：数据脚 **GPIO12**，默认 1 颗（`include/led/AmbientLight.h` 的 `WS2812_LED_COUNT`），效果 tick 在 main loop 与场景无关；控制见 `/api/v1/light` 与首页控制块。
 - 图形库是 **Arduino_GFX**（不是 TFT_eSPI）；面板初始化走 `src/display/DisplayManager.cpp::lcdRunVendorInit()`（厂商序列，含 gamma/电源/VCOM），另有 `lcdRunSd2Init()`（旧 sd2 精简序列）可切换。
-- **本面板色序是 BGR**：旧 sd2 用 TFT_eSPI 的 ST7789_2 驱动（240x240 自动定义 CGRAM_OFFSET → MADCTL 带 BGR 位 0x08），所以 `lcd_bgr` 默认 **true**。改这个之前先确认观感（红蓝互换是最明显症状）。
+- **本面板色序是 BGR**：旧 sd2 用 TFT_eSPI 的 ST7789_2 驱动（240x240 自动定义 CGRAM_OFFSET → MADCTL 带 BGR 位 0x08），所以 `lcd_bgr` 默认 **true**。改这个之前先确认观感（红蓝互换是最明显症状）。推入的 16bpp 位图（相册/实时帧）在 `writePixels` 前做 **R/B 字段交换**补偿（`Scenes.cpp::drawImage`、`Api.cpp` 推帧行），写端（web 转换、推帧脚本）保持标准 RGB565(LE) 不变。
 - 亮度：GPIO5 反相 PWM（`analogWriteRange(1023)`，`analogWrite(pin, 1023 - duty)`），`lcd_brightness` 0-100。
 - 屏幕方向：`lcd_rotation` 0-3 正常四向，4-7 是镜像变体；本机 0。另有 `lcd_mirror_x/y` 翻转 MADCTL 的 MX/MY 位。
 

@@ -766,7 +766,13 @@ static void livePushBytes(const uint8_t* data, size_t len) {
         if (s_liveRowFill == 480) {
             tft->startWrite();
             tft->writeAddrWindow(0, s_liveRowY, 240, 1);
-            tft->writePixels(reinterpret_cast<uint16_t*>(s_liveRow), 240);
+            // 同 AlbumScene：标准 RGB565(LE) 直推在本面板红蓝互换，做 R/B 字段交换补偿
+        auto* px = reinterpret_cast<uint16_t*>(s_liveRow);
+        for (int i = 0; i < 240; i++) {
+            const uint16_t v = px[i];
+            px[i] = static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
+        }
+        tft->writePixels(reinterpret_cast<uint16_t*>(s_liveRow), 240);
             tft->endWrite();
 
             s_liveRowFill = 0;

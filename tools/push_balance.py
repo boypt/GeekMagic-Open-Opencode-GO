@@ -22,7 +22,7 @@ POST 到设备的 ``/api/v1/balance`` 接口显示。
 
 上游协议（移植自 include/opencodego/OpenCodeGoClient.h，只读参考）::
 
-    GET <--upstream-url 完整 URL，如 https://host/path>
+    GET <--upstream-url 完整 URL；默认 https://opencode.ai/zen/go/v1/usage>
     Authorization: Bearer <上游 key>
     x-opencode-session: push-balance-<hostname>
     -> {"usage": {"rolling": {"status","percent","resetsAt"},
@@ -40,15 +40,13 @@ status 行沿用旧 ``UPDATE HH:MM`` 语义（推送成功时刻，本地时间�
 
 中文用法示例::
 
-    # 单次推送（参数显式）
+    # 单次推送（上游 URL 用默认值，只需 key）
     python3 tools/push_balance.py --device http://192.168.1.10 \\
-        --device-token DEV_TOKEN \\
-        --upstream-url https://bwe.example.com/api/usage --upstream-key UPSTREAM_KEY
+        --device-token DEV_TOKEN --upstream-key UPSTREAM_KEY
 
-    # 循环推送（每 300 秒一轮，上游轮询节奏与旧固件一致默认 5 分钟）
+    # 循环推送（每 300 秒一轮；换上游时加 --upstream-url https://host/path）
     python3 tools/push_balance.py --device http://192.168.1.10 \\
-        --device-token DEV_TOKEN \\
-        --upstream-url https://bwe.example.com/api/usage --upstream-key UPSTREAM_KEY \\
+        --device-token DEV_TOKEN --upstream-key UPSTREAM_KEY \\
         --loop --interval 300
 
     # 只打印 payload 不推送（格式化路径验证，可用假参数跑通）
@@ -80,6 +78,8 @@ import urllib.request
 
 SESSION_PREFIX = "push-balance"
 MAX_STATUS_LEN = 24
+# 上游用量接口默认地址；用 --upstream-url 或环境变量 UPSTREAM_URL 覆盖
+DEFAULT_UPSTREAM_URL = "https://opencode.ai/zen/go/v1/usage"
 # 上游 resetsAt 是 UTC ISO8601；旧固件按 UTC+8 显示，这里同样 +8h。
 TZ_OFFSET_SEC = 8 * 3600
 
@@ -131,10 +131,10 @@ def build_arg_parser():
                         "也可经环境变量 DEVICE 传入")
     p.add_argument("--device-token", default=os.environ.get("DEVICE_TOKEN", ""),
                    help="设备 api_token（Bearer）。也可经 DEVICE_TOKEN 传入")
-    p.add_argument("--upstream-url", default=os.environ.get("UPSTREAM_URL", ""),
-                   help="上游完整 URL（含 https:// 与 path，如 "
-                        "https://bwe.example.com/api/usage）。"
-                        "也可经环境变量 UPSTREAM_URL 传入")
+    p.add_argument("--upstream-url",
+                   default=os.environ.get("UPSTREAM_URL", DEFAULT_UPSTREAM_URL),
+                   help="上游完整 URL（含 https:// 与 path；默认 %s）。"
+                        "也可经环境变量 UPSTREAM_URL 传入" % DEFAULT_UPSTREAM_URL)
     p.add_argument("--upstream-key", default=os.environ.get("UPSTREAM_KEY", ""),
                    help="上游 API Key（Anthropic 兼容 Key）。"
                         "也可经 UPSTREAM_KEY 传入")

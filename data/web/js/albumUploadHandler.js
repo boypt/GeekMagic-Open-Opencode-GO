@@ -201,11 +201,12 @@ function albumUploadHandler() {
       try {
         this.pendingFile = file;
         this.pendingCanvas = await this.decodeToCanvas(file);
-        const img = this.$refs.cropImage;
-        img.src = this.pendingCanvas.toDataURL("image/jpeg", 0.92);
         this.cropping = true;
 
         await this.$nextTick();
+        const img = this.$refs.cropImage;
+        if (!img) throw new Error("crop UI not ready");
+        img.src = this.pendingCanvas.toDataURL("image/jpeg", 0.92);
         this.cropper = new Cropper(img, {
           aspectRatio: 1,
           viewMode: 1,

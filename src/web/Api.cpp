@@ -1723,7 +1723,7 @@ void handleDeleteGif(Webserver* webserver) {
     String filename(name);
     filename.replace("\\", "/");
     filename = filename.substring(filename.lastIndexOf('/') + 1);
-    String path = String("/gif/") + filename;
+    String path = String("/album/") + filename;
 
     if (!LittleFS.exists(path)) {
         JsonDocument resp;

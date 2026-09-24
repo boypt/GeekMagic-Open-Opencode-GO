@@ -38,6 +38,8 @@ class DisplayManager {
     static void begin();
     static void setRotation(uint8_t rotation, String currentIP);
     static void setBacklight(uint8_t percent);
+    static void setSleeping(bool sleeping);
+    static bool isSleeping();
     static Arduino_GFX* getGfx();
     static void applyPanelProfile();
     static void requestFullRedraw();

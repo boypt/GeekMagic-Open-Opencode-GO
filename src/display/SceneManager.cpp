@@ -102,6 +102,13 @@ auto SceneManager::update() -> void {
     }
 }
 
+auto SceneManager::redrawCurrent() -> void {
+    if (s_current != nullptr) {
+        // 唤醒只重放当前场景的 enter()，不经过 switchTo 的注册/退场/回滚路径。
+        s_current->enter(s_currentParam);
+    }
+}
+
 auto SceneManager::current() -> Scene* { return s_current; }
 
 auto SceneManager::currentName() -> const char* {

@@ -72,6 +72,8 @@ void handleDisplayMirrorGet(Webserver* webserver);
 void handleDisplayMirrorSet(Webserver* webserver);
 void handleDisplayBrightnessGet(Webserver* webserver);
 void handleDisplayBrightnessSet(Webserver* webserver);
+void handleDisplaySleepGet(Webserver* webserver);
+void handleDisplaySleepSet(Webserver* webserver);
 void handleDeleteGif(Webserver* webserver);
 static void handleStockGet(Webserver* webserver);
 static void handleStockSet(Webserver* webserver);
@@ -145,6 +147,15 @@ void registerApiEndpoints(Webserver* webserver) {
     // requestBody=application/json requestBodySchema=lcd_brightness:integer example={"lcd_brightness":78}
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/display/brightness", HTTP_POST, [webserver]() { handleDisplayBrightnessSet(webserver); });
+
+    // @openapi {get} /display/sleep version=v1 group=Display summary="Get display sleep state" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/display/sleep", HTTP_GET, [webserver]() { handleDisplaySleepGet(webserver); });
+
+    // @openapi {post} /display/sleep version=v1 group=Display summary="Set display sleep state and suspend ambient light" requiresAuth=true
+    // requestBody=application/json requestBodySchema=on:boolean example={"on":true}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/display/sleep", HTTP_POST, [webserver]() { handleDisplaySleepSet(webserver); });
 
     // @openapi {post} /reboot version=v1 group=System summary="Reboot the device" requiresAuth=true
     // responses=200:application/json,401:application/json
@@ -1430,6 +1441,77 @@ void handleDisplayBrightnessSet(Webserver* webserver) {
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 
     Logger::info(("Display brightness updated to " + String(configManager.getLCDBrightness()) + "%").c_str(), "API");
+}
+
+void handleDisplaySleepGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    doc["sleeping"] = DisplayManager::isSleeping();
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+void handleDisplaySleepSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Missing JSON body";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    JsonDocument ddoc;
+    const DeserializationError err = deserializeJson(ddoc, webserver->raw().arg("plain"));
+    if (err || !ddoc["on"].is<bool>()) {
+        JsonDocument doc;
+        doc["status"] = "error";
+        doc["message"] = "Invalid JSON or missing on";
+
+        String json;
+        serializeJson(doc, json);
+
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    const bool on = ddoc["on"].as<bool>();
+    const bool wasSleeping = DisplayManager::isSleeping();
+    if (on) {
+        DisplayManager::setSleeping(true);
+        AmbientLight::suspend();
+    } else if (wasSleeping) {
+        // 背光先恢复，氛围灯再恢复，最后让当前场景整屏 enter()。
+        DisplayManager::setSleeping(false);
+        AmbientLight::resume();
+        SceneManager::redrawCurrent();
+    }
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["sleeping"] = DisplayManager::isSleeping();
+
+    String json;
+    serializeJson(doc, json);
+
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 }
 
 /**

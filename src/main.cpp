@@ -225,12 +225,15 @@ void loop() {
         ntpClient->loop();
     }
 
-    // WS2812 氛围灯效果 tick（独立于显示场景）
-    AmbientLight::update();
+    // 休眠时停止场景与 WS2812 效果推进；Web/NTP/metrics/watchdog 仍必须运行。
+    if (!DisplayManager::isSleeping()) {
+        // WS2812 氛围灯效果 tick（独立于显示场景）
+        AmbientLight::update();
 
-    // 场景调度：仅驱动当前场景（sysinfo / balance / album / clock / live ...），
-    // 场景切换统一经 SceneManager::switchTo()（退场重绘）
-    SceneManager::update();
+        // 场景调度：仅驱动当前场景（sysinfo / balance / album / clock / live ...），
+        // 场景切换统一经 SceneManager::switchTo()（退场重绘）
+        SceneManager::update();
+    }
 
     if (METRICS_ENDPOINT[0] != '\0' && wifiManager != nullptr && WiFiManager::isConnected() &&
         !wifiManager->isApMode()) {

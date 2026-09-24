@@ -38,6 +38,8 @@ static constexpr uint32_t LCD_BEGIN_DELAY_MS = 10;
 static constexpr int16_t DISPLAY_PADDING = 10;
 static constexpr int16_t DISPLAY_INFO_Y = 100;
 
+static bool s_sleeping = false;
+
 static constexpr int WRAP_MAX_CHARS = 128;
 static constexpr int WRAP_MAX_LINE_SLOTS = 10;
 
@@ -223,6 +225,9 @@ void DisplayManager::setBacklight(uint8_t percent) {
     if (percent > 100) {
         percent = 100;
     }
+    if (s_sleeping) {
+        percent = 0;
+    }
 
     const uint8_t pin = static_cast<uint8_t>(LCD_BACKLIGHT_GPIO);
     pinMode(pin, OUTPUT);
@@ -248,6 +253,26 @@ void DisplayManager::setBacklight(uint8_t percent) {
 static inline void lcdBacklightOn() {
     DisplayManager::setBacklight(configManager.getLCDBrightness());
 }
+
+auto DisplayManager::setSleeping(bool sleeping) -> void {
+    if (s_sleeping == sleeping) {
+        return;
+    }
+
+    s_sleeping = sleeping;
+    if (s_sleeping) {
+        // 先把 framebuffer 留为黑色，再关反相背光；不触碰配置亮度。
+        DisplayManager::clearScreen();
+        DisplayManager::setBacklight(0);
+        Logger::info("Display sleep enabled", "DisplayManager");
+    } else {
+        // 先解除输出压暗，再由上层恢复灯光并整屏重绘。
+        lcdBacklightOn();
+        Logger::info("Display sleep disabled", "DisplayManager");
+    }
+}
+
+auto DisplayManager::isSleeping() -> bool { return s_sleeping; }
 
 /**
  * @brief Write a single command byte to the ST7789 via the data bus

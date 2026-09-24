@@ -37,6 +37,8 @@ class SceneManager {
     static auto addScene(Scene* scene) -> bool;
     static auto switchTo(const char* name, const char* param = nullptr) -> bool;
     static auto update() -> void;
+    /// 仅让当前场景重新 enter() 全量绘制，不改变场景指针或执行退场
+    static auto redrawCurrent() -> void;
 
     static auto current() -> Scene*;
     static auto currentName() -> const char*;

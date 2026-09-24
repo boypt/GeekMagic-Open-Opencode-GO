@@ -36,6 +36,9 @@ class AmbientLight {
    public:
     static void begin();
     static void update();
+    /// 休眠挂起/恢复：强制熄灭，但不修改任何持久化灯光配置
+    static void suspend();
+    static void resume();
     /// 按当前配置立即重算并写灯
     static void apply();
     /// 以下 setter 修改配置并立即生效（持久化由调用方 configManager.save()）

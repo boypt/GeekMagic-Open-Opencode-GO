@@ -40,6 +40,7 @@ static uint16_t s_phase = 0;  // 彩虹色相
 static uint32_t s_lastSentColor = 0;
 static bool s_lastSentColorValid = false;
 static bool s_forceShow = true;  // begin / 库状态变更后，下一帧必须重发
+static bool s_suspended = false;  // 休眠期间不推进效果，也不允许 API 重新点亮
 
 /// 余弦包络经近似 gamma 2.2 校正后的 Q12 曲线；正弦平方使 0/1 周期点斜率均为零
 /// 曲线左右对称，只存前半段，258B flash，换取暗段足够的定点精度
@@ -102,6 +103,11 @@ static auto clearColor() -> void {
 }
 
 auto AmbientLight::apply() -> void {
+    if (s_suspended) {
+        clearColor();
+        return;
+    }
+
     uint8_t r = 0;
     uint8_t g = 0;
     uint8_t b = 0;
@@ -146,7 +152,7 @@ auto AmbientLight::begin() -> void {
 }
 
 auto AmbientLight::update() -> void {
-    if (!configManager.getLedOn() || configManager.getLedMode() == 0) {
+    if (s_suspended || !configManager.getLedOn() || configManager.getLedMode() == 0) {
         return;
     }
 
@@ -161,6 +167,27 @@ auto AmbientLight::update() -> void {
     }
     // 呼吸相位在 apply() 中按 millis() 求值，漏掉的 tick 会在下一帧直接补上
 
+    apply();
+}
+
+auto AmbientLight::suspend() -> void {
+    if (s_suspended) {
+        return;
+    }
+    s_suspended = true;
+    // 不改 configManager：led_on/mode/color/brightness 仍代表用户配置。
+    clearColor();
+}
+
+auto AmbientLight::resume() -> void {
+    if (!s_suspended) {
+        return;
+    }
+    s_suspended = false;
+    s_lastTickMs = millis();
+    s_breathPhaseStartMs = s_lastTickMs;
+    s_phase = 0;
+    s_forceShow = true;
     apply();
 }
 

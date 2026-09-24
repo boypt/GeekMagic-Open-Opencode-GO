@@ -79,6 +79,14 @@
             <button
               type="button"
               class="secondary"
+              @click="switchScene('stock')"
+              x-bind:disabled="loading"
+            >
+              Stock
+            </button>
+            <button
+              type="button"
+              class="secondary"
               @click="switchScene('sysinfo')"
               x-bind:disabled="loading"
             >

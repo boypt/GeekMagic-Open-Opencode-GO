@@ -36,6 +36,7 @@
 #include "ntp/NTPClient.h"
 #include "boot/RescueMode.h"
 #include "dashboard/DashboardManager.h"
+#include "opencodego/StockData.h"
 #include "opencodego/UsageManager.h"
 #include <array>
 
@@ -194,6 +195,7 @@ void setup() {
     }
 
     UsageManager::begin();
+    StockData::begin();  // 股票场景缓冲：数据全由上位机推送，启动时为空
 
     // WS2812 氛围灯（GPIO12）
     AmbientLight::begin();

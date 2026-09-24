@@ -31,6 +31,7 @@
 #include "wireless/WiFiManager.h"
 #include "config/ConfigManager.h"
 #include "ntp/NTPClient.h"
+#include "opencodego/StockData.h"
 #include "project_version.h"
 #include <time.h>
 
@@ -259,6 +260,229 @@ class SystemInfoScene : public Scene {
     }
 };
 
+// ---------- stock：推送的股票行情 ----------
+// 固定五个槽位让 1~5 行的切换不跳动；数据变化只擦写行带，不触碰整屏。
+class StockScene : public Scene {
+   public:
+    auto name() const -> const char* override { return "stock"; }
+
+    auto enter(const char* param) -> bool override {
+        (void)param;
+        m_count = StockData::rowCount();
+        for (uint8_t i = 0; i < StockData::MAX_ROWS; ++i) {
+            if (i < m_count && StockData::getRow(i, &m_rows[i])) {
+                m_saved[i] = m_rows[i];
+            } else {
+                m_rows[i].name[0] = '\0';
+                m_saved[i].change = 0.0F;
+            }
+        }
+        m_lastUpdated = StockData::updatedAtMs();
+        m_count = m_count > StockData::MAX_ROWS ? StockData::MAX_ROWS : m_count;
+
+        DisplayManager::clearScreen();
+        drawTitle();
+        drawRows();
+        drawClock(true, true);
+        return true;
+    }
+
+    auto update() -> void override {
+        // 时间戳变了才读取定长缓冲；相同 payload 不重绘，避免无意义的 SPI 传输。
+        const uint32_t updated = StockData::updatedAtMs();
+        if (updated != m_lastUpdated) {
+            m_lastUpdated = updated;
+            const uint8_t count = StockData::rowCount();
+            StockData::Row candidate[StockData::MAX_ROWS]{};
+            bool changed = count != m_count;
+            for (uint8_t i = 0; i < count && i < StockData::MAX_ROWS; ++i) {
+                if (!StockData::getRow(i, &candidate[i])) {
+                    changed = true;
+                    continue;
+                }
+                if (i >= m_count || strcmp(candidate[i].name, m_saved[i].name) != 0 ||
+                    candidate[i].change != m_saved[i].change) {
+                    changed = true;
+                }
+            }
+            if (changed) {
+                m_count = count > StockData::MAX_ROWS ? StockData::MAX_ROWS : count;
+                for (uint8_t i = 0; i < StockData::MAX_ROWS; ++i) {
+                    m_saved[i] = i < m_count ? candidate[i] : StockData::Row{};
+                    strlcpy(m_rows[i].name, m_saved[i].name, sizeof(m_rows[i].name));
+                }
+                drawRows();
+            }
+        }
+
+        const time_t now = time(nullptr) + 8 * 3600;
+        const int minute = static_cast<int>((now / 60) % 1440);
+        const int second = static_cast<int>(now % 60);
+        if (second != m_lastSecond) {
+            // 平时只擦写 SS 两个字符（36px）；分钟跳变时补写 HH:MM。
+            drawClock(minute != m_lastMinute, false);
+        }
+    }
+
+    auto exit() -> void override {}
+
+   private:
+    static constexpr uint16_t C_BG = rgb565(0x00, 0x00, 0x00);
+    static constexpr uint16_t C_SUB = rgb565(0x8A, 0x94, 0xB8);
+    static constexpr uint16_t C_WHITE = rgb565(0xFF, 0xFF, 0xFF);
+    static constexpr uint16_t C_UP = rgb565(0xFF, 0x00, 0x00);
+    static constexpr uint16_t C_DOWN = rgb565(0x00, 0xFF, 0x00);
+    static constexpr uint16_t C_NEUTRAL = rgb565(0x8A, 0x94, 0xB8);
+    static constexpr int16_t ROW_Y = 50;
+    static constexpr uint8_t ROW_STEP = 27;
+    static constexpr int16_t CLOCK_Y = 204;
+    static constexpr int16_t NAME_X = 4;
+    static constexpr int16_t VALUE_RIGHT = 236;
+    static constexpr int8_t NAME_GAP = 4;
+
+    StockData::Row m_rows[StockData::MAX_ROWS]{};
+    StockData::Row m_saved[StockData::MAX_ROWS]{};
+    uint8_t m_count = 0;
+    uint32_t m_lastUpdated = 0;
+    int m_lastMinute = -1;
+    int m_lastSecond = -1;
+
+    static auto formatChange(float change, char* out, size_t size) -> void {
+        (void)size;
+        // 先转百分位整数，避免把浮点 printf 及其格式化库带进 ESP8266 固件。
+        int32_t cents = static_cast<int32_t>(change * 100.0F + (change >= 0.0F ? 0.5F : -0.5F));
+        if (cents < 0) {
+            out[0] = '-';
+            cents = -cents;
+        } else {
+            out[0] = '+';
+        }
+        uint32_t whole = static_cast<uint32_t>(cents) / 100U;
+        const uint8_t fraction = static_cast<uint8_t>(static_cast<uint32_t>(cents) % 100U);
+        // 上界留足：接口允许 |change| ≤ 100000，输出形如 "+100000.00%" 共 12 字符 + NUL。
+        char digits[10];
+        uint8_t digitCount = 0;
+        do {
+            digits[digitCount++] = static_cast<char>('0' + whole % 10U);
+            whole /= 10U;
+        } while (whole != 0U);
+        size_t pos = 1;
+        while (digitCount != 0U) {
+            out[pos++] = digits[--digitCount];
+        }
+        out[pos++] = '.';
+        out[pos++] = static_cast<char>('0' + fraction / 10U);
+        out[pos++] = static_cast<char>('0' + fraction % 10U);
+        out[pos++] = '%';
+        out[pos] = '\0';
+    }
+
+    auto drawTitle() -> void {
+        auto* gfx = DisplayManager::getGfx();
+        gfx->setTextSize(2);
+        gfx->setTextColor(C_WHITE);
+        gfx->setCursor(120 - textWidthPx("STOCK", 2) / 2, 16);
+        gfx->print("STOCK");
+    }
+
+    auto drawRows() -> void {
+        auto* gfx = DisplayManager::getGfx();
+        // 字号 2 的字高为 16px；27px 行距给每行保留 11px 的呼吸空间。
+        // 擦除带在 47~179，时钟擦除带从 202 开始，中间保留 22px 安全间隔。
+        gfx->fillRect(0, ROW_Y - 3, 240, 5 * ROW_STEP - 2, C_BG);
+        if (m_count == 0) {
+            gfx->setTextSize(2);
+            gfx->setTextColor(C_SUB);
+            gfx->setCursor(120 - textWidthPx("NO DATA", 2) / 2, 90);
+            gfx->print("NO DATA");
+            gfx->setTextSize(1);
+            gfx->setTextColor(C_WHITE);
+            gfx->setCursor(120 - textWidthPx("PUSH VIA API", 1) / 2, 116);
+            gfx->print("PUSH VIA API");
+            return;
+        }
+
+        char value[16];
+        for (uint8_t i = 0; i < StockData::MAX_ROWS; ++i) {
+            const int16_t y = ROW_Y + i * ROW_STEP;
+            gfx->setTextSize(2);
+            if (i >= m_count) {
+                gfx->setTextColor(C_SUB);
+                gfx->setCursor(NAME_X, y);
+                gfx->print("--");
+                continue;
+            }
+
+            formatChange(m_rows[i].change, value, sizeof(value));
+            const int valueWidth = textWidthPx(value, 2);
+            const int valueX = VALUE_RIGHT - valueWidth;
+            const size_t nameLength = strlen(m_rows[i].name);
+            // 极端的 9 字符名称 + "+100000.00%" 原本需要 252px，必须让名称
+            // 退让而不是让两段文字重叠；用 ASCII ~ 标记被截断的末尾。
+            const int maxNameChars = (valueX - NAME_GAP - NAME_X) / 12;
+            char nameText[StockData::NAME_MAX];
+            int shownNameChars = static_cast<int>(nameLength);
+            if (shownNameChars > maxNameChars) {
+                shownNameChars = maxNameChars > 0 ? maxNameChars - 1 : 0;
+                for (int n = 0; n < shownNameChars; ++n) {
+                    nameText[n] = m_rows[i].name[n];
+                }
+                if (shownNameChars > 0) {
+                    nameText[shownNameChars++] = '~';
+                }
+                nameText[shownNameChars] = '\0';
+            } else {
+                strlcpy(nameText, m_rows[i].name, sizeof(nameText));
+            }
+
+            gfx->setTextColor(C_WHITE);
+            gfx->setCursor(NAME_X, y);
+            gfx->print(nameText);
+            gfx->setTextColor(m_rows[i].change > 0.0F ? C_UP :
+                               (m_rows[i].change < 0.0F ? C_DOWN : C_NEUTRAL));
+            gfx->setCursor(valueX, y);
+            gfx->print(value);
+        }
+    }
+
+    auto drawClock(bool minuteChanged, bool fullRedraw) -> void {
+        const time_t now = time(nullptr) + 8 * 3600;
+        struct tm localTime;
+        gmtime_r(&now, &localTime);
+        m_lastMinute = static_cast<int>((now / 60) % 1440);
+        m_lastSecond = static_cast<int>(now % 60);
+
+        auto* gfx = DisplayManager::getGfx();
+        gfx->setTextSize(3);
+        gfx->setTextColor(C_WHITE);
+        const int16_t clockX = 120 - textWidthPx("00:00:00", 3) / 2;
+        const int16_t minuteWidth = textWidthPx("00:00:", 3);
+        const int16_t secondX = clockX + minuteWidth;
+        const int16_t secondWidth = textWidthPx("00", 3);
+        if (fullRedraw) {
+            gfx->fillRect(0, CLOCK_Y - 2, 240, 28, C_BG);
+        }
+        if (fullRedraw || minuteChanged) {
+            // 分钟跳变时整条擦除不会执行，必须先擦掉本区域再画，否则新旧分钟
+            // 数字直接叠在一起（14:37 → 14:38 会看到 7 与 8 重影）。
+            if (!fullRedraw) {
+                gfx->fillRect(clockX, CLOCK_Y - 2, minuteWidth, 28, C_BG);
+            }
+            gfx->setCursor(clockX, CLOCK_Y);
+            char minuteText[8];
+            strftime(minuteText, sizeof(minuteText), "%H:%M:", &localTime);
+            gfx->print(minuteText);
+        }
+        // 仅擦写秒字段，避免每秒把整条时钟或屏幕重新推送到 SPI。
+        // 高度与全量路径一致，避免字号下沿残留上一秒字形。
+        gfx->fillRect(secondX, CLOCK_Y - 2, secondWidth, 28, C_BG);
+        char secondText[3];
+        strftime(secondText, sizeof(secondText), "%S", &localTime);
+        gfx->setCursor(secondX, CLOCK_Y);
+        gfx->print(secondText);
+    }
+};
+
 // ---------- balance：额度 + 时钟主页面 ----------
 class BalanceScene : public Scene {
    public:
@@ -452,6 +676,7 @@ class ClockScene : public Scene {
 static SystemInfoScene s_sysInfoScene;
 static BalanceScene s_balanceScene;
 static AlbumScene s_albumScene;
+static StockScene s_stockScene;
 
 // ---------- live：实时推图 ----------
 // POST /api/v1/album/live 流式推送 240x240 RGB565 帧，边收边绘、不落盘；
@@ -481,6 +706,7 @@ auto registerBuiltinScenes() -> void {
     SceneManager::addScene(&s_sysInfoScene);
     SceneManager::addScene(&s_balanceScene);
     SceneManager::addScene(&s_albumScene);
+    SceneManager::addScene(&s_stockScene);
     SceneManager::addScene(&s_clockScene);
     SceneManager::addScene(&s_liveScene);
 }

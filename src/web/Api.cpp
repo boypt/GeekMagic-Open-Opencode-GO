@@ -22,6 +22,7 @@
 #include <ArduinoJson.h>
 #include <Updater.h>
 #include <LittleFS.h>
+#include <math.h>
 
 #include "web/Webserver.h"
 #include "web/Api.h"
@@ -38,6 +39,7 @@ static constexpr size_t ALBUM_IMG_BYTES = 240UL * 240UL * 2UL;
 #include "wireless/WiFiManager.h"
 #include "ntp/NTPClient.h"
 #include "opencodego/UsageManager.h"
+#include "opencodego/StockData.h"
 
 extern ConfigManager configManager;
 extern WiFiManager* wifiManager;
@@ -71,6 +73,8 @@ void handleDisplayMirrorSet(Webserver* webserver);
 void handleDisplayBrightnessGet(Webserver* webserver);
 void handleDisplayBrightnessSet(Webserver* webserver);
 void handleDeleteGif(Webserver* webserver);
+static void handleStockGet(Webserver* webserver);
+static void handleStockSet(Webserver* webserver);
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr size_t NTP_CONFIG_DOC_SIZE = 512;
 static constexpr int BEARER_LEN = 7;
@@ -231,6 +235,16 @@ void registerApiEndpoints(Webserver* webserver) {
     // example={"lines":["5H 42%","WK 61%","MO 33%"],"status":"SYNC OK"}
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/balance", HTTP_POST, [webserver]() { handleBalanceSet(webserver); });
+
+    // @openapi {get} /stock version=v1 group=Stock summary="Get latest pushed stock rows" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/stock", HTTP_GET, [webserver]() { handleStockGet(webserver); });
+
+    // @openapi {post} /stock version=v1 group=Stock summary="Push stock rows from host" requiresAuth=true
+    // requestBody=application/json requestBodySchema=rows:array
+    // example={"rows":[{"name":"600519","change":1.23},{"name":"AAPL","change":-0.85}]}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/stock", HTTP_POST, [webserver]() { handleStockSet(webserver); });
 
 
     webserver->raw().onNotFound([webserver]() {
@@ -2292,4 +2306,142 @@ void handleBalanceGet(Webserver* webserver) {
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 }
 
+static constexpr size_t STOCK_BODY_MAX = 1024;
+
+static void sendStockError(Webserver* webserver, int code, const char* message) {
+    JsonDocument doc;
+    doc["status"] = "error";
+    doc["message"] = message;
+
+    char json[128];
+    serializeJson(doc, json, sizeof(json));
+    setCorsHeaders(webserver);
+    webserver->raw().send(code, "application/json", json);
+}
+
+static void handleStockGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    JsonArray rows = doc["rows"].to<JsonArray>();
+    for (uint8_t i = 0; i < StockData::rowCount(); i++) {
+        StockData::Row row;
+        if (!StockData::getRow(i, &row)) {
+            continue;
+        }
+
+        JsonObject rowJson = rows.add<JsonObject>();
+        rowJson["name"] = row.name;
+        rowJson["change"] = row.change;
+    }
+    doc["ts"] = static_cast<unsigned long>(StockData::updatedAtMs());
+    doc["age_s"] = static_cast<unsigned long>(StockData::ageSeconds());
+
+    char json[512];
+    serializeJson(doc, json, sizeof(json));
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+static void handleStockSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "Missing JSON body");
+        return;
+    }
+
+    const String& body = webserver->raw().arg("plain");
+    if (body.length() >= STOCK_BODY_MAX) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "body too large (max 1023 bytes)");
+        return;
+    }
+
+    JsonDocument ddoc;
+    DeserializationError err = deserializeJson(ddoc, body);
+    if (err) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "Invalid JSON");
+        return;
+    }
+
+    if (!ddoc["rows"].is<JsonArray>()) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows must be an array of 0..5 objects");
+        return;
+    }
+
+    JsonArray inputRows = ddoc["rows"].as<JsonArray>();
+    if (inputRows.size() > StockData::MAX_ROWS) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows must contain at most 5 objects");
+        return;
+    }
+
+    StockData::Row rows[StockData::MAX_ROWS] = {};
+    uint8_t rowCount = static_cast<uint8_t>(inputRows.size());
+    for (uint8_t i = 0; i < rowCount; i++) {
+        // 用 as<JsonObjectConst>() + isNull() 判定元素类型：is<JsonObject>() 作用在
+        // JsonVariantConst 上会因 ArduinoJson 版本差异把真实对象判为非对象（→ 400）。
+        JsonObjectConst inputRow = inputRows[i].as<JsonObjectConst>();
+        if (inputRow.isNull()) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "each row must be an object");
+            return;
+        }
+        if (!inputRow["name"].is<const char*>()) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "row name must be a string");
+            return;
+        }
+
+        const char* name = inputRow["name"].as<const char*>();
+        const size_t nameLength = name == nullptr ? 0 : strlen(name);
+        if (nameLength < 1 || nameLength >= StockData::NAME_MAX) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "row name must be 1..9 printable ASCII bytes");
+            return;
+        }
+        for (size_t j = 0; j < nameLength; j++) {
+            const unsigned char ch = static_cast<unsigned char>(name[j]);
+            if (ch < 0x20 || ch > 0x7E) {
+                sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "row name must be 1..9 printable ASCII bytes");
+                return;
+            }
+        }
+
+        JsonVariantConst changeValue = inputRow["change"];
+        if (!changeValue.is<int>() && !changeValue.is<float>() && !changeValue.is<double>()) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "row change must be a finite number");
+            return;
+        }
+
+        const float change = changeValue.as<float>();
+        if (!isfinite(change) || change < -100000.0f || change > 100000.0f) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "row change must be finite and within -100000..100000");
+            return;
+        }
+
+        memcpy(rows[i].name, name, nameLength);
+        rows[i].name[nameLength] = '\0';
+        rows[i].change = change;
+    }
+
+    if (rowCount == 0) {
+        StockData::clear();
+    } else if (!StockData::setRows(rows, rowCount)) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "invalid stock rows");
+        return;
+    }
+
+    DisplayManager::requestFullRedraw();
+    if (strcmp(SceneManager::currentName(), "stock") != 0) {
+        SceneManager::switchTo("stock");
+    }
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    char json[32];
+    serializeJson(doc, json, sizeof(json));
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
 

@@ -72,6 +72,16 @@ static constexpr int TM_YEAR_BASE = 1900;
 NTPClient::NTPClient() = default;
 
 /**
+ * @brief 生效的 NTP 服务器：配置值优先，配置为空时回退默认池
+ *
+ * @return 服务器主机名（恒非空）
+ */
+auto NTPClient::effectiveServer() -> const char* {
+    const char* srv = configManager.getNtpServer();
+    return (srv != nullptr && srv[0] != '\0') ? srv : DEFAULT_NTP_SERVER1;
+}
+
+/**
  * @brief Initialize the NTP client
  * @param syncIntervalSeconds Sync interval in seconds (default: 6 hours)
  * @param maxRetries Maximum number of retries on failure (default: 3)
@@ -139,7 +149,7 @@ void NTPClient::performSync() {
     while (attempt < _maxRetries) {
         attempt++;
         const char* srv = configManager.getNtpServer();
-        const char* server1 = (srv != nullptr && srv[0] != '\0') ? srv : DEFAULT_NTP_SERVER1;
+        const char* server1 = effectiveServer();
         const char* server2 = (srv != nullptr && srv[0] != '\0') ? DEFAULT_NTP_SERVER1 : nullptr;
 
         if (server2 != nullptr) {

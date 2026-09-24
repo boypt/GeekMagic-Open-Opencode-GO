@@ -20,7 +20,7 @@
 #ifndef INCLUDE_DISPLAY_SCENES_H
 #define INCLUDE_DISPLAY_SCENES_H
 
-/// 注册内置场景（startup / balance / gif），供 main 启动时调用一次
+/// 注册内置场景（sysinfo / balance / album / clock / live），供 main 启动时调用一次
 auto registerBuiltinScenes() -> void;
 
 #endif  // INCLUDE_DISPLAY_SCENES_H

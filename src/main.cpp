@@ -183,10 +183,11 @@ void setup() {
 
     delay(LOADING_DELAY_MS);
 
-    // 场景系统接管显示面：开机先显示 IP 画面（startup 场景），
-    // 展示片刻后自动进入 balance；后续切换统一走 SceneManager（退场重绘契约）
+    // 场景系统接管显示面：开机落在 System Info 场景（设备地址 / WiFi / NTP 等
+    // 配置信息 + 底部时钟），停留至用户切换或上位机推送接管 balance；
+    // 切换一律走 SceneManager（退场重绘契约）
     registerBuiltinScenes();
-    SceneManager::switchTo("startup");
+    SceneManager::switchTo("sysinfo");
 
     if (METRICS_ENDPOINT[0] != '\0' && WiFiManager::isConnected() && !wifiManager->isApMode()) {
         DashboardManager::begin(METRICS_ENDPOINT);
@@ -225,7 +226,7 @@ void loop() {
     // WS2812 氛围灯效果 tick（独立于显示场景）
     AmbientLight::update();
 
-    // 场景调度：仅驱动当前场景（startup / balance / album ...），
+    // 场景调度：仅驱动当前场景（sysinfo / balance / album / clock / live ...），
     // 场景切换统一经 SceneManager::switchTo()（退场重绘）
     SceneManager::update();
 

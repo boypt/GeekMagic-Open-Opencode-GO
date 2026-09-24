@@ -42,7 +42,6 @@ class DisplayManager {
     static void applyPanelProfile();
     static void requestFullRedraw();
     static bool consumeFullRedrawRequest();
-    static void drawStartup(String currentIP);
     static void drawTextWrapped(int16_t xPos, int16_t yPos, const String& text, uint8_t textSize, uint16_t fgColor,
                                 uint16_t bgColor, bool clearBg);
     static void drawLoadingBar(float progress, int yPos = 180, int barWidth = 200, int barHeight = 20,

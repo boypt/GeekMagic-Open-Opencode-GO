@@ -48,7 +48,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
 | `include/display/Scene.h` + `src/display/SceneManager.cpp` | 场景接口 + 调度器：显示面唯一切换入口 `switchTo()`（退场重绘契约：旧场景 exit 禁画/释放，新场景 enter 全量绘制；失败回滚重绘上一场景） |
-| `src/display/Scenes.cpp` | 内置场景：`startup`（开机 IP 画面）/ `balance`（额度+时钟）/ `album`（静态相册：param=文件名常驻单张、空=循环轮播 5s/张）/ `live`（实时推图：API 流式直绘、不落盘、常驻最后一帧）。场景切换一律 `switchTo`；**唯二例外是推送自动接管**：`live` 推图 → live，额度推送 → balance |
+| `src/display/Scenes.cpp` | 内置场景：`sysinfo`（系统信息：IP / WiFi SSID+RSSI / NTP 服务器+同步状态 / 芯片 ID / 运行时长 / 剩余堆 / 显示配置 / 固件版本 + 底部 UTC+8 时钟；**开机落点**，取代原 startup IP 画面；值变化时只擦写对应单行）/ `balance`（额度+时钟）/ `album`（静态相册：param=文件名常驻单张、空=循环轮播 5s/张）/ `clock`（纯时钟页）/ `live`（实时推图：API 流式直绘、不落盘、常驻最后一帧）。场景切换一律 `switchTo`；**唯二例外是推送自动接管**：`live` 推图 → live，额度推送 → balance |
 | `src/display/Scenes.cpp`（AlbumScene/LiveScene） | 相册图片 = `/album/<name>.rgb565`（240x240 RGB565(LE) 115200B，Web 端 canvas 转换上传，jpg/png 等任意源图）；`POST /album/live` 同格式流式推帧（480B 行缓冲逐行直绘、不保存），推送时若不在 live 场景则自动接管屏幕 |
 | `src/config/ConfigManager.cpp` | `config.json`（LittleFS）+ SecureStorage（EEPROM NVS）双层配置 |
 | `src/boot/RescueMode.cpp` | boot-loop 保护（见"已知坑"） |
@@ -77,7 +77,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 1. **ESP8266 IROM 只支持 32-bit 对齐访问**：直接 `*(const uint8_t*)` 读 flash 常量会 `Exception (3)` LoadStoreError（excvaddr=符号地址）。必须走 `pgm_read_byte/word`，并保持 `-DNON32XFER_HANDLER` 兜底。u8g2 的裸指针解引用靠 `IromAccess.h` 重定义宏修正。
 2. **rescue 误触发**：每次刷机/手动复位都算一次启动，旧阈值 3 太敏感。现已：阈值 10 + **只统计崩溃类复位**（Exception/Fatal/Watchdog），`External System`/`Power On`/`Software/System restart` 直接清零计数。若再进 rescue：连 AP 后 `curl -X POST http://192.168.4.1/api/v1/rescue/reset` 再 `/rescue/reboot`。
-3. **显示设置后屏幕残留启动屏**：`DisplayManager::setRotation()/applyPanelProfile()` 不得画启动屏（会覆盖主页面且 `mainPageDrawn` 不回退）；改完必须 `requestFullRedraw()`，由 `UsageManager::update()` 重画。
+3. **显示设置后屏幕残留开机画面**：`DisplayManager::setRotation()/applyPanelProfile()` 不得画开机画面（会覆盖主页面且 `mainPageDrawn` 不回退）；改完必须 `requestFullRedraw()`，由 `UsageManager::update()` 重画。原生启动画面（`drawStartup`：红绿蓝闪烁 + 色块 + IP）已随 `sysinfo` 场景删除。
 4. **Web 静态资源缓存 24h**（`max-age=86400`）：改了网页/JS 后浏览器要硬刷新（Ctrl+Shift+R）才生效。图像处理遵循「CDN 引库」策略（零设备空间）：`jpeg-js`（JS 解码 JPEG，浏览器内建解码对 CMYK/YCCK JPG 反色）+ `cropperjs`（画布裁剪缩放控件），均为 jsDelivr/esm.sh 动态或标签引用，离线/内网需自建镜像。
 5. **刷文件系统覆盖设备 config.json**（见"配置系统"）。同理也会**清空设备上的 `/album` 相册库**（相册图只存在设备上，不在 `data/` 里）——`uploadfs` 前提醒用户重传图片，或先用 `GET /api/v1/album` + 逐个下载备份（无下载接口，重要图请留原图）。
 6. 上传时报 `Invalid head of packet`：重试即可；报 PermissionError：先关掉占用串口的 monitor。
@@ -85,6 +85,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 8. **Alpine `x-if` 里的元素在条件为真前不在 DOM**：`$refs.xxx` 取到 `undefined`（症状 `TypeError: Cannot set properties of undefined (setting 'src')`）。必须先置条件 + `await this.$nextTick()` 再取 ref（相册单图裁剪上传曾因此全挂）。要 ref 恒在用 `x-show`。
 9. **GIF→相册重构的路径残留**：删除接口曾写死 `/gif/` 前缀，文件实际在 `/album/`，删除必 404 `file not found`。改存储目录/前缀时全仓 grep 旧前缀对齐（上传/列表/删除/场景四处）。
 10. **勿在设备端重新引入出站 TLS**：BearSSL/`WiFiClientSecure`/CA 校验/MFLN 等组件已整体移除（Flash 从 ~59% 降到 ~46%），历史坑（CA 解析 OOM、低堆 abort 重启、MFLN 512 档被拒、握手 15s）都随移除消失；上游 HTTPS 归上位机脚本。
+11. **LCD 上屏文案必须 ASCII**：Arduino_GFX 内建 6px 字体只覆盖 ASCII，固件里没有任何 CJK 字模（现有界面文案全是英文即因此）。给 LCD 文本写中文会取到字表越界字形（乱码，甚至读越界）——中文只出现在 Web 页（浏览器自带字体）。
 
 ## 验证工作流
 

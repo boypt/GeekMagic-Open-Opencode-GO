@@ -759,46 +759,6 @@ auto DisplayManager::consumeFullRedrawRequest() -> bool {
 }
 
 /**
- * @brief Draw the startup screen on the LCD
- *
- * @return void
- */
-auto DisplayManager::drawStartup(String currentIP) -> void {
-    int constexpr rgbDelayMs = 1000;
-
-    g_lcd.fillScreen(LCD_RED);
-    delay(rgbDelayMs);
-    g_lcd.fillScreen(LCD_GREEN);
-    delay(rgbDelayMs);
-    g_lcd.fillScreen(LCD_BLUE);
-    delay(rgbDelayMs);
-
-    g_lcd.fillScreen(LCD_BLACK);
-
-    int constexpr titleY = 10;
-    int constexpr fontSize = 2;
-
-    DisplayManager::drawTextWrapped(DISPLAY_PADDING, titleY, "GeekMagic Open Firmware", fontSize, LCD_WHITE, LCD_BLACK,
-                                    false);
-    DisplayManager::drawTextWrapped(DISPLAY_PADDING, titleY + THREE_LINES_SPACE, String(PROJECT_VER_STR), fontSize,
-                                    LCD_WHITE, LCD_BLACK, false);
-    DisplayManager::drawTextWrapped(DISPLAY_PADDING, (titleY + THREE_LINES_SPACE + TWO_LINES_SPACE), "IP: " + currentIP,
-                                    fontSize, LCD_WHITE, LCD_BLACK, false);
-
-    const int16_t box = 40;
-    const int16_t gap = 20;
-    const int16_t boxY = titleY + (THREE_LINES_SPACE * 2) + ONE_LINE_SPACE;
-
-    g_lcd.fillRect(DISPLAY_PADDING, boxY, box, box, LCD_RED);
-    g_lcd.fillRect((int16_t)(DISPLAY_PADDING + box + gap), boxY, box, box, LCD_GREEN);
-    g_lcd.fillRect((int16_t)(DISPLAY_PADDING + (box + gap) * 2), boxY, box, box, LCD_BLUE);
-
-    yield();
-
-    Logger::info("Startup screen drawn", "DisplayManager");
-}
-
-/**
  * @brief Draw text on the display with simple word-wrapping
  *
  * @param x Starting X coordinate in pixels

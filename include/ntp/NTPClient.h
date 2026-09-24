@@ -29,6 +29,9 @@ class NTPClient {
     void loop();
     bool syncNow();
 
+    // 生效的 NTP 服务器：配置为空时回退默认池（供 sysinfo 场景显示真实地址）
+    static auto effectiveServer() -> const char*;
+
     bool lastSyncOk() const;
     time_t lastSyncTime() const;
     String lastStatus() const;

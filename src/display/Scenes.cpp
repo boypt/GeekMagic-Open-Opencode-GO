@@ -29,26 +29,223 @@
 #include "display/SceneManager.h"
 #include "opencodego/UsageManager.h"
 #include "wireless/WiFiManager.h"
+#include "config/ConfigManager.h"
+#include "ntp/NTPClient.h"
+#include "project_version.h"
+#include <time.h>
 
 extern WiFiManager* wifiManager;
+extern ConfigManager configManager;
 
-// ---------- startup：开机 IP 画面 ----------
-// 纯手动场景：不再自动跳转（全手工切换策略），停留至用户切换
-class StartupScene : public Scene {
+static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
+    return static_cast<uint16_t>(((r & 0xF8U) << 8) | ((g & 0xFCU) << 3) | (b >> 3));
+}
+
+// Arduino_GFX 的内建 6px 字体没有测量 API，按其实际字宽做像素级截断。
+static auto textWidthPx(const char* text, uint8_t textSize) -> int {
+    return text == nullptr ? 0 : static_cast<int>(strlen(text)) * 6 * textSize;
+}
+
+// ---------- sysinfo：系统信息 + UTC+8 时钟 ----------
+// LCD 内建字体只含 ASCII（固件无 CJK 字模），故所有标签走英文；
+// enter() 全量绘制；update() 只擦写「值发生变化」的单行小区域（IP/NTP/运行时长/剩余堆）
+// 与分钟变化的时钟区域，绝不整屏重绘，避免闪屏。
+class SystemInfoScene : public Scene {
    public:
-    auto name() const -> const char* override { return "startup"; }
+    auto name() const -> const char* override { return "sysinfo"; }
 
     auto enter(const char* param) -> bool override {
         (void)param;
-        const String ip = (wifiManager != nullptr) ? wifiManager->getIP().toString() : String("--");
-        DisplayManager::drawStartup(ip);
+        m_lastMinute = -1;
+        m_lastDay = -1;
+        m_ntpSynced = ntpSyncedNow();
+        readDeviceAddress(m_deviceAddress, sizeof(m_deviceAddress));
+        readUptime(m_uptimeValue, sizeof(m_uptimeValue));
+        readHeap(m_heapValue, sizeof(m_heapValue));
+        char ntpStatus[64];
+        ntpStatusText(ntpStatus, sizeof(ntpStatus));
+        DisplayManager::clearScreen();
+
+        drawLineChars("IP", m_deviceAddress, 8);
+        drawLine("WIFI", wifiValue(), 25);
+        drawLineChars("NTP", ntpStatus, 42);
+        drawLine("CHIP", String(ESP.getChipId()), 59);
+        drawLineChars("UPTIME", m_uptimeValue, 76);
+        drawLineChars("HEAP", m_heapValue, 93);
+        drawLine("DISPLAY", displayValue(), 110);
+        drawLine("VERSION", PROJECT_VER_STR, 127);
+
+        drawDate();
+        drawClock(true);
 
         return true;
     }
 
-    auto update() -> void override {}
+    auto update() -> void override {
+        char address[32];
+        readDeviceAddress(address, sizeof(address));
+        if (strcmp(address, m_deviceAddress) != 0) {
+            strlcpy(m_deviceAddress, address, sizeof(m_deviceAddress));
+            drawLineChars("IP", m_deviceAddress, 8);
+        }
+
+        const bool ntpSynced = ntpSyncedNow();
+        if (ntpSynced != m_ntpSynced) {
+            m_ntpSynced = ntpSynced;
+            char status[64];
+            ntpStatusText(status, sizeof(status));
+            drawLineChars("NTP", status, 42);
+        }
+
+        char uptime[16];
+        readUptime(uptime, sizeof(uptime));
+        if (strcmp(uptime, m_uptimeValue) != 0) {
+            strlcpy(m_uptimeValue, uptime, sizeof(m_uptimeValue));
+            drawLineChars("UPTIME", m_uptimeValue, 76);
+        }
+
+        char heap[16];
+        readHeap(heap, sizeof(heap));
+        if (strcmp(heap, m_heapValue) != 0) {
+            strlcpy(m_heapValue, heap, sizeof(m_heapValue));
+            drawLineChars("HEAP", m_heapValue, 93);
+        }
+
+        const time_t now = time(nullptr) + 8 * 3600;
+        // 日期行也要随校时刷新：开机入场时 NTP 可能未同步（会先画成 1970），同步后立即纠正
+        if (static_cast<int>(now / 86400) != m_lastDay) {
+            drawDate();
+        }
+        const int minute = static_cast<int>((now / 60) % 1440);
+        if (minute != m_lastMinute) {
+            drawClock(false);
+        }
+    }
 
     auto exit() -> void override {}
+
+   private:
+    static constexpr uint16_t C_BG = rgb565(0x00, 0x00, 0x00);
+    static constexpr uint16_t C_SUB = rgb565(0x8A, 0x94, 0xB8);
+    static constexpr uint16_t C_WHITE = rgb565(0xFF, 0xFF, 0xFF);
+    static constexpr uint16_t C_ACCENT = rgb565(0x4D, 0x6B, 0xFE);
+    static constexpr int16_t VALUE_X = 80;
+    static constexpr int16_t VALUE_MAX_W = 151;
+    static constexpr int16_t CLOCK_Y = 181;
+
+    int m_lastMinute = -1;
+    int m_lastDay = -1;
+    bool m_ntpSynced = false;
+    char m_deviceAddress[32] = {0};
+    char m_uptimeValue[16] = {0};
+    char m_heapValue[16] = {0};
+
+    static auto ntpSyncedNow() -> bool { return time(nullptr) > 1600000000; }
+
+    static auto readDeviceAddress(char* output, size_t outputSize) -> void {
+        if (wifiManager == nullptr) {
+            strlcpy(output, "--", outputSize);
+            return;
+        }
+
+        const IPAddress ip = wifiManager->getIP();
+        snprintf(output, outputSize, "%u.%u.%u.%u%s", ip[0], ip[1], ip[2], ip[3],
+                 wifiManager->isApMode() ? " (AP)" : "");
+    }
+
+    static auto ntpStatusText(char* output, size_t outputSize) -> void {
+        const char* server = NTPClient::effectiveServer();
+        if (server == nullptr || server[0] == '\0') {
+            server = "--";
+        }
+        snprintf(output, outputSize, "%s / %s", server, ntpSyncedNow() ? "SYNCED" : "NOSYNC");
+    }
+
+    auto wifiValue() -> String {
+        String ssid = WiFi.SSID();
+        if (ssid.length() == 0 && configManager.getSSID() != nullptr) {
+            ssid = configManager.getSSID();
+        }
+        if (ssid.length() == 0) {
+            return String("--");
+        }
+        return ssid + " / " + String(WiFi.RSSI()) + "dBm";
+    }
+
+    static auto readUptime(char* output, size_t outputSize) -> void {
+        const unsigned long totalMinutes = millis() / 60000UL;
+        if (totalMinutes >= 1440UL) {
+            snprintf(output, outputSize, "%lud%02lu:%02lu", totalMinutes / 1440UL,
+                     (totalMinutes / 60UL) % 24UL, totalMinutes % 60UL);
+        } else {
+            snprintf(output, outputSize, "%02lu:%02lu:%02lu", totalMinutes / 60UL,
+                     totalMinutes % 60UL, (millis() / 1000UL) % 60UL);
+        }
+    }
+
+    static auto readHeap(char* output, size_t outputSize) -> void {
+        snprintf(output, outputSize, "%uKB", ESP.getFreeHeap() / 1024U);
+    }
+
+    auto displayValue() -> String {
+        return String(configManager.getLCDBrightness()) + "% / ROT " + String(configManager.getLCDRotationSafe());
+    }
+
+    auto drawLine(const char* label, const String& value, int16_t y) -> void {
+        drawLineChars(label, value.c_str(), y);
+    }
+
+    auto drawLineChars(const char* label, const char* value, int16_t y) -> void {
+        auto* gfx = DisplayManager::getGfx();
+        char fitted[64];
+        const int maxChars = VALUE_MAX_W / 6;
+        snprintf(fitted, sizeof(fitted), "%.*s", maxChars, value == nullptr ? "" : value);
+
+        gfx->fillRect(0, y - 1, 240, 11, C_BG);
+        gfx->setTextSize(1);
+        gfx->setTextColor(C_SUB);
+        gfx->setCursor(10, y);
+        gfx->print(label);
+        gfx->setTextColor(C_WHITE);
+        gfx->setCursor(VALUE_X, y);
+        gfx->print(fitted);
+    }
+
+    auto drawDate() -> void {
+        char dateText[24];
+        const time_t now = time(nullptr) + 8 * 3600;
+        m_lastDay = static_cast<int>(now / 86400);
+        struct tm localTime;
+        gmtime_r(&now, &localTime);
+        strftime(dateText, sizeof(dateText), "%Y-%m-%d  %a", &localTime);
+        auto* gfx = DisplayManager::getGfx();
+        gfx->setTextSize(1);
+        gfx->setTextColor(C_ACCENT);
+        gfx->setCursor(120 - textWidthPx(dateText, 1) / 2, 164);
+        gfx->print(dateText);
+    }
+
+    auto drawClock(bool fullRedraw) -> void {
+        const time_t now = time(nullptr) + 8 * 3600;
+        struct tm localTime;
+        gmtime_r(&now, &localTime);
+        const int minute = static_cast<int>((now / 60) % 1440);
+        m_lastMinute = minute;
+
+        char clockText[6];
+        strftime(clockText, sizeof(clockText), "%H:%M", &localTime);
+        auto* gfx = DisplayManager::getGfx();
+        if (fullRedraw) {
+            // 起点 174：日期行占 164~171，清屏不得覆盖（否则日期缺一像素行）
+            gfx->fillRect(0, 174, 240, 34, C_BG);
+        } else {
+            gfx->fillRect(0, CLOCK_Y - 2, 240, 28, C_BG);
+        }
+        gfx->setTextSize(3);
+        gfx->setTextColor(C_WHITE);
+        gfx->setCursor(120 - textWidthPx(clockText, 3) / 2, CLOCK_Y);
+        gfx->print(clockText);
+    }
 };
 
 // ---------- balance：额度 + 时钟主页面 ----------
@@ -216,7 +413,7 @@ class ClockScene : public Scene {
     auto exit() -> void override {}
 };
 
-static StartupScene s_startupScene;
+static SystemInfoScene s_sysInfoScene;
 static BalanceScene s_balanceScene;
 static AlbumScene s_albumScene;
 
@@ -245,7 +442,7 @@ static LiveScene s_liveScene;
 static ClockScene s_clockScene;
 
 auto registerBuiltinScenes() -> void {
-    SceneManager::addScene(&s_startupScene);
+    SceneManager::addScene(&s_sysInfoScene);
     SceneManager::addScene(&s_balanceScene);
     SceneManager::addScene(&s_albumScene);
     SceneManager::addScene(&s_clockScene);

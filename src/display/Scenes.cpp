@@ -309,7 +309,9 @@ class StockScene : public Scene {
                 m_count = count > StockData::MAX_ROWS ? StockData::MAX_ROWS : count;
                 for (uint8_t i = 0; i < StockData::MAX_ROWS; ++i) {
                     m_saved[i] = i < m_count ? candidate[i] : StockData::Row{};
-                    strlcpy(m_rows[i].name, m_saved[i].name, sizeof(m_rows[i].name));
+                    // 必须整行赋值：早先只 strlcpy 了 name，change 一直停在 enter()
+                    // 时的旧值，于是推送后涨跌幅不变（真机发现「推送无变化」）。
+                    m_rows[i] = m_saved[i];
                 }
                 drawRows();
             }
@@ -332,7 +334,8 @@ class StockScene : public Scene {
     static constexpr uint16_t C_WHITE = rgb565(0xFF, 0xFF, 0xFF);
     static constexpr uint16_t C_UP = rgb565(0xFF, 0x00, 0x00);
     static constexpr uint16_t C_DOWN = rgb565(0x00, 0xFF, 0x00);
-    static constexpr uint16_t C_NEUTRAL = rgb565(0x8A, 0x94, 0xB8);
+    /// 平盘 0.00%：中性白，比灰蓝醒目，也不与涨跌色混淆
+    static constexpr uint16_t C_NEUTRAL = rgb565(0xFF, 0xFF, 0xFF);
     static constexpr int16_t ROW_Y = 50;
     static constexpr uint8_t ROW_STEP = 27;
     static constexpr int16_t CLOCK_Y = 204;
@@ -351,11 +354,13 @@ class StockScene : public Scene {
         (void)size;
         // 先转百分位整数，避免把浮点 printf 及其格式化库带进 ESP8266 固件。
         int32_t cents = static_cast<int32_t>(change * 100.0F + (change >= 0.0F ? 0.5F : -0.5F));
+        // 平盘不写正负号：0.00% 若带 '+' 会被读成「涨」。
+        size_t pos = 0;
         if (cents < 0) {
-            out[0] = '-';
+            out[pos++] = '-';
             cents = -cents;
-        } else {
-            out[0] = '+';
+        } else if (cents > 0) {
+            out[pos++] = '+';
         }
         uint32_t whole = static_cast<uint32_t>(cents) / 100U;
         const uint8_t fraction = static_cast<uint8_t>(static_cast<uint32_t>(cents) % 100U);
@@ -366,7 +371,6 @@ class StockScene : public Scene {
             digits[digitCount++] = static_cast<char>('0' + whole % 10U);
             whole /= 10U;
         } while (whole != 0U);
-        size_t pos = 1;
         while (digitCount != 0U) {
             out[pos++] = digits[--digitCount];
         }
@@ -403,15 +407,9 @@ class StockScene : public Scene {
         }
 
         char value[16];
-        for (uint8_t i = 0; i < StockData::MAX_ROWS; ++i) {
+        for (uint8_t i = 0; i < m_count; ++i) {
             const int16_t y = ROW_Y + i * ROW_STEP;
             gfx->setTextSize(2);
-            if (i >= m_count) {
-                gfx->setTextColor(C_SUB);
-                gfx->setCursor(NAME_X, y);
-                gfx->print("--");
-                continue;
-            }
 
             formatChange(m_rows[i].change, value, sizeof(value));
             const int valueWidth = textWidthPx(value, 2);

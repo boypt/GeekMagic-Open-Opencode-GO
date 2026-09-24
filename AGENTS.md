@@ -43,7 +43,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 |---|---|
 | `src/main.cpp` | 启动流程：DisplayManager → WiFiManager → NTP → Webserver → `UsageManager::begin()`；loop 委托各 manager |
 | `src/opencodego/UsageManager.cpp` | 七段时钟、logo、三行额度、状态行渲染；数据源 = `POST /api/v1/balance` 推送缓冲（静态定长 char 数组，零 String 抖动），推送到达即 `requestFullRedraw()`；额度行为纯文本自适应字号（能放大字 helvB12 则大字，超宽降级 6x10，右对齐截断），设备不解析语义 |
-| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（Bearer + `x-opencode-session`），格式化 3 行 ≤16 ASCII 文本（label + 剩余% + 距重置相对时长）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check`，退出码 0/1/2/3 |
+| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（Bearer + `x-opencode-session`），格式化 3 行 ≤16 ASCII 文本（label + 剩余% + 距重置相对时长）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check/--demo`（`--demo` 用本地随机数据测试、无需上游凭据），退出码 0/1/2/3 |
 | `include/opencodego/SegFont7.h` | TFT_eSPI Font7 原字模解码的 1bpp 行位图（0-9 : -，32x48），像素级还原旧七段观感 |
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |

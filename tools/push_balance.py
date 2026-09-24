@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """上位机额度推送脚本：读上游 OpenCode Go 用量，格式化后推给 GeekMagic 小屏。
 
+``--demo`` 用本地随机数据代替上游，无需上游凭据即可测试推送与屏幕渲染。
+
 设备端不再自己 HTTPS 拉取，改为本脚本拉取上游、格式化成 3 行文本、
 POST 到设备的 ``/api/v1/balance`` 接口显示。
 
@@ -58,6 +60,10 @@ POST 到设备的 ``/api/v1/balance`` 接口显示。
     python3 tools/push_balance.py --device http://192.168.1.10 \\
         --device-token DEV_TOKEN --check
 
+    # 本地随机测试数据直推（不拉上游、无需上游参数；加 --loop 可反复刷新）
+    python3 tools/push_balance.py --device http://192.168.1.10 \\
+        --device-token DEV_TOKEN --demo
+
 退出码约定：0=成功 / 1=上游失败 / 2=设备失败 / 3=参数配置错误。
 仅标准库（argparse/urllib/ssl/json/time/os/sys），零 pip 依赖。
 """
@@ -65,6 +71,7 @@ POST 到设备的 ``/api/v1/balance`` 接口显示。
 import argparse
 import json
 import os
+import random
 import socket
 import ssl
 import sys
@@ -87,6 +94,30 @@ SAMPLE_USAGE = {
     "monthly": {"status": "active", "percent": 9,
                 "resetsAt": "2026-09-01T00:00:00.000Z"},
 }
+
+
+def build_demo_usage():
+    """本地随机生成三窗口额度数据（--demo 用，不拉上游）。
+
+    percent 取 0~100；重置时长按窗口量级取随机值（5H 10min~5h / 周 1h~7d /
+    月 1d~30d），使三行长度在大字/小字档间浮动，便于肉眼检查自适应字号渲染。
+    """
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+
+    def window(span_sec):
+        return {
+            "status": "active",
+            "percent": random.randint(0, 100),
+            "resetsAt": (now + timedelta(seconds=span_sec)).strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z"),
+        }
+
+    return {
+        "rolling": window(random.randint(10 * 60, 5 * 3600)),
+        "weekly": window(random.randint(3600, 7 * 86400)),
+        "monthly": window(random.randint(86400, 30 * 86400)),
+    }
 
 
 def eprint(*args):
@@ -124,6 +155,9 @@ def build_arg_parser():
     p.add_argument("--dry-run", action="store_true",
                    help="只打印 payload 不推送（仍会拉上游；上游不可达时用示例数据"
                         "演示格式，返回 0）")
+    p.add_argument("--demo", action="store_true",
+                   help="本地随机生成额度数据并推送（不拉上游、无需上游参数）；"
+                        "可与 --loop/--dry-run 组合")
     p.add_argument("--timeout", type=float, default=15.0,
                    help="单次 HTTP 超时秒数（默认 15，与旧固件 FETCH_TIMEOUT_MS 一致）")
     return p
@@ -349,37 +383,26 @@ def validate_args(args):
         return "", "缺少 --device-token（或环境变量 DEVICE_TOKEN）"
     if args.check:
         return device_base, ""
+    if args.interval <= 0:
+        return "", "--interval 必须 > 0"
+    if args.timeout <= 0:
+        return "", "--timeout 必须 > 0"
+    if args.demo:
+        return device_base, ""   # 随机数据直推，不需要上游参数
     if not args.upstream_host:
         return "", "缺少 --upstream-host（或环境变量 UPSTREAM_HOST）"
     if not args.upstream_path:
         return "", "缺少 --upstream-path（或环境变量 UPSTREAM_PATH）"
     if not args.upstream_key:
         return "", "缺少 --upstream-key（或环境变量 UPSTREAM_KEY）"
-    if args.interval <= 0:
-        return "", "--interval 必须 > 0"
-    if args.timeout <= 0:
-        return "", "--timeout 必须 > 0"
     return device_base, ""
 
 
-def run_once(args, ssl_context):
-    try:
-        usage = fetch_upstream(args.upstream_host, args.upstream_path,
-                               args.upstream_key, args.timeout, ssl_context)
-    except RuntimeError as ex:
-        if args.dry_run:
-            # 演示模式：上游不可达时用示例数据走完格式化路径（假参数可验证）
-            eprint("上游失败 (%s)，用示例数据演示格式" % ex)
-            lines, status = build_payload(SAMPLE_USAGE)
-            print(json.dumps({"lines": lines, "status": status},
-                             indent=2, ensure_ascii=False))
-            return 0
-        eprint("上游失败: %s" % ex)
-        return 1
-    lines, status = build_payload(usage)
-    payload = {"lines": lines, "status": status}
+def deliver_payload(args, lines, status, tag=""):
+    """dry-run 只打印 payload；否则推送到设备。返回 0 / 2。"""
     if args.dry_run:
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        print(json.dumps({"lines": lines, "status": status},
+                         indent=2, ensure_ascii=False))
         return 0
     try:
         push_device(normalize_device_base(args.device), args.device_token,
@@ -387,8 +410,26 @@ def run_once(args, ssl_context):
     except RuntimeError as ex:
         eprint("设备失败: %s" % ex)
         return 2
-    print("已推送: %s | %s" % (" / ".join(lines), status))
+    print("%s已推送: %s | %s" % (tag, " / ".join(lines), status))
     return 0
+
+
+def run_once(args, ssl_context):
+    if args.demo:
+        lines, status = build_payload(build_demo_usage())
+        status = "DEMO " + status.replace("UPDATE ", "")   # 屏上可辨认是随机数据
+        return deliver_payload(args, lines, status, tag="[demo] ")
+    try:
+        usage = fetch_upstream(args.upstream_host, args.upstream_path,
+                               args.upstream_key, args.timeout, ssl_context)
+    except RuntimeError as ex:
+        if args.dry_run:
+            # 演示模式：上游不可达时用示例数据走完格式化路径（假参数可验证）
+            eprint("上游失败 (%s)，用示例数据演示格式" % ex)
+            return deliver_payload(args, *build_payload(SAMPLE_USAGE))
+        eprint("上游失败: %s" % ex)
+        return 1
+    return deliver_payload(args, *build_payload(usage))
 
 
 def main(argv=None):

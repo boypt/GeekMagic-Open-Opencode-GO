@@ -22,7 +22,7 @@ POST 到设备的 ``/api/v1/balance`` 接口显示。
 
 上游协议（移植自 include/opencodego/OpenCodeGoClient.h，只读参考）::
 
-    GET https://<host><path>
+    GET <--upstream-url 完整 URL，如 https://host/path>
     Authorization: Bearer <上游 key>
     x-opencode-session: push-balance-<hostname>
     -> {"usage": {"rolling": {"status","percent","resetsAt"},
@@ -30,6 +30,7 @@ POST 到设备的 ``/api/v1/balance`` 接口显示。
     rolling=5 小时窗口，weekly=周，monthly=月；percent=已用百分比，
     remaining = max(100 - percent, 0)（与 cc-switch 提取器一致）；
     status=="invalid" 视为无效窗口；resetsAt 为 ISO8601 UTC 时间。
+    TLS 默认按标准系统证书库校验；``--insecure`` 可关闭校验（无自定义 CA 选项）。
 
 三段渲染（设备零语义，分字段推送）：
 ``labels`` = 左上标签（``5H`` / ``WK.`` / ``MO.``）、``progress`` = 进度条
@@ -41,17 +42,17 @@ status 行沿用旧 ``UPDATE HH:MM`` 语义（推送成功时刻，本地时间�
 
     # 单次推送（参数显式）
     python3 tools/push_balance.py --device http://192.168.1.10 \\
-        --device-token DEV_TOKEN --upstream-host bwe.example.com \\
-        --upstream-path /api/usage --upstream-key UPSTREAM_KEY
+        --device-token DEV_TOKEN \\
+        --upstream-url https://bwe.example.com/api/usage --upstream-key UPSTREAM_KEY
 
     # 循环推送（每 300 秒一轮，上游轮询节奏与旧固件一致默认 5 分钟）
     python3 tools/push_balance.py --device http://192.168.1.10 \\
-        --device-token DEV_TOKEN --upstream-host bwe.example.com \\
-        --upstream-path /api/usage --upstream-key UPSTREAM_KEY \\
+        --device-token DEV_TOKEN \\
+        --upstream-url https://bwe.example.com/api/usage --upstream-key UPSTREAM_KEY \\
         --loop --interval 300
 
     # 只打印 payload 不推送（格式化路径验证，可用假参数跑通）
-    python3 tools/push_balance.py --upstream-host fake --upstream-path /x \\
+    python3 tools/push_balance.py --upstream-url https://fake.invalid/x \\
         --upstream-key fake --device http://127.0.0.1 --device-token fake \\
         --dry-run
 
@@ -62,7 +63,6 @@ status 行沿用旧 ``UPDATE HH:MM`` 语义（推送成功时刻，本地时间�
     # 本地随机测试数据直推（不拉上游、无需上游参数；加 --loop 可反复刷新）
     python3 tools/push_balance.py --device http://192.168.1.10 \\
         --device-token DEV_TOKEN --demo
-
 退出码约定：0=成功 / 1=上游失败 / 2=设备失败 / 3=参数配置错误。
 仅标准库（argparse/urllib/ssl/json/time/os/sys），零 pip 依赖。
 """
@@ -131,12 +131,10 @@ def build_arg_parser():
                         "也可经环境变量 DEVICE 传入")
     p.add_argument("--device-token", default=os.environ.get("DEVICE_TOKEN", ""),
                    help="设备 api_token（Bearer）。也可经 DEVICE_TOKEN 传入")
-    p.add_argument("--upstream-host", default=os.environ.get("UPSTREAM_HOST", ""),
-                   help="上游 host（不带 scheme，如 bwe.example.com）。"
-                        "也可经 UPSTREAM_HOST 传入")
-    p.add_argument("--upstream-path", default=os.environ.get("UPSTREAM_PATH", ""),
-                   help="上游 path（以 / 开头，如 /api/usage）。"
-                        "也可经 UPSTREAM_PATH 传入")
+    p.add_argument("--upstream-url", default=os.environ.get("UPSTREAM_URL", ""),
+                   help="上游完整 URL（含 https:// 与 path，如 "
+                        "https://bwe.example.com/api/usage）。"
+                        "也可经环境变量 UPSTREAM_URL 传入")
     p.add_argument("--upstream-key", default=os.environ.get("UPSTREAM_KEY", ""),
                    help="上游 API Key（Anthropic 兼容 Key）。"
                         "也可经 UPSTREAM_KEY 传入")
@@ -145,9 +143,7 @@ def build_arg_parser():
     p.add_argument("--interval", type=int, default=300,
                    help="循环推送间隔秒数（默认 300，与旧固件 5min 轮询一致）")
     p.add_argument("--insecure", action="store_true",
-                   help="上游 TLS 不校验证书（默认用系统证书库校验）")
-    p.add_argument("--ca-file", default="",
-                   help="上游 TLS 自定义 CA 证书文件（PEM）")
+                   help="上游 TLS 不校验证书（默认按标准系统证书库校验）")
     p.add_argument("--check", action="store_true",
                    help="GET 设备当前 balance 状态并打印，不拉上游、不推送")
     p.add_argument("--dry-run", action="store_true",
@@ -246,7 +242,7 @@ def build_payload(usage):
 
 
 def http_request(url, method="GET", headers=None, body=None, timeout=15.0,
-                 ssl_context=None):
+                 insecure=False):
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -256,9 +252,14 @@ def http_request(url, method="GET", headers=None, body=None, timeout=15.0,
         req.add_header(k, v)
     if data is not None:
         req.add_header("Content-Type", "application/json")
+    # 默认标准系统证书库校验；--insecure 时关闭校验（自签/坏链上游的应急出口）
+    ctx = None
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen(req, timeout=timeout,
-                                     context=ssl_context) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
             raw = resp.read().decode("utf-8", "replace")
             return resp.status, raw
     except urllib.error.HTTPError as ex:
@@ -272,22 +273,15 @@ def http_request(url, method="GET", headers=None, body=None, timeout=15.0,
         raise ex
 
 
-def make_upstream_context(insecure, ca_file):
-    if insecure:
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-    if ca_file:
-        return ssl.create_default_context(cafile=ca_file)
-    return None  # 系统默认证书库
-
-
-def fetch_upstream(host, path, key, timeout, ssl_context, retries=2):
-    """GET https://<host><path>，带简单重试。成功返回 usage dict；失败抛异常。"""
-    if not path.startswith("/"):
-        path = "/" + path
-    url = "https://%s%s" % (host, path)
+def fetch_upstream(url, key, timeout, insecure, retries=2):
+    """GET <url>（完整 URL；insecure=True 时不校验证书），带简单重试。成功返回 usage dict。"""
+    url = url.strip()
+    if not url:
+        raise RuntimeError("上游 URL 为空")
+    if "://" not in url:
+        raise RuntimeError("上游 URL 需带 scheme，如 https://host/path")
+    if url.endswith("/"):
+        url = url[:-1]
     try:
         hostname = socket.gethostname()
     except Exception:
@@ -301,7 +295,7 @@ def fetch_upstream(host, path, key, timeout, ssl_context, retries=2):
     for attempt in range(1, retries + 2):
         try:
             code, raw = http_request(url, headers=headers, timeout=timeout,
-                                     ssl_context=ssl_context)
+                                     insecure=insecure)
         except Exception as ex:
             last_err = "Network error: %s" % ex
             eprint("上游请求失败 (attempt %d): %s" % (attempt, last_err))
@@ -401,10 +395,8 @@ def validate_args(args):
         return "", "--timeout 必须 > 0"
     if args.demo:
         return device_base, ""   # 随机数据直推，不需要上游参数
-    if not args.upstream_host:
-        return "", "缺少 --upstream-host（或环境变量 UPSTREAM_HOST）"
-    if not args.upstream_path:
-        return "", "缺少 --upstream-path（或环境变量 UPSTREAM_PATH）"
+    if not args.upstream_url:
+        return "", "缺少 --upstream-url（或环境变量 UPSTREAM_URL，需含 https:// 与 path）"
     if not args.upstream_key:
         return "", "缺少 --upstream-key（或环境变量 UPSTREAM_KEY）"
     return device_base, ""
@@ -428,15 +420,15 @@ def deliver_payload(args, labels, progress, resets, status, tag=""):
     return 0
 
 
-def run_once(args, ssl_context):
+def run_once(args):
     if args.demo:
         labels, progress, resets, status = build_payload(build_demo_usage())
         status = "DEMO " + status.replace("UPDATE ", "")   # 屏上可辨认是随机数据
         return deliver_payload(args, labels, progress, resets, status,
                                tag="[demo] ")
     try:
-        usage = fetch_upstream(args.upstream_host, args.upstream_path,
-                               args.upstream_key, args.timeout, ssl_context)
+        usage = fetch_upstream(args.upstream_url, args.upstream_key,
+                               args.timeout, args.insecure)
     except RuntimeError as ex:
         if args.dry_run:
             # 演示模式：上游不可达时用示例数据走完格式化路径（假参数可验证）
@@ -460,22 +452,13 @@ def main(argv=None):
         except RuntimeError as ex:
             eprint("设备失败: %s" % ex)
             return 2
-    if args.ca_file and not os.path.isfile(args.ca_file):
-        eprint("参数错误: --ca-file 不存在: %s" % args.ca_file)
-        return 3
-    try:
-        ssl_context = make_upstream_context(args.insecure, args.ca_file)
-    except Exception as ex:
-        eprint("参数错误: TLS 上下文创建失败: %s" % ex)
-        return 3
-
     if not args.loop:
-        return run_once(args, ssl_context)
+        return run_once(args)
 
     # 循环模式：单轮失败只报错不退出，下一轮继续
     rc = 0
     while True:
-        rc = run_once(args, ssl_context)
+        rc = run_once(args)
         if rc != 0:
             eprint("本轮失败 (rc=%d)，%ds 后重试" % (rc, args.interval))
         try:

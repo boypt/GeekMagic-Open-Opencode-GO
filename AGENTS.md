@@ -43,7 +43,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 |---|---|
 | `src/main.cpp` | 启动流程：DisplayManager → WiFiManager → NTP → Webserver → `UsageManager::begin()`；loop 委托各 manager |
 | `src/opencodego/UsageManager.cpp` | 七段时钟、logo、三行额度、状态行渲染；数据源 = `POST /api/v1/balance` 的三段推送缓冲（`setRowLabel/setRowProgress/setRowReset` 写入，定长静态数组，零 String 抖动），推送到达即 `requestFullRedraw()`；额度行**三段式**：行上方左=标签（缺省回落 5H/WK./MO.）/右=百分比（中等字号，无值红 `--`）、中间=进度条（轨道左右 4px 等边距、填充绿≥50/黄≥20/红<20、无值空槽）、行下方右=重置日期（最小字号，缺省 `--`）。设备不解析语义 |
-| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（Bearer + `x-opencode-session`），按**三段字段**推送（左上标签 `labels` / 进度条与右上百分比 `progress`=剩余% / 右下重置相对时长 `resets`）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check/--demo`（`--demo` 用本地随机数据测试、无需上游凭据），退出码 0/1/2/3 |
+| `tools/push_balance.py` | 上位机脚本（在 PC 上运行，仅 Python 标准库）：HTTPS 读上游 OpenCode Go 用量（完整 URL `--upstream-url` + Bearer + `x-opencode-session`），按**三段字段**推送（左上标签 `labels` / 进度条与右上百分比 `progress`=剩余% / 右下重置相对时长 `resets`）+ 可选状态行，POST 到设备 `/api/v1/balance`；支持 `--loop/--dry-run/--check/--demo`（`--demo` 用本地随机数据测试、无需上游凭据），退出码 0/1/2/3 |
 | `include/opencodego/SegFont7.h` | TFT_eSPI Font7 原字模解码的 1bpp 行位图（0-9 : -，32x48），像素级还原旧七段观感 |
 | `include/opencodego/IromAccess.h` | 经 `-include` 注入：`u8x8_pgm_read`→`pgm_read_byte`、字体独立节（配合 `NON32XFER_HANDLER`） |
 | `src/display/DisplayManager.cpp` | 面板初始化（厂商/sd2 两套）、MADCTL（rotation/镜像/BGR）、背光 PWM、`requestFullRedraw()` 机制 |
@@ -59,7 +59,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 - `config.json`（LittleFS 根）：`api_token` 有值且与 NVS **不同**时**覆盖** NVS（便于刷机生效）；随后 `save()` 会把它从 JSON 删除（敏感信息只留 NVS）。
 - WiFi 凭据、API token 在 SecureStorage（EEPROM，XOR 混淆）；亮度/显示/NTP 等参数在 `config.json`。上游 host/path/key 已移出设备，归上位机脚本的参数/环境变量。
 - `data/config.json` 被上游 `.gitignore` 忽略（含 token，勿提交）。它被打进 littlefs 映像，所以**刷文件系统会覆盖设备上的 config.json**——新增持久化字段时记得同步加进去，否则刷完丢配置。
-- TLS：设备端**已无任何出站 TLS**（BearSSL/CA 文件/`verify_tls_cert`/MFLN 全部移除）；上游 HTTPS 校验由上位机脚本按系统证书库处理（`--ca-file` / `--insecure` 可调）。
+- TLS：设备端**已无任何出站 TLS**（BearSSL/CA 文件/`verify_tls_cert`/MFLN 全部移除）；上游 HTTPS 由上位机脚本按**标准系统证书库**校验（`--insecure` 可关闭校验，无自定义 CA 选项）。
 
 ## API 端点（全部 `/api/v1/...`，Bearer token 保护，rescue 模式除外）
 

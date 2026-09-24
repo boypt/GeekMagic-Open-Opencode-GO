@@ -16,7 +16,7 @@ urllib 调用只发生在 handler yield 的 Fetch*/Post* 任务中。
 
     AWAKE_OPEN     Every(stock,15s), Every(balance_due,900s),
                    DailyAt(market_check,15:30), DailyAt(sleep_at,00:00)
-    BALANCE_WINDOW Every(balance_refresh,60s), After(window_end,300s),
+    BALANCE_WINDOW Every(balance_refresh,300s), After(window_end,300s),
                    DailyAt(sleep_at,00:00)
     AWAKE_CLOSED   Every(balance,300s), DailyAt(market_check,09:20),
                    DailyAt(sleep_at,00:00)
@@ -1157,8 +1157,8 @@ def build_arg_parser():
                         help="开市额度窗口周期秒数，默认 900")
     policy.add_argument("--balance-window", type=int, default=300,
                         help="开市额度窗口持续秒数，默认 300")
-    policy.add_argument("--balance-refresh", type=int, default=60,
-                        help="额度窗口内刷新间隔秒数，默认 60")
+    policy.add_argument("--balance-refresh", type=int, default=300,
+                        help="额度窗口内刷新间隔秒数，默认 300（5 分钟）")
     policy.add_argument("--sleep-from", default="00:00",
                         help="每日休眠开始 HH:MM，默认 00:00")
     policy.add_argument("--sleep-to", default="08:00",

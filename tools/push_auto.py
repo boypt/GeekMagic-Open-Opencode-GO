@@ -33,6 +33,15 @@ urllib 调用只发生在 handler yield 的 Fetch*/Post* 任务中。
     行情 15s:  {"rows": [...]}
     额度 5min: {"balance": {"progress": [58, null, 91]}}
 
+行名可以用 SYMBOL_NAMES 配的简称代替代码，按位置一一对应、项数必须相同（错位会把
+简称贴到错的标的上，所以宁可启动失败）。建议用官方英文简称，例如::
+
+    SYMBOLS=sh000300,sh000905,sz159531,sz399006,sh000688
+    SYMBOL_NAMES=CSI300,CSI500,CSI2000,GEM,STAR50
+
+留空项表示那只沿用代码。简称受设备端同名限制（1..9 字节可打印 ASCII），校验与
+--symbols 一致；替换只发生在排版层，取数层拿到的永远是原代码。
+
 额度那条**不带 rows**：设备只更新屏顶三条额度条，不动行情行、不接管屏幕，
 所以 5 分钟一刷的额度不会打断 15s 一刷的行情。progress 顺序固定为滚动/周/月
 三段，元素是 0..100 的剩余百分比或 null（无窗口）；上游取数失败时这一拍什么
@@ -414,10 +423,12 @@ class AlarmRegistry:
 
 class Scheduler:
     def __init__(self, args, device_base, symbols, clock=None, backend=None,
-                 quiet=False):
+                 quiet=False, aliases=None):
         self.args = args
         self.device_base = device_base
         self.symbols = symbols
+        # {代码: 简称}，推送前替换行名；None/空 = 全用原代码
+        self.aliases = aliases or {}
         self.clock = clock or RealClock()
         self.backend = backend
         self.quiet = quiet
@@ -525,6 +536,12 @@ class Scheduler:
         self.state = target
         self.register_state_alarms(target)
 
+    def alias_text(self):
+        """启动摘要里的简称一览，确认 SYMBOL_NAMES 真的生效了。"""
+        if not self.aliases:
+            return "未配置（沿用代码）"
+        return ",".join(self.aliases.get(symbol, symbol) for symbol in self.symbols)
+
     def log_start(self):
         """启动摘要 —— 普通日志里唯一常驻的「一切正常」信息。
 
@@ -532,11 +549,11 @@ class Scheduler:
         会长时间一片空白（看不出是没跑还是在跑）。末尾顺带说明日志为什么是静的。
         """
         yield Log("启动：状态=%s 设备=%s 行情 %ds / 额度 %ds / 非开市 %ds / "
-                  "休眠 %s-%s%s"
+                  "休眠 %s-%s / 简称 %s%s"
                   % (self.state.value, self.device_base or "(未配置)",
                      self.args.open_interval, self.args.balance_every,
                      self.args.closed_interval, self.args.sleep_from,
-                     self.args.sleep_to,
+                     self.args.sleep_to, self.alias_text(),
                      "" if self.args.verbose
                      else "（例行节拍日志已静默，加 --verbose 查看每拍明细）"))
 
@@ -714,6 +731,10 @@ class Scheduler:
             yield Log("额度条推送失败：%s" % posted.error)
         return posted
 
+    def display_rows(self, rows):
+        """行名换成用户配置的简称（简称是排版层的事，取数层保持原代码）。"""
+        return apply_aliases(rows, self.aliases)
+
     def stock_and_post(self, result):
         rows, date = result.data
         self.last_data_date = date
@@ -722,7 +743,8 @@ class Scheduler:
             yield EnterState(Event.STALE_DATE)
             yield Log("行情日期 %s 不是今天，转休市节拍" % date)
             return None
-        posted = yield PostDevice("/api/v1/stock", {"rows": rows})
+        posted = yield PostDevice("/api/v1/stock",
+                                  {"rows": self.display_rows(rows)})
         if not posted.ok:
             yield Log("股票设备推送失败：%s" % posted.error)
             return posted
@@ -797,7 +819,8 @@ class Scheduler:
         # 先发一条纯额度推送（不进场景），再推行情：这样切到 stock 场景的第一帧
         # 就带着屏顶三条，不会有「先空屏一帧再补条」的闪烁。
         yield from self.handle_quota_due()
-        posted = yield PostDevice("/api/v1/stock", {"rows": rows})
+        posted = yield PostDevice("/api/v1/stock",
+                                  {"rows": self.display_rows(rows)})
         if posted.ok:
             prefix = "开市中" if self.state == State.AWAKE_OPEN else "休市中"
             yield Verbose("%s（%s）股票已推送，%ds 后下一轮"
@@ -1011,6 +1034,46 @@ def parse_symbols(value):
     return symbols
 
 
+def parse_symbol_names(symbols, raw):
+    """按位置解析简称表 → {代码: 简称}；空项表示这只沿用原代码。
+
+    数量必须与 --symbols 一致：按位错配会把简称贴到错的标的上（比如只给前 3 个
+    配简称却按顺序顶替 5 个），宁可启动失败也不让屏上出现错误的简称。留空项是
+    表达「只有这几只想简称」的正规写法。
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    items = [item.strip() for item in text.split(",")]
+    if len(items) != len(symbols):
+        raise ValueError("SYMBOL_NAMES 有 %d 项，与 SYMBOLS 的 %d 个标的不一致"
+                         % (len(items), len(symbols)))
+    aliases = {}
+    owner = {}
+    for symbol, alias in zip(symbols, items):
+        if not alias:
+            continue
+        if len(alias.encode("ascii", "ignore")) != len(alias):
+            raise ValueError("简称 %r 含非 ASCII 字符" % alias)
+        if not 1 <= len(alias.encode("ascii")) <= 9:
+            raise ValueError("简称 %r 长度必须为 1..9 字节（设备端同名限制）" % alias)
+        if any(ord(ch) < 32 or ord(ch) > 126 for ch in alias):
+            raise ValueError("简称 %r 含不可打印 ASCII" % alias)
+        if alias in owner:
+            eprint("警告：简称 %r 重复（%s 与 %s 用了同一个），屏上两行会显示一样"
+                   % (alias, owner[alias], symbol))
+        owner[alias] = symbol
+        aliases[symbol] = alias
+    return aliases
+
+
+def apply_aliases(rows, aliases):
+    """把行名换成用户配置的简称。取数层只认代码，简称属于排版，故在推送前替换。"""
+    if not aliases:
+        return rows
+    return [dict(row, name=aliases.get(row["name"], row["name"])) for row in rows]
+
+
 def make_sina_url(base_url, symbols):
     """用 rpartition 替换已有 list= 后的标的，避免请求成空列表。"""
     base_url = (base_url or "").strip()
@@ -1202,6 +1265,11 @@ def build_arg_parser():
     stock = parser.add_argument_group("股票行情")
     stock.add_argument("--symbols", default=os.environ.get("SYMBOLS", DEFAULT_SYMBOLS),
                        help="逗号分隔新浪代码，最多 5 个（也可用 SYMBOLS）")
+    stock.add_argument("--symbol-names",
+                       default=os.environ.get("SYMBOL_NAMES", ""),
+                       help="与 SYMBOLS 按位置一一对应的简称（也可用 SYMBOL_NAMES）"
+                            "，项数必须相同，留空项表示这只沿用代码；"
+                            "例如 CSI300,CSI500,CSI2000,GEM,STAR50")
     stock.add_argument("--sina-url", default=os.environ.get("SINA_URL", DEFAULT_SINA_URL),
                        help="新浪 URL 前缀（也可用 SINA_URL）")
     stock.add_argument("--stock-dry-run", action="store_true",
@@ -1249,29 +1317,33 @@ def validate_args(args):
     try:
         symbols = parse_symbols(args.symbols)
     except ValueError as ex:
-        return device_base, [], str(ex)
+        return device_base, [], {}, str(ex)
+    try:
+        aliases = parse_symbol_names(symbols, args.symbol_names)
+    except ValueError as ex:
+        return device_base, symbols, {}, str(ex)
     try:
         sleep_from = parse_clock(args.sleep_from, "--sleep-from/SLEEP_FROM")
         sleep_to = parse_clock(args.sleep_to, "--sleep-to/SLEEP_TO")
     except ValueError as ex:
-        return device_base, symbols, str(ex)
+        return device_base, symbols, aliases, str(ex)
     if sleep_from == sleep_to:
-        return device_base, symbols, "--sleep-from/--sleep-to 不能相同"
+        return device_base, symbols, aliases, "--sleep-from/--sleep-to 不能相同"
     for name in ("timeout", "open_interval", "closed_interval", "balance_every",
                  "sleep_keepalive"):
         if getattr(args, name) <= 0:
-            return device_base, symbols, "--%s 必须 > 0" % name.replace("_", "-")
+            return device_base, symbols, aliases, "--%s 必须 > 0" % name.replace("_", "-")
     if not (args.sina_url or "").strip():
-        return device_base, symbols, "缺少 --sina-url（或环境变量 SINA_URL）"
+        return device_base, symbols, aliases, "缺少 --sina-url（或环境变量 SINA_URL）"
     # --stock-dry-run 只测取数，不需要设备地址与 token
     if args.check or not (args.dry_run or args.stock_dry_run):
         if not device_base:
-            return device_base, symbols, "缺少 --device（或环境变量 DEVICE）"
+            return device_base, symbols, aliases, "缺少 --device（或环境变量 DEVICE）"
         if not args.device_token:
-            return device_base, symbols, "缺少 --device-token（或环境变量 DEVICE_TOKEN）"
+            return device_base, symbols, aliases, "缺少 --device-token（或环境变量 DEVICE_TOKEN）"
     if not (args.upstream_url or "").strip() and (args.upstream_key or args.demo):
-        return device_base, symbols, "缺少 --upstream-url"
-    return device_base, symbols, ""
+        return device_base, symbols, aliases, "缺少 --upstream-url"
+    return device_base, symbols, aliases, ""
 
 
 def show_dry_run(endpoint, payload):
@@ -1279,12 +1351,13 @@ def show_dry_run(endpoint, payload):
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def stock_dry_run(args, symbols):
+def stock_dry_run(args, symbols, aliases=None):
     """真实拉取股票行情并打印 payload，全程不连接设备。
 
     与 ``--dry-run`` 的区别：后者跟随时间策略、且用本地随机数据代替取数；
     这里是真的请求新浪，用来单独验证取数链路、字段解析与开市判定。
     """
+    aliases = aliases or {}
     if args.demo:
         rows = [{"name": symbol, "change": round_change(random.uniform(-5.0, 5.0))}
                 for symbol in symbols]
@@ -1303,6 +1376,11 @@ def stock_dry_run(args, symbols):
     print("北京时间 %s（%s）" % (time.strftime("%Y-%m-%d %H:%M:%S", now_bj), weekday))
     print("行情日期 %s → 开市判定：%s" % (data_date or "(取不到)",
                                           "开市" if open_now else "休市"))
+    if aliases:
+        print("简称映射 %s" % ", ".join(
+            "%s→%s" % (symbol, aliases.get(symbol, "(沿用代码)"))
+            for symbol in symbols))
+    rows = apply_aliases(rows, aliases)
     for row in rows:
         if row["change"] > 0:
             tone = "涨 → 屏上正红"
@@ -1349,7 +1427,7 @@ def run_balance(args, device_base):
     return 0, usage_ok
 
 
-def run_stock(args, device_base, symbols):
+def run_stock(args, device_base, symbols, aliases=None):
     if args.demo or args.dry_run:
         # dry-run 也不能访问新浪；使用本地样例保证离线可重复。
         rows = [{"name": symbol,
@@ -1369,7 +1447,7 @@ def run_stock(args, device_base, symbols):
             eprint("新浪行情日期 %s 不是今天，按休市处理" % data_date)
             return 0, data_date
     endpoint = device_base + "/api/v1/stock"
-    payload = {"rows": rows}
+    payload = {"rows": apply_aliases(rows, aliases or {})}
     if args.dry_run:
         show_dry_run(endpoint, payload)
         return 0, data_date
@@ -1449,11 +1527,12 @@ def self_test():
         results.append(name)
         print("[PASS] %02d %s" % (len(results), name))
     
-    def make(start=0.0, **kwargs):
+    def make(start=0.0, aliases=None, **kwargs):
         clock = VirtualClock(start)
         backend = Backend()
         scheduler = Scheduler(args_for(**kwargs), "", DEFAULT_SYMBOLS.split(","),
-                               clock=clock, backend=backend, quiet=True)
+                               clock=clock, backend=backend, quiet=True,
+                               aliases=aliases)
         return clock, backend, scheduler
     
     def stock_bodies(backend):
@@ -1677,7 +1756,56 @@ def self_test():
             else:
                 os.environ[key] = value
     
-    print("SELF-TEST PASS: %d/22" % len(results))
+    # 23. 简称表解析：按位置对齐，数量不符 / 非 ASCII 必须挡住，空项=沿用代码。
+    symbols = DEFAULT_SYMBOLS.split(",")
+    full = parse_symbol_names(symbols, "MT,PAZ,ZZ500,ZZ2000,CYB")
+    partial = parse_symbol_names(symbols, "MT,,,,KCB")
+    mismatch = non_ascii = 0
+    try:
+        parse_symbol_names(symbols, "A,B")
+    except ValueError:
+        mismatch = 1
+    try:
+        parse_symbol_names(symbols, "沪深300,,,,")
+    except ValueError:
+        non_ascii = 1
+    ok("简称表按位置解析且校验严格",
+       full == {"sh600519": "MT", "sz000001": "PAZ", "sh000001": "ZZ500",
+                "sz399001": "ZZ2000", "sh000300": "CYB"} and
+       partial == {"sh600519": "MT", "sh000300": "KCB"} and
+       parse_symbol_names(symbols, "") == {} and
+       mismatch == 1 and non_ascii == 1)
+    
+    # 24. 配了简称就用简称上屏（且启动摘要是能确认配置生效的）。
+    clock, backend, s = make(0, no_sleep=True, open_interval=15,
+                             aliases={"sh600519": "HS300"})
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=1)
+    ok("推送行名用简称代替代码",
+       row_bodies(backend) and
+       row_bodies(backend)[-1]["rows"] == [{"name": "HS300", "change": 1.0}] and
+       # 摘要按 SYMBOLS 顺序列出实际会显示的名字：只有 sh600519 配了简称
+       any("简称 HS300,sz000001,sh000001,sz399001,sh000300" in line
+           for line in s.log_lines))
+    
+    # 25. 没配简称时一字不改，仍推原代码。
+    clock, backend, s = make(0, no_sleep=True, open_interval=15)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=1)
+    ok("未配简称时沿用代码",
+       row_bodies(backend)[-1]["rows"] == [{"name": "sh600519", "change": 1.0}] and
+       any("简称 未配置" in line for line in s.log_lines))
+    
+    # 26. 简称只影响行名，涨跌幅数值与条数不受影响。
+    clock, backend, s = make(0, no_sleep=True, open_interval=15,
+                             aliases={"sh600519": "X"})
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=1)
+    rows = row_bodies(backend)[-1]["rows"]
+    ok("简称不改变涨跌幅数值",
+       len(rows) == 1 and rows[0]["change"] == 1.0)
+    
+    print("SELF-TEST PASS: %d/26" % len(results))
     
 
 def check_device_sync(args, device_base):
@@ -1692,7 +1820,7 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     if args.self_test:
         return self_test()
-    device_base, symbols, error = validate_args(args)
+    device_base, symbols, aliases, error = validate_args(args)
     if error:
         eprint("参数错误: %s" % error)
         return 3
@@ -1704,8 +1832,9 @@ def main(argv=None):
             eprint("设备失败: %s" % ex)
             return 2
     if args.stock_dry_run:
-        return stock_dry_run(args, symbols)
-    scheduler = Scheduler(args, device_base, symbols, clock=RealClock())
+        return stock_dry_run(args, symbols, aliases)
+    scheduler = Scheduler(args, device_base, symbols, clock=RealClock(),
+                          aliases=aliases)
     try:
         scheduler.start()
         scheduler.run(max_events=None if args.loop else 1)

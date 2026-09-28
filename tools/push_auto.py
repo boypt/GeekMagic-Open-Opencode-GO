@@ -13,22 +13,25 @@ urllib 调用只发生在 handler yield 的 Fetch*/Post* 任务中。
 
 每状态闹钟表::
 
-    AWAKE_OPEN     Every(stock,300s), Every(quota_due,300s),
+    AWAKE_OPEN     Every(stock,15s), Every(quota_due,300s),
                    DailyAt(market_check,15:30), DailyAt(sleep_at,00:00)
     AWAKE_CLOSED   Every(balance,300s), DailyAt(market_check,09:20),
                    DailyAt(sleep_at,00:00)
     SLEEPING       Every(keepalive,600s), DailyAt(wake_at,08:00)
 
 开市期间屏幕只保留股票场景：额度**不再**单独 POST /api/v1/balance（设备会立刻
-切到 balance 页），只按 --balance-every 缓存三段进度值，搭下一次股票推送的
-顺风车；休市/唤醒时仍单独推 /api/v1/balance，保证额度页在收盘后是新的。
+切到 balance 页），改成按 --balance-every 单独推一条只含额度数据的股票推送；
+休市/唤醒时仍单独推 /api/v1/balance，保证额度页在收盘后是新的。
 
-POST /api/v1/stock body::
+行情与额度是两个独立节拍，各推各的（POST /api/v1/stock 两种 body）::
 
-    {"rows": [...], "balance": {"progress": [58, null, 91]}}
+    行情 15s:  {"rows": [...]}
+    额度 5min: {"balance": {"progress": [58, null, 91]}}
 
-balance 键可选（--no-quota-bars 或还没取到额度时省略，设备保持原值不画条）；
-progress 顺序固定为滚动/周/月三段，元素是 0..100 的剩余百分比或 null（无窗口）。
+额度那条**不带 rows**：设备只更新屏顶三条额度条，不动行情行、不接管屏幕，
+所以 5 分钟一刷的额度不会打断 15s 一刷的行情。progress 顺序固定为滚动/周/月
+三段，元素是 0..100 的剩余百分比或 null（无窗口）；上游取数失败时这一拍什么
+都不推，设备保留上次的条。--no-quota-bars 可让开市期间完全不发额度。
 
 handler 可 yield 的任务与调度器回喂结果::
 
@@ -401,8 +404,6 @@ class Scheduler:
         self.suspended = {}
         self.state = None
         self.last_balance_at = None
-        # 开市时搭车下发的额度进度缓存；None = 还没取到或已失效
-        self.quota_progress = None
         self.last_data_date = None
         self.probe_day = None
         self.key_warned = False
@@ -642,33 +643,30 @@ class Scheduler:
         return (yield from self.balance_and_post())
 
     def handle_quota_due(self):
-        """开市额度取数：只缓存进度值，不切屏、不 POST /api/v1/balance。"""
+        """开市额度节拍：只推 balance 块，与行情节拍完全独立。
+
+        额度不搭行情的车 —— 行情 15s 一推、额度 5min 一推，各推各的：单独发一条
+        只含 balance 的 POST /api/v1/stock，设备只更新屏顶三条额度条，不碰行情行、
+        也不接管屏幕。上游失败时什么都不推，设备保留上次的条。
+        """
+        if self.args.no_quota_bars:
+            return None
         result = yield FetchBalance()
         self.last_balance_at = self.now()
         if not result.ok:
             if not self.key_warned:
-                yield Log("额度未配置或上游失败（开市只缓存进度条）：%s"
+                yield Log("额度未配置或上游失败（开市只更新进度条）：%s"
                           % result.error)
                 self.key_warned = True
             return result
-        # 保留上一次缓存语义：只有取到才替换
-        self.quota_progress = list(result.data[1])
-        yield Log("额度进度已更新（%s），%ds 后刷新"
-                  % (self.clock_text(), self.args.balance_every))
-        return result
-
-    def stock_body(self, rows):
-        """股票推送 body；有额度缓存且未 --no-quota-bars 时搭上 balance.progress。"""
-        body = {"rows": rows}
-        if self.quota_progress is not None and not self.args.no_quota_bars:
-            body["balance"] = {"progress": list(self.quota_progress)}
-        return body
-
-    def log_stock_pushed(self, with_quota):
-        prefix = "开市中" if self.state == State.AWAKE_OPEN else "休市中"
-        kind = "股票+额度已推送" if with_quota else "股票已推送"
-        yield Log("%s（%s）%s，%ds 后下一轮"
-                  % (prefix, self.clock_text(), kind, self.args.open_interval))
+        posted = yield PostDevice("/api/v1/stock", {
+            "balance": {"progress": list(result.data[1])}})
+        if posted.ok:
+            yield Log("额度进度已更新（%s），%ds 后刷新"
+                      % (self.clock_text(), self.args.balance_every))
+        else:
+            yield Log("额度条推送失败：%s" % posted.error)
+        return posted
 
     def stock_and_post(self, result):
         rows, date = result.data
@@ -678,10 +676,11 @@ class Scheduler:
             yield EnterState(Event.STALE_DATE)
             yield Log("行情日期 %s 不是今天，转休市节拍" % date)
             return None
-        body = self.stock_body(rows)
-        posted = yield PostDevice("/api/v1/stock", body)
+        posted = yield PostDevice("/api/v1/stock", {"rows": rows})
         if posted.ok:
-            yield from self.log_stock_pushed("balance" in body)
+            prefix = "开市中" if self.state == State.AWAKE_OPEN else "休市中"
+            yield Log("%s（%s）股票已推送，%ds 后下一轮"
+                      % (prefix, self.clock_text(), self.args.open_interval))
         else:
             yield Log("股票设备推送失败：%s" % posted.error)
         return posted
@@ -747,12 +746,14 @@ class Scheduler:
             yield Log("行情日期 %s 不是今天，继续休市节拍" % date)
             return
         yield EnterState(Event.MARKET_OPEN)
-        # 进入开市先补拉一次额度，让这一帧就带上屏顶进度条
+        # 先发一条纯额度推送（不进场景），再推行情：这样切到 stock 场景的第一帧
+        # 就带着屏顶三条，不会有「先空屏一帧再补条」的闪烁。
         yield from self.handle_quota_due()
-        body = self.stock_body(rows)
-        posted = yield PostDevice("/api/v1/stock", body)
+        posted = yield PostDevice("/api/v1/stock", {"rows": rows})
         if posted.ok:
-            yield from self.log_stock_pushed("balance" in body)
+            prefix = "开市中" if self.state == State.AWAKE_OPEN else "休市中"
+            yield Log("%s（%s）股票已推送，%ds 后下一轮"
+                      % (prefix, self.clock_text(), self.args.open_interval))
 
     def _dispatch_due(self):
         count = 0
@@ -1163,13 +1164,13 @@ def build_arg_parser():
                        help="开市时股票推送不带额度数据（屏幕顶部不画进度条）")
 
     policy = parser.add_argument_group("时间策略")
-    policy.add_argument("--open-interval", type=int, default=300,
-                        help="开市股票间隔秒数，默认 300（5 分钟）")
+    policy.add_argument("--open-interval", type=int, default=15,
+                        help="开市股票间隔秒数，默认 15（行情 15s 一刷）")
     policy.add_argument("--closed-interval", type=int, default=300,
                         help="非开市额度间隔秒数，默认 300")
     policy.add_argument("--balance-every", type=int, default=300,
-                        help="开市时拉取上游额度的间隔秒数，默认 300"
-                             "（5 分钟；额度只是搭车下发的进度条，不需要更频繁）")
+                        help="开市额度间隔秒数，默认 300（5 分钟；单独推，"
+                             "不带行情、不切屏）")
     policy.add_argument("--sleep-from", default="00:00",
                         help="每日休眠开始 HH:MM，默认 00:00")
     policy.add_argument("--sleep-to", default="08:00",
@@ -1405,14 +1406,22 @@ def self_test():
     def stock_bodies(backend):
         return [body for path, body in backend.posts if path == "/api/v1/stock"]
     
+    def row_bodies(backend):
+        """只带 rows 的行情推送（额度那条不带 rows，两者互不夹带）。"""
+        return [body for body in stock_bodies(backend) if "rows" in body]
+    
+    def quota_bodies(backend):
+        """只带 balance 的额度推送（body 里没有 rows）。"""
+        return [body for body in stock_bodies(backend) if "balance" in body]
+    
     # 1. 开市连续股票 tick，且永不推 /api/v1/balance 抢场景。
     clock, backend, s = make(0, no_sleep=True)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=3)
-    ok("开市 15s 股票 tick 连续触发", backend.calls.count("post/api/v1/stock") == 3
-       and "post/api/v1/balance" not in backend.calls)
+    ok("开市 15s 股票 tick 连续触发", len(row_bodies(backend)) == 3 and
+       "post/api/v1/balance" not in backend.calls)
     
-    # 2. quota_due 闹钟只取数，不切状态也不推额度。
+    # 2. quota_due 闹钟只发额度，不切状态也不推 /balance。
     clock, backend, s = make(0, no_sleep=True, open_interval=3600)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)          # 先消费开市首帧股票
@@ -1423,35 +1432,39 @@ def self_test():
     s.run(max_events=1)
     ok("开市 300s 额度到期只刷新进度条", s.state == State.AWAKE_OPEN and
        "fetch_balance" in backend.calls and
-       "post/api/v1/balance" not in backend.calls)
+       "post/api/v1/balance" not in backend.calls and
+       # 入市预取 1 次 + 到期这次 1 次，且两次都不带 rows
+       len(quota_bodies(backend)) == 2 and
+       all("rows" not in b for b in quota_bodies(backend)))
     
-    # 3. 额度取到后，股票推送搭上 balance.progress。
+    # 3. 行情与额度分别推送：额度那条不带 rows，行情那条不带 balance。
     clock, backend, s = make(0, no_sleep=True, open_interval=15)
     s.start(State.AWAKE_OPEN)
-    backend.calls[:] = []
     s.run(max_events=1)
-    bodies = stock_bodies(backend)
-    ok("额度抓取后股票推送带 balance.progress", bool(bodies) and
-       bodies[-1].get("balance") == {"progress": [50, 40, 30]} and
-       list(bodies[-1].keys()) == ["rows", "balance"] and
-       any("股票+额度已推送" in line for line in s.log_lines))
+    ok("额度与行情分别推送互不夹带",
+       quota_bodies(backend) == [{"balance": {"progress": [50, 40, 30]}}] and
+       all("rows" not in b for b in quota_bodies(backend)) and
+       bool(row_bodies(backend)) and
+       all("balance" not in b for b in row_bodies(backend)) and
+       not any("股票+额度已推送" in line for line in s.log_lines))
     
-    # 4. 额度还没取到时，股票推送不带 balance 键。
+    # 4. 额度取不到时不发额度推送（设备保留上次的条）。
     clock, backend, s = make(0, no_sleep=True, open_interval=15)
     backend.balance_failures = 1
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
-    bodies = stock_bodies(backend)
-    ok("额度未取到时股票推送不带 balance 键", bool(bodies) and
-       "balance" not in bodies[-1])
+    ok("额度未取到时不开额度推送", not quota_bodies(backend) and
+       bool(row_bodies(backend)) and
+       any("额度未配置或上游失败" in line for line in s.log_lines))
     
-    # 5. --no-quota-bars 时始终不带额度。
+    # 5. --no-quota-bars 时开市完全不发额度（连上游都不碰）。
     clock, backend, s = make(0, no_sleep=True, open_interval=15, no_quota_bars=True)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
-    bodies = stock_bodies(backend)
-    ok("--no-quota-bars 时股票推送不带额度", bool(bodies) and
-       "balance" not in bodies[-1])
+    clock.advance(300)
+    s.run(max_events=1)
+    ok("--no-quota-bars 时开市不发额度", not quota_bodies(backend) and
+       "fetch_balance" not in backend.calls and bool(row_bodies(backend)))
     
     # 6. 开市额度上游失败：留在开市，不退回额度推送。
     clock, backend, s = make(0, no_sleep=True, open_interval=3600)
@@ -1459,20 +1472,22 @@ def self_test():
     s.run(max_events=1)
     backend.balance_failures = 5
     backend.calls[:] = []
+    backend.posts[:] = []
     clock.advance(300)
     s.run(max_events=1)
     ok("开市额度上游失败留在开市且不推额度", s.state == State.AWAKE_OPEN and
        "post/api/v1/balance" not in backend.calls and
-       not any("stock" in call for call in backend.calls))
+       not any("stock" in call for call in backend.calls) and
+       not quota_bodies(backend))
     
-    # 7. 进入开市先补拉额度，首帧股票推送就带进度条。
+    # 7. 进入开市先补拉额度（独立一条），首帧行情随后才推。
     clock, backend, s = make(0, no_sleep=True, open_interval=15)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
-    bodies = stock_bodies(backend)
-    ok("开市预取额度后首帧股票推送即带进度条",
-       backend.calls[0] == "fetch_balance" and bool(bodies) and
-       bodies[0].get("balance") == {"progress": [50, 40, 30]})
+    ok("开市预取额度先于首帧行情",
+       backend.calls[0] == "fetch_balance" and
+       quota_bodies(backend) == [{"balance": {"progress": [50, 40, 30]}}] and
+       len(row_bodies(backend)) == 1)
     
     # 8. 休市 300s。
     clock, backend, s = make(0, no_sleep=True)
@@ -1513,7 +1528,7 @@ def self_test():
     s.start(State.SLEEPING)
     clock.advance(60)
     s.run(max_events=1)
-    ok("开市中唤醒只缓存额度不推额度页",
+    ok("开市中唤醒只推额度条不推额度页",
        backend.calls[0] == "sleep:False" and s.state == State.AWAKE_OPEN and
        "post/api/v1/balance" not in backend.calls and
        "fetch_balance" in backend.calls)
@@ -1524,7 +1539,7 @@ def self_test():
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
     ok("行情日期过期转休市节拍", s.state == State.AWAKE_CLOSED and
-       "post/api/v1/stock" not in backend.calls)
+       not row_bodies(backend))
     
     # 15. 跨午夜区间。
     clock, backend, s = make(15 * 3600, sleep_from="23:00", sleep_to="07:00")
@@ -1549,7 +1564,7 @@ def self_test():
     backend.slow_stock = True
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
-    ok("漏 tick 单飞跳过积压节拍", backend.calls.count("post/api/v1/stock") == 1 and
+    ok("漏 tick 单飞跳过积压节拍", len(row_bodies(backend)) == 1 and
        any("跳过" in line for line in s.log_lines))
     
     print("SELF-TEST PASS: %d/17" % len(results))

@@ -33,12 +33,17 @@ urllib 调用只发生在 handler yield 的 Fetch*/Post* 任务中。
 三段，元素是 0..100 的剩余百分比或 null（无窗口）；上游取数失败时这一拍什么
 都不推，设备保留上次的条。--no-quota-bars 可让开市期间完全不发额度。
 
+日志分两层：普通日志只有**启动摘要**、**状态转移**和**全部失败/异常**；例行节拍
+的成功行（15s 行情、5min 额度、休眠 keepalive）走 Verbose 任务，默认丢弃，
+`--verbose` 才逐拍输出。否则 journal 每分钟 4 行正常噪音，真异常反而被淹没。
+
 handler 可 yield 的任务与调度器回喂结果::
 
     FetchStock / FetchBalance  同步执行阻塞网络调用，回 Result(ok,data,error)
     PostDevice(path,body)      同步 POST 设备，回 Result
     PostSleep(on)              同步设置休眠，回 Result
     Log(msg)                   打印一行状态，回 None
+    Verbose(msg)               仅 --verbose 时打印（例行节拍的成功行），回 None
     Wait(seconds)              挂起生成器并立即放掉调度器
     Register(alarm)            注册闹钟，回 None
     Unregister(name)           注销闹钟，回 None
@@ -227,6 +232,17 @@ class EnterState:
 
 @dataclass(frozen=True)
 class Log:
+    message: str
+
+
+@dataclass(frozen=True)
+class Verbose:
+    """例行节拍的成功行：默认丢弃，只在 --verbose 下输出。
+
+    15s 行情、5min 额度、休眠 keepalive 这类「每拍都成功」的行属于正常噪音，
+    混在一起会把真正的异常淹没（journal 每分钟 4 行）。状态转移与全部失败/异常
+    走 Log，不受本开关影响。
+    """
     message: str
 
 
@@ -426,6 +442,12 @@ class Scheduler:
         if not self.quiet:
             print(message)
 
+    def emit_verbose(self, message):
+        """例行节拍行：没开 --verbose 就当它不存在（也不进 log_lines）。"""
+        if not self.args.verbose:
+            return
+        self.emit(message)
+
     def sleeping_now(self):
         if self.args.no_sleep:
             return False
@@ -498,15 +520,32 @@ class Scheduler:
         self.state = target
         self.register_state_alarms(target)
 
+    def log_start(self):
+        """启动摘要 —— 普通日志里唯一常驻的「一切正常」信息。
+
+        例行节拍的成功行都进了 --verbose，所以没有这行的话，进程起来之后 journal
+        会长时间一片空白（看不出是没跑还是在跑）。末尾顺带说明日志为什么是静的。
+        """
+        yield Log("启动：状态=%s 设备=%s 行情 %ds / 额度 %ds / 非开市 %ds / "
+                  "休眠 %s-%s%s"
+                  % (self.state.value, self.device_base or "(未配置)",
+                     self.args.open_interval, self.args.balance_every,
+                     self.args.closed_interval, self.args.sleep_from,
+                     self.args.sleep_to,
+                     "" if self.args.verbose
+                     else "（例行节拍日志已静默，加 --verbose 查看每拍明细）"))
+
     def start(self, force_state=None):
         if self.sleeping_now() and force_state is None:
             self.state = State.AWAKE_CLOSED
             self.register_state_alarms(self.state, initial=True)
+            self.run_handler(self.log_start())
             self.run_handler(self.handle_sleep_enter())
             return
         self.state = force_state or (
             State.AWAKE_OPEN if self.market_open() else State.AWAKE_CLOSED)
         self.register_state_alarms(self.state, initial=True)
+        self.run_handler(self.log_start())
         if self.state == State.AWAKE_OPEN:
             # 开市先补拉一次额度，首帧股票推送就带上进度条。
             self.run_handler(self.handle_quota_due())
@@ -547,6 +586,8 @@ class Scheduler:
             return SUSPEND
         if isinstance(task, Log):
             self.emit(task.message)
+        elif isinstance(task, Verbose):
+            self.emit_verbose(task.message)
         elif isinstance(task, Register):
             self.register(task.alarm)
         elif isinstance(task, Unregister):
@@ -633,8 +674,8 @@ class Scheduler:
             "resets": result.data[2], "status": result.data[3]})
         if next_seconds is None:
             next_seconds = self.args.closed_interval
-        yield Log("额度已刷新（%s），%ds 后刷新"
-                  % (self.clock_text(), next_seconds))
+        yield Verbose("额度已刷新（%s），%ds 后刷新"
+                      % (self.clock_text(), next_seconds))
         return posted
 
     def handle_balance_due(self):
@@ -662,8 +703,8 @@ class Scheduler:
         posted = yield PostDevice("/api/v1/stock", {
             "balance": {"progress": list(result.data[1])}})
         if posted.ok:
-            yield Log("额度进度已更新（%s），%ds 后刷新"
-                      % (self.clock_text(), self.args.balance_every))
+            yield Verbose("额度进度已更新（%s），%ds 后刷新"
+                          % (self.clock_text(), self.args.balance_every))
         else:
             yield Log("额度条推送失败：%s" % posted.error)
         return posted
@@ -677,12 +718,14 @@ class Scheduler:
             yield Log("行情日期 %s 不是今天，转休市节拍" % date)
             return None
         posted = yield PostDevice("/api/v1/stock", {"rows": rows})
-        if posted.ok:
-            prefix = "开市中" if self.state == State.AWAKE_OPEN else "休市中"
-            yield Log("%s（%s）股票已推送，%ds 后下一轮"
-                      % (prefix, self.clock_text(), self.args.open_interval))
-        else:
+        if not posted.ok:
             yield Log("股票设备推送失败：%s" % posted.error)
+            return posted
+        # 15s 一推的例行成功行进 verbose：普通日志只留启动摘要、状态转移和异常，
+        # 否则 journal 每分钟 4 行，真正要看的异常反而被淹没。
+        prefix = "开市中" if self.state == State.AWAKE_OPEN else "休市中"
+        yield Verbose("%s（%s）股票已推送，%ds 后下一轮"
+                      % (prefix, self.clock_text(), self.args.open_interval))
         return posted
 
     def handle_stock(self):
@@ -710,8 +753,8 @@ class Scheduler:
         result = yield PostSleep(True)
         if result.ok:
             yield EnterState(Event.SLEEP_KEEPALIVE)
-            yield Log("休市中（%s）重申 sleep，%ds 后再次检查"
-                      % (self.clock_text(), self.args.sleep_keepalive))
+            yield Verbose("休市中（%s）重申 sleep，%ds 后再次检查"
+                          % (self.clock_text(), self.args.sleep_keepalive))
         return result
 
     def handle_wake(self):
@@ -752,8 +795,8 @@ class Scheduler:
         posted = yield PostDevice("/api/v1/stock", {"rows": rows})
         if posted.ok:
             prefix = "开市中" if self.state == State.AWAKE_OPEN else "休市中"
-            yield Log("%s（%s）股票已推送，%ds 后下一轮"
-                      % (prefix, self.clock_text(), self.args.open_interval))
+            yield Verbose("%s（%s）股票已推送，%ds 后下一轮"
+                          % (prefix, self.clock_text(), self.args.open_interval))
 
     def _dispatch_due(self):
         count = 0
@@ -1188,6 +1231,8 @@ def build_arg_parser():
                         help="用 VirtualClock 和假后端运行内置策略验收")
     common.add_argument("--demo", action="store_true",
                         help="额度/股票均用本地随机数据；不联网且跳过开市判定")
+    common.add_argument("--verbose", action="store_true",
+                        help="连 15s 行情的成功行也打（默认只打低频状态与全部异常）")
     return parser
 
 
@@ -1352,7 +1397,7 @@ def self_test():
                       sleep_from="00:00", sleep_to="08:00",
                       sleep_keepalive=600, loop=False, dry_run=False,
                       check=False, demo=True, self_test=False,
-                      no_quota_bars=False)
+                      no_quota_bars=False, verbose=False)
         values.update(changes)
         return argparse.Namespace(**values)
     
@@ -1567,7 +1612,25 @@ def self_test():
     ok("漏 tick 单飞跳过积压节拍", len(row_bodies(backend)) == 1 and
        any("跳过" in line for line in s.log_lines))
     
-    print("SELF-TEST PASS: %d/17" % len(results))
+    # 18. 例行节拍行默认全部静默（--verbose 才打），启动摘要照打。
+    clock, backend, s = make(0, no_sleep=True, open_interval=15)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=2)
+    ok("例行节拍行默认静默、启动摘要照打",
+       not any("股票已推送" in line for line in s.log_lines) and
+       not any("额度进度已更新" in line for line in s.log_lines) and
+       any("启动：状态=" in line for line in s.log_lines) and
+       len(row_bodies(backend)) == 2)
+    
+    clock, backend, s = make(0, no_sleep=True, open_interval=15, verbose=True)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=2)
+    ok("--verbose 恢复例行节拍行",
+       any("股票已推送" in line for line in s.log_lines) and
+       any("额度进度已更新" in line for line in s.log_lines) and
+       len(row_bodies(backend)) == 2)
+    
+    print("SELF-TEST PASS: %d/19" % len(results))
     
 
 def check_device_sync(args, device_base):

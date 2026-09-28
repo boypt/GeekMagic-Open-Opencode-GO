@@ -65,6 +65,11 @@ bool StockData::setQuota(const int8_t* percent, uint8_t count) {
         }
     }
     s_hasQuota = any;
+    // 纯额度推送（body 里没有 rows）也要让 stock 场景察觉：场景只在
+    // updatedAtMs 变化时才去比对快照，不更新时间戳就只会等到下一次行情
+    // 推送才重画条带。此处只动时间戳，行数据与行快照比较都走各自的差量路径。
+    s_updatedAtMs = millis();
+    s_hasUpdate = true;
     return true;
 }
 

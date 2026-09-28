@@ -2479,6 +2479,17 @@ static void sendStockError(Webserver* webserver, int code, const char* message) 
     webserver->raw().send(code, "application/json", json);
 }
 
+/// POST /api/v1/stock 的成功响应：纯行情、纯额度、两者都带，返回体一致。
+static void sendStockOk(Webserver* webserver) {
+    JsonDocument doc;
+    doc["ok"] = true;
+
+    char json[16];
+    serializeJson(doc, json, sizeof(json));
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
 static void handleStockGet(Webserver* webserver) {
     if (!requireBearerToken(webserver)) {
         return;
@@ -2543,14 +2554,18 @@ static void handleStockSet(Webserver* webserver) {
         return;
     }
 
-    if (!ddoc["rows"].is<JsonArray>()) {
-        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows must be an array of 0..5 objects");
+    // rows / balance 都是可选键且彼此独立：开市期间行情 15s 一推、额度 5min 一推，
+    // 各推各的（额度不再搭行情的车，否则每 15s 都要重发同一份数据）。只推 balance
+    // 时不碰行情缓冲、不接管屏幕，屏顶三条额度条由 StockScene 自己的差量判定重画
+    //（setQuota 会更新时间戳把它唤醒）。两个键都缺 = 无事可做，回 400 而不是假成功。
+    const bool rowsPresent = !ddoc["rows"].isNull();
+    const bool quotaPresent = !ddoc["balance"].isNull();
+    if (!rowsPresent && !quotaPresent) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows or balance is required");
         return;
     }
-
-    JsonArray inputRows = ddoc["rows"].as<JsonArray>();
-    if (inputRows.size() > StockData::MAX_ROWS) {
-        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows must contain at most 5 objects");
+    if (rowsPresent && !ddoc["rows"].is<JsonArrayConst>()) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows must be an array of 0..5 objects");
         return;
     }
 
@@ -2561,8 +2576,8 @@ static void handleStockSet(Webserver* webserver) {
     int8_t quota[StockData::QUOTA_MAX] = {-1, -1, -1};
     uint8_t quotaCount = 0;
     // 「键缺失」与「键存在但不是对象」必须分开：isNull() 对缺失与显式 null 同为真，
-    // 所以先用它判缺失，再用 as<JsonObjectConst>() + isNull() 判类型（沿用本文件行校验的口径）。
-    bool quotaPresent = !ddoc["balance"].isNull();
+    // 所以上面用 isNull() 判存在性，这里再用 as<JsonObjectConst>() + isNull() 判类型
+    //（沿用本文件行校验的口径）。
     JsonObjectConst balance = ddoc["balance"].as<JsonObjectConst>();
     if (quotaPresent && balance.isNull()) {
         sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "balance must be an object");
@@ -2600,6 +2615,23 @@ static void handleStockSet(Webserver* webserver) {
             }
             quota[i] = static_cast<int8_t>(value);
         }
+    }
+
+    // 纯额度推送（body 只有 balance）：只写额度槽位。此处绝不能走 clear() ——
+    // 那会把行情行一起抹掉，屏幕瞬间变成 NO DATA，5 分钟的行情白等。
+    if (!rowsPresent) {
+        if (!StockData::setQuota(quota, quotaCount)) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "invalid balance progress");
+            return;
+        }
+        sendStockOk(webserver);
+        return;
+    }
+
+    JsonArray inputRows = ddoc["rows"].as<JsonArray>();
+    if (inputRows.size() > StockData::MAX_ROWS) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows must contain at most 5 objects");
+        return;
     }
 
     StockData::Row rows[StockData::MAX_ROWS] = {};
@@ -2666,12 +2698,7 @@ static void handleStockSet(Webserver* webserver) {
         SceneManager::switchTo("stock");
     }
 
-    JsonDocument doc;
-    doc["ok"] = true;
-    char json[32];
-    serializeJson(doc, json, sizeof(json));
-    setCorsHeaders(webserver);
-    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+    sendStockOk(webserver);
 }
 
 // ===========================================================================

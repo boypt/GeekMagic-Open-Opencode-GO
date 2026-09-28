@@ -762,7 +762,10 @@ static bool s_liveAuthed = true;
 static bool s_liveAborted = false;
 static int s_liveRowY = 0;
 static int s_liveRowFill = 0;
-static uint8_t s_liveRow[480];
+// alignas(4) 不是洁癖：本缓冲会被 reinterpret_cast<uint16_t*> 做 16 位读写，
+// ESP8266 上奇地址 16 位访问直接 Exception 9 LoadStoreError，而链接器只把它放在
+// 前面静态量结束处、不保证 2/4 字节对齐 —— 相邻多一个单字节 bool 就可能挤成奇地址。
+alignas(4) static uint8_t s_liveRow[480];
 
 static void livePushBytes(const uint8_t* data, size_t len) {
     auto* tft = reinterpret_cast<Arduino_TFT*>(DisplayManager::getGfx());

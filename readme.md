@@ -26,6 +26,8 @@
 - [What's next ?](#whats-next)
 - [The firmware](#plateformio-firmware)
 - [Install guide](#installation-guide)
+- [Rescue Boot Mode](#rescue-boot-mode)
+- [API — Notice notifications](#api--notice-notifications)
 - [License](#license)
 - [Support](#support)
 
@@ -398,6 +400,215 @@ If the device fails to boot successfully several times in a row (boot loop), it 
 
 - After a successful boot and stable operation, the crash counter is reset automatically
 - Reboot the device after fixing the issue (e.g., uploading new firmware or resetting the token)
+
+---
+
+## API — Notice notifications
+
+The `notice` scene is a **temporary overlay**: it takes over the screen, shows a big level icon plus an ASCII body (or a full-screen image), then automatically switches back to whatever scene was running before.
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/v1/notice` | `POST` | Show a text notice |
+| `/api/v1/notice/image` | `POST` | Show a notice that is one full-screen image |
+| `/api/v1/notice` | `GET` | Query the active notice state |
+
+All three require the Bearer token: `-H "Authorization: Bearer $TOKEN"` (see `api_token` in `data/config.json` or the Web UI).
+
+**Rules that trip people up**
+
+- `text` is **printable ASCII only** (`0x20`–`0x7E`) plus `\n`. The firmware has no CJK font, so Chinese characters are rejected with `400`. `\r\n` is normalized to `\n`.
+- `seconds` is an **integer 1..30** (default `5`). `"5"` (string), `5.0`, `0`, `31` and negatives are all `400`.
+- `level` is `info` (default) / `warning` / `critical`, case-insensitive. It changes the icon shape (circle / triangle / square), so the notice stays readable without relying on color.
+- `text` must be 1..199 bytes; the request body must stay under 1 KB.
+- The notice is **not persistent** — a reboot clears it.
+- While a notice is active, other scene requests are ignored: `POST /api/v1/scene` returns `409`, and stock/balance/live pushes are accepted but not displayed. The return target is captured when the notice enters, and restored (scene *and* param) when the countdown expires.
+
+### Text notice
+
+```bash
+# minimum: 5s info notice
+curl -X POST http://192.168.1.50/api/v1/notice \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Rebooting soon"}'
+
+# full form: warning level, 20s, multi-line body
+curl -X POST http://192.168.1.50/api/v1/notice \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"level":"warning","seconds":20,"text":"OTA update available\nDevice reboots in 20s\nDo not power off"}'
+
+# critical level (square icon)
+curl -X POST http://192.168.1.50/api/v1/notice \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"level":"critical","text":"WiFi lost"}'
+```
+
+Response (`200`):
+
+```json
+{"ok":true,"scene":"notice","seconds":20,"remaining":20}
+```
+
+Pushing a new notice while one is already active replaces the content and restarts the countdown; the return target stays the same.
+
+### Image notice
+
+The image variant streams a **240x240 RGB565 (little-endian) raw frame**, exactly 115200 bytes — the same format as `/api/v1/album/live`. It is drawn row by row as it arrives and is **not** saved. The whole screen is the frame; no icon or decorations are added.
+
+The duration travels in the query string (the multipart body is the raw frame, so there is no room for JSON). An invalid value is rejected in the done callback, and **not a single pixel is drawn**.
+
+```bash
+# 12-second full-screen notice
+curl -X POST "http://192.168.1.50/api/v1/notice/image?seconds=12" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F "file=@alert.rgb565"
+```
+
+Response (`200`):
+
+```json
+{"ok":true,"scene":"notice","seconds":12,"rows":240}
+```
+
+`rows` is the number of 480-byte rows the device actually received.
+
+### Querying the state
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://192.168.1.50/api/v1/notice
+```
+
+While active:
+
+```json
+{"active":true,"mode":"text","level":"warning","text":"OTA update available","total":20,"remaining":18}
+```
+
+When idle:
+
+```json
+{"active":false,"mode":"none","total":0,"remaining":0}
+```
+
+`remaining` is rounded up, so it ticks `2, 1` before the switch back happens.
+
+### Common errors
+
+| Status | Response | Cause |
+| --- | --- | --- |
+| `400` | `{"status":"error","message":"text must be 1..199 printable ASCII bytes (\n allowed, non-ASCII rejected)"}` | Chinese/UTF-8 characters or a tab in `text` |
+| `400` | `{"status":"error","message":"seconds must be an integer 1..30"}` | `0`, `31`, a float, or a quoted number |
+| `400` | `{"status":"error","message":"body too large (max 1023 bytes)"}` | Body >= 1 KB |
+| `400` | `{"status":"error","message":"Invalid JSON"}` | Body is not valid JSON, or empty |
+| `401` | `{"status":"error","message":"Invalid or missing token"}` | Missing or wrong Bearer token |
+| `409` | `{"status":"error","message":"notice active (Ns remaining), scene switch ignored"}` | `POST /api/v1/scene` while a notice is showing |
+
+### Python example
+
+Standard library only, no `requests` required:
+
+```python
+#!/usr/bin/env python3
+"""Push temporary notices to a GeekMagic device (text or image)."""
+import json
+import os
+import struct
+import urllib.error
+import urllib.request
+
+DEVICE = os.environ.get("DEVICE", "192.168.1.50")
+TOKEN = os.environ["API_TOKEN"]
+BASE = f"http://{DEVICE}/api/v1"
+
+
+def _request(req: urllib.request.Request) -> dict:
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode() or "{}")
+
+
+def notice(text: str, level: str = "info", seconds: int = 5) -> dict:
+    """Show a text notice. ASCII only, seconds must be an int in 1..30."""
+    payload = json.dumps({"level": level, "seconds": seconds, "text": text})
+    req = urllib.request.Request(
+        f"{BASE}/notice",
+        data=payload.encode(),
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    return _request(req)
+
+
+def notice_image(rgb565: bytes, seconds: int = 5) -> dict:
+    """Show a notice that is one 240x240 RGB565(LE) frame (115200 bytes)."""
+    boundary = "----geekmagicnotice"
+    body = b"".join([
+        f"--{boundary}\r\n".encode(),
+        b'Content-Disposition: form-data; name="file"; filename="frame.rgb565"\r\n',
+        b"Content-Type: application/octet-stream\r\n\r\n",
+        rgb565,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ])
+    req = urllib.request.Request(
+        f"{BASE}/notice/image?seconds={int(seconds)}",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {TOKEN}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    return _request(req)
+
+
+def notice_state() -> dict:
+    req = urllib.request.Request(
+        f"{BASE}/notice", headers={"Authorization": f"Bearer {TOKEN}"}
+    )
+    return _request(req)
+
+
+def to_rgb565(width: int, height: int, pixel_at) -> bytes:
+    """Convert an RGB image to the raw frame format.
+
+    `pixel_at(x, y)` must return an (r, g, b) tuple with 0..255 components.
+    The layout is standard RGB565 little-endian, the same one the Web UI
+    uploader produces. The device applies the R/B compensation itself, so
+    send plain RGB565 here.
+    """
+    out = bytearray()
+    for y in range(height):
+        for x in range(width):
+            r, g, b = pixel_at(x, y)
+            value = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+            out += struct.pack("<H", value)
+    return bytes(out)
+
+
+if __name__ == "__main__":
+    print(notice("Rebooting soon", level="warning", seconds=10))
+    # frame = to_rgb565(240, 240, lambda x, y: (x, y, 0))
+    # print(notice_image(frame, seconds=8))
+    print(notice_state())
+```
+
+If you already have an image file, convert it to RGB565 with a 240x240 canvas first (Pillow makes this a one-liner):
+
+```python
+from PIL import Image
+
+img = Image.open("alert.png").convert("RGB").resize((240, 240))
+with open("alert.rgb565", "wb") as fh:
+    fh.write(to_rgb565(240, 240, img.getpixel))
+```
 
 ---
 

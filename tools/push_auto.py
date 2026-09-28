@@ -14,10 +14,15 @@ urllib 调用只发生在 handler yield 的 Fetch*/Post* 任务中。
 每状态闹钟表::
 
     AWAKE_OPEN     Every(stock,15s), Every(quota_due,300s),
-                   DailyAt(market_check,15:30), DailyAt(sleep_at,00:00)
+                   DailyAt(market_check,15:30), DailyAt(sleep_at,20:00)
     AWAKE_CLOSED   Every(balance,300s), DailyAt(market_check,09:20),
-                   DailyAt(sleep_at,00:00)
+                   DailyAt(sleep_at,20:00)
     SLEEPING       Every(keepalive,600s), DailyAt(wake_at,08:00)
+
+休眠区间 20:00~08:00 **跨午夜**（is_sleep_time 已支持 from > to 的情形）：收盘
+15:30 到 20:00 之间照常按休市节拍推额度，20:00 闹钟入睡，次日 08:00 唤醒。
+起止时间从命令行 flag 读，也可用环境变量 SLEEP_FROM / SLEEP_TO 覆盖 —— 部署机上
+就是 systemd 的 EnvironmentFile（/etc/sd2.conf），改那里不用动 unit 的 ExecStart。
 
 开市期间屏幕只保留股票场景：额度**不再**单独 POST /api/v1/balance（设备会立刻
 切到 balance 页），改成按 --balance-every 单独推一条只含额度数据的股票推送；
@@ -1214,10 +1219,13 @@ def build_arg_parser():
     policy.add_argument("--balance-every", type=int, default=300,
                         help="开市额度间隔秒数，默认 300（5 分钟；单独推，"
                              "不带行情、不切屏）")
-    policy.add_argument("--sleep-from", default="00:00",
-                        help="每日休眠开始 HH:MM，默认 00:00")
-    policy.add_argument("--sleep-to", default="08:00",
-                        help="每日休眠结束 HH:MM，默认 08:00")
+    policy.add_argument("--sleep-from",
+                        default=os.environ.get("SLEEP_FROM", "20:00"),
+                        help="每日休眠开始 HH:MM，默认 20:00（跨午夜到 --sleep-to；"
+                             "也可用 SLEEP_FROM）")
+    policy.add_argument("--sleep-to",
+                        default=os.environ.get("SLEEP_TO", "08:00"),
+                        help="每日休眠结束 HH:MM，默认 08:00（也可用 SLEEP_TO）")
     policy.add_argument("--sleep-keepalive", type=int, default=600,
                         help="休眠期间重申 sleep 的间隔秒数，默认 600")
 
@@ -1243,12 +1251,12 @@ def validate_args(args):
     except ValueError as ex:
         return device_base, [], str(ex)
     try:
-        sleep_from = parse_clock(args.sleep_from, "--sleep-from")
-        sleep_to = parse_clock(args.sleep_to, "--sleep-to")
+        sleep_from = parse_clock(args.sleep_from, "--sleep-from/SLEEP_FROM")
+        sleep_to = parse_clock(args.sleep_to, "--sleep-to/SLEEP_TO")
     except ValueError as ex:
         return device_base, symbols, str(ex)
     if sleep_from == sleep_to:
-        return device_base, symbols, "--sleep-from 与 --sleep-to 不能相同"
+        return device_base, symbols, "--sleep-from/--sleep-to 不能相同"
     for name in ("timeout", "open_interval", "closed_interval", "balance_every",
                  "sleep_keepalive"):
         if getattr(args, name) <= 0:
@@ -1394,7 +1402,7 @@ def self_test():
                       insecure=False, symbols=DEFAULT_SYMBOLS,
                       sina_url=DEFAULT_SINA_URL, open_interval=15,
                       closed_interval=300, balance_every=300,
-                      sleep_from="00:00", sleep_to="08:00",
+                      sleep_from="20:00", sleep_to="08:00",
                       sleep_keepalive=600, loop=False, dry_run=False,
                       check=False, demo=True, self_test=False,
                       no_quota_bars=False, verbose=False)
@@ -1540,11 +1548,11 @@ def self_test():
     s.run(max_events=2)
     ok("非开市 300s 额度节拍", backend.calls.count("post/api/v1/balance") == 2)
     
-    # 9. 00:00 进入休眠。
+    # 9. 启动时刻已落在默认休眠区间（20:00~08:00 跨午夜，北京 00:00 在区间内）。
     midnight = -8 * 3600
     clock, backend, s = make(midnight)
     s.start()
-    ok("00:00 进入休眠并发送 sleep true", s.state == State.SLEEPING and
+    ok("启动落在休眠区间直接休眠并发送 sleep true", s.state == State.SLEEPING and
        backend.calls.count("sleep:True") == 1)
     
     # 10. keepalive 前无数据调用。
@@ -1630,7 +1638,46 @@ def self_test():
        any("额度进度已更新" in line for line in s.log_lines) and
        len(row_bodies(backend)) == 2)
     
-    print("SELF-TEST PASS: %d/19" % len(results))
+    # 20. 默认休眠 20:00：19:00 还醒着，20:00 闹钟触发入睡。
+    clock, backend, s = make(11 * 3600, open_interval=3600, balance_every=3600)
+    s.start()                    # 北京 19:00：不在休眠区间
+    clock.advance(3600)          # 到 20:00
+    s.run(max_events=1)
+    ok("默认 20:00 闹钟触发入睡", s.state == State.SLEEPING and
+       backend.calls.count("sleep:True") == 1)
+    
+    # 21. 休眠时间可由配置文件覆盖：SLEEP_FROM / SLEEP_TO 环境变量。
+    saved = {key: os.environ.get(key) for key in ("SLEEP_FROM", "SLEEP_TO")}
+    os.environ["SLEEP_FROM"] = "21:30"
+    os.environ["SLEEP_TO"] = "07:15"
+    try:
+        parsed = build_arg_parser().parse_args([])
+        ok("休眠时间读 SLEEP_FROM/SLEEP_TO 配置",
+           parsed.sleep_from == "21:30" and parsed.sleep_to == "07:15")
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    
+    # 22. 显式 flag 优先于配置文件。
+    saved = {key: os.environ.get(key) for key in ("SLEEP_FROM", "SLEEP_TO")}
+    os.environ["SLEEP_FROM"] = "21:30"
+    os.environ["SLEEP_TO"] = "07:15"
+    try:
+        parsed = build_arg_parser().parse_args(
+            ["--sleep-from", "23:00", "--sleep-to", "06:00"])
+        ok("命令行 flag 优先于配置文件",
+           parsed.sleep_from == "23:00" and parsed.sleep_to == "06:00")
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    
+    print("SELF-TEST PASS: %d/22" % len(results))
     
 
 def check_device_sync(args, device_base):

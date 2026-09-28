@@ -295,19 +295,88 @@ static void drawSegText(int cx, int topY, const String& s, uint16_t color) {
     }
 }
 
+// ---------- 行/状态行的「有效显示内容」（局部更新比对的唯一口径）----------
+// 绘制与比对共用这两个函数 → 显示回退规则（空标签回落 5H/WK./MO.、空重置值
+// 显示 --、无进度按 -1 空槽处理）天然一致，不会出现「画了 A 却按 B 判变化」。
+// 截断不进快照：截断由同一份输入确定性地算出，存截断前文本即可。
+// 输出缓冲全部由调用方提供（栈上或静态），零堆分配。
+static void quotaRowDisplayText(uint8_t index, char* labelOut, size_t labelCap,
+                                char* resetOut, size_t resetCap, int* progressOut) {
+    const bool inPayload = index < s_rowCount;
+    const int progress = inPayload ? UsageManager::rowProgress(index) : -1;
+    const char* label = inPayload ? UsageManager::rowLabel(index) : "";
+    if (label[0] == '\0') {
+        label = (index == 0) ? "5H" : (index == 1 ? "WK." : "MO.");
+    }
+    const char* reset = inPayload ? UsageManager::rowReset(index) : "";
+    if (reset[0] == '\0') {
+        reset = "--";
+    }
+    strlcpy(labelOut, label, labelCap);
+    strlcpy(resetOut, reset, resetCap);
+    *progressOut = progress;
+}
+
+// 状态行有效文本（与推送时刻耦合：同内容的新推送会得到新的 "UPD HH:MM"）
+static void statusDisplayText(char* out, size_t cap) {
+    if (!s_hasPush) {
+        strlcpy(out, "WAITING", cap);
+    } else if (s_hasStatus && s_status[0] != '\0') {
+        strlcpy(out, s_status, cap);
+    } else if (s_pushEpoch > 0) {
+        const String t = "UPD " + formatLocalTime(s_pushEpoch + TZ_OFFSET_SEC, "%H:%M");
+        strlcpy(out, t.c_str(), cap);
+    } else {
+        strlcpy(out, "UPD --:--", cap);
+    }
+}
+
+// ---------- 屏上内容快照（推送局部更新基准）----------
+// 只存「当前屏上真正画出来的内容」，定长静态缓冲、零堆：
+//   3 × (标签 8 + 重置 16 + 进度 4) = 84B，状态行 48B，两个标志 2B → 共 134B。
+// 容量直接沿用推送缓冲的既有上限（kRowLabelCap / kRowResetCap / kStatusCap），
+// 逐行重建故无需额外 NUL 余量之外的冗余。
+struct QuotaRowShown {
+    char label[UsageManager::kRowLabelCap];
+    char reset[UsageManager::kRowResetCap];
+    int progress;
+};
+static QuotaRowShown s_shownRows[UsageManager::kBalanceLines];
+static char s_shownStatus[UsageManager::kStatusCap];
+// 快照是否可信（整屏绘制或局部重画后才为 true；退场/未画过主页面时为 false）
+static bool s_shownValid = false;
+// 推送到达待刷新标志：只走局部更新，不与显示设置变更的整屏重绘共用一个信号
+static bool s_pushRefreshPending = false;
+
+// 绘制后同步快照：drawQuotaRow / drawUpdateRow 各自收尾调用，
+// 保证「快照 == 屏上像素」，整屏与局部两条路径共用同一套记录逻辑。
+static void captureRowShown(uint8_t index) {
+    quotaRowDisplayText(index, s_shownRows[index].label, sizeof(s_shownRows[index].label),
+                        s_shownRows[index].reset, sizeof(s_shownRows[index].reset),
+                        &s_shownRows[index].progress);
+    s_shownValid = true;
+}
+
+// 第 index 行额度组的顶部 y（整屏与局部刷新共用，避免两处布局公式漂移）
+static int quotaRowY(uint8_t index) { return GROUP_TOP + (GROUP_H + GROUP_GAP) * index; }
+
+static void captureStatusShown() {
+    statusDisplayText(s_shownStatus, sizeof(s_shownStatus));
+    s_shownValid = true;
+}
+
 // ---------- 右栏额度行（三段式）----------
 // labels/resets/progress 均由 API 写入定长缓冲；设备只按位置排版，不解析字符串。
 // 空标签才回落到旧版固定标签，这是无标签数据时的显示兜底，不是语义解析。
+// 行带自清底 → 本身即一个自洽的局部更新单元（局部刷新直接复用）。
 void UsageManager::drawQuotaRow(int y, uint8_t index) {
     auto* gfx = DisplayManager::getGfx();
     gfx->fillRect(122, y, 112, GROUP_H, C_BG);
 
-    const bool inPayload = index < s_rowCount;
-    const int progress = inPayload ? rowProgress(index) : -1;
-    const char* label = inPayload ? rowLabel(index) : "";
-    if (label[0] == '\0') {
-        label = (index == 0) ? "5H" : (index == 1 ? "WK." : "MO.");
-    }
+    char label[UsageManager::kRowLabelCap];
+    char resetRaw[UsageManager::kRowResetCap];
+    int progress = -1;
+    quotaRowDisplayText(index, label, sizeof(label), resetRaw, sizeof(resetRaw), &progress);
     const int contentX = 126;
     const int contentX1 = 230;
     const int contentW = contentX1 - contentX;
@@ -320,7 +389,7 @@ void UsageManager::drawQuotaRow(int y, uint8_t index) {
     truncateToFit(labelFit, contentW);
 
     char pct[12];
-    const bool hasProgress = inPayload && progress >= 0;
+    const bool hasProgress = progress >= 0;
     if (hasProgress) {
         snprintf(pct, sizeof(pct), "%u%%", static_cast<unsigned>(progress));
     } else {
@@ -350,16 +419,14 @@ void UsageManager::drawQuotaRow(int y, uint8_t index) {
         gfx->fillRect(trackX, trackY, fillW, trackH, fillColor);
     }
 
-    // 下方：重置值由 API 提供；缺失时仅显示占位。
-    const char* reset = inPayload ? rowReset(index) : "";
-    if (reset[0] == '\0') {
-        reset = "--";
-    }
+    // 下方：重置值由 API 提供（缺失时 quotaRowDisplayText 已回落为 "--"）。
     u8g2().setFont(FONT_MINI);
     char resetFit[UsageManager::kRowResetCap];
-    strlcpy(resetFit, reset, sizeof(resetFit));
+    strlcpy(resetFit, resetRaw, sizeof(resetFit));
     truncateToFit(resetFit, contentW);
     drawTextC(contentX1 - textWidthC(resetFit), y + 31, resetFit, C_SUB);
+
+    captureRowShown(index);  // 画完即同步屏上快照（整屏/局部两条路径共用）
 }
 
 // ---------- 左栏时钟区 ----------
@@ -540,27 +607,20 @@ void UsageManager::drawUpdateRow() {
 
     u8g2().setFont(FONT_MINI);
     char upd[UsageManager::kStatusCap];
-    if (!s_hasPush) {
-        strlcpy(upd, "WAITING", sizeof(upd));
-    } else if (s_hasStatus && s_status[0] != '\0') {
-        strlcpy(upd, s_status, sizeof(upd));
-    } else if (s_pushEpoch > 0) {
-        String t = "UPD " + formatLocalTime(s_pushEpoch + TZ_OFFSET_SEC, "%H:%M");
-        strlcpy(upd, t.c_str(), sizeof(upd));
-    } else {
-        strlcpy(upd, "UPD --:--", sizeof(upd));
-    }
+    statusDisplayText(upd, sizeof(upd));
     truncateToFit(upd, 112);
     drawTextC(QUOTA_X1 - textWidthC(upd), STATUS_Y + 4, upd, C_SUB);
+
+    captureStatusShown();  // 画完即同步屏上快照
 }
 
 // ---------- 页面组装 ----------
 // 正文区域（状态行 + 额度栏 + 时钟栏 + 中缝竖线）；调用前须保证该区域已清底
 void UsageManager::drawBody() {
     drawUpdateRow();
-    drawQuotaRow(GROUP_TOP, 0);
-    drawQuotaRow(GROUP_TOP + GROUP_H + GROUP_GAP, 1);
-    drawQuotaRow(GROUP_TOP + (GROUP_H + GROUP_GAP) * 2, 2);
+    drawQuotaRow(quotaRowY(0), 0);
+    drawQuotaRow(quotaRowY(1), 1);
+    drawQuotaRow(quotaRowY(2), 2);
     drawClock();
     DisplayManager::getGfx()->drawFastVLine(120, STATUS_Y, ROW_BLOCK_BOTTOM - STATUS_Y, C_BORDER);
 }
@@ -574,6 +634,47 @@ void UsageManager::drawMainPage() {
     gfx->drawFastHLine(16, 40, 208, C_BORDER);
     drawBody();
     gfx->endWrite();
+}
+
+// ---------- 推送局部刷新 ----------
+// 与七段时钟的像素差量重绘同一思路：推送只可能改动状态行与三行额度，
+// 因此只重画「屏上内容真的变了」的那一行（drawQuotaRow 行带自清底），
+// 内容完全一致时一次绘制都不做 → 消除整屏 fillScreen 造成的闪烁。
+// 返回是否真的碰了屏（全一致时 false → 零绘制）
+bool UsageManager::redrawChangedQuota() {
+    // 先算差异再决定是否碰屏：全一致 → 零绘制（连 startWrite 都不开）
+    uint8_t changedRows = 0;
+    char label[UsageManager::kRowLabelCap];
+    char reset[UsageManager::kRowResetCap];
+    int progress = -1;
+    for (uint8_t i = 0; i < UsageManager::kBalanceLines; i++) {
+        quotaRowDisplayText(i, label, sizeof(label), reset, sizeof(reset), &progress);
+        if (strncmp(label, s_shownRows[i].label, UsageManager::kRowLabelCap) != 0 ||
+            strncmp(reset, s_shownRows[i].reset, UsageManager::kRowResetCap) != 0 ||
+            progress != s_shownRows[i].progress) {
+            changedRows |= static_cast<uint8_t>(1U << i);
+        }
+    }
+    char status[UsageManager::kStatusCap];
+    statusDisplayText(status, sizeof(status));
+    const bool statusChanged = (strncmp(status, s_shownStatus, UsageManager::kStatusCap) != 0);
+    if (changedRows == 0 && !statusChanged) {
+        return false;
+    }
+
+    u8g2();
+    auto* gfx = DisplayManager::getGfx();
+    gfx->startWrite();
+    if (statusChanged) {
+        drawUpdateRow();  // 内部同步快照
+    }
+    for (uint8_t i = 0; i < kBalanceLines; i++) {
+        if (changedRows & (1U << i)) {
+            drawQuotaRow(quotaRowY(i), i);  // 内部同步快照
+        }
+    }
+    gfx->endWrite();
+    return true;
 }
 
 // ---------- 纯时钟页（clock 场景）----------
@@ -767,8 +868,11 @@ void UsageManager::pushBalance(uint8_t rowCount, const char* status, bool hasSta
     s_hasPush = true;
     s_pushMillis = millis();
     s_pushEpoch = timeSynced() ? time(nullptr) : 0;
-    // 立即刷新显示：经整屏重绘由 update() 重画主页面（严禁绘制启动屏，见坑 #4）
-    DisplayManager::requestFullRedraw();
+    // 立即刷新显示：只置「推送待刷新」，由 update() 走局部更新
+    //（逐行比对屏上快照，只重画变化行；严禁绘制启动屏，见坑 #4）
+    // 注意不碰 DisplayManager::requestFullRedraw()：那是显示设置变更
+    //（rotation / 面板 profile）的整屏重绘信号，两者互不降级。
+    s_pushRefreshPending = true;
     Logger::info("Balance push stored", "Balance");
 }
 
@@ -777,6 +881,8 @@ void UsageManager::enterScene() {
     mainPageDrawn = false;
     lastClockMinute = -1;
     lastClockSecond = -1;
+    s_pushRefreshPending = false;  // 入场即全量绘制，吞掉入场前积压的推送刷新
+    s_shownValid = false;
 
     if (WiFiManager::isConnected()) {
         drawMainPage();
@@ -791,6 +897,7 @@ void UsageManager::exitScene() {
     mainPageDrawn = false;
     lastClockMinute = -1;
     lastClockSecond = -1;
+    s_shownValid = false;  // 屏上内容已不属本场景，快照作废
 }
 
 void UsageManager::update() {
@@ -801,12 +908,29 @@ void UsageManager::update() {
     const bool wifiReady = (wifiManager != nullptr) && !wifiManager->isApMode() &&
                            WiFiManager::isConnected();
 
-    // 显示设置（rotation / 面板 profile）变更或上位机推送后，应用层整屏重绘主页面
+    // 显示设置（rotation / 面板 profile）变更后的整屏重绘主页面
     //（用推送缓冲/占位符绘制；不看 wifiReady；严禁绘制启动屏，见坑 #4）
+    // 整屏绘制顺带把屏上快照刷新为当前内容
     if (DisplayManager::consumeFullRedrawRequest()) {
         drawMainPage();
         mainPageDrawn = true;
         Logger::info("UsageManager: main page redrawn", "Balance");
+    }
+
+    // 上位机推送：只重画与推送缓冲/屏上快照不一致的行（内容全同则零绘制）
+    if (s_pushRefreshPending) {
+        s_pushRefreshPending = false;
+        if (mainPageDrawn && s_shownValid) {
+            if (redrawChangedQuota()) {
+                Logger::info("UsageManager: balance rows redrawn (diff only)", "Balance");
+            } else {
+                Logger::info("UsageManager: balance push unchanged (no redraw)", "Balance");
+            }
+        } else {
+            // 还没画过主页面（首绘 / boot 页期间）→ 无快照可比，退回整屏
+            drawMainPage();
+            mainPageDrawn = true;
+        }
     }
 
     // 首次联网就绪时画主页面（同旧工程 onConnected hook）

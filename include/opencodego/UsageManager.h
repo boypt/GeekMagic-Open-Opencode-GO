@@ -6,8 +6,10 @@
 // 仿 DashboardManager 的 begin()/update() 静态模式：
 //   begin()  标记启动（首帧绘制仍由 enterScene / 首次联网就绪触发）；
 //   update() 每秒 tick 时钟（分钟变化差量更新 HH/MM 字形 / 秒变化只摆动分隔线），
-//            并消费 DisplayManager::requestFullRedraw() 整屏重绘（推送到达时触发）。
-// 局部重绘策略与旧工程一致，无整屏重刷（整屏重绘/入场除外）。
+//            推送到达时走「局部更新」（逐行比对屏上快照，只重画变化行，
+//            内容全同则零绘制），并消费 DisplayManager::requestFullRedraw()
+//            整屏重绘（仅供显示设置变更 rotation / 面板 profile 使用）。
+// 局部重绘策略与旧工程一致，无整屏重刷（整屏重绘/入场/首绘除外）。
 // 存储为静态定长 char 缓冲（零 String 常驻、零 >4KB 分配，见坑 #9）。
 
 #include <Arduino.h>
@@ -31,7 +33,9 @@ class UsageManager {
 
     // ---- 上位机推送入口（POST /api/v1/balance 调用）----
     // labels/progress/resets 由 API 在调用前逐项写入；status 为可选状态行。
-    // 记录行数、状态行、时间戳并 requestFullRedraw()，调用方直接回 200。
+    // 记录行数、状态行、时间戳并置「推送待刷新」（由 update() 局部更新消费，
+    // 不使用 DisplayManager::requestFullRedraw()，以免与显示设置变更的整屏
+    // 重绘混为一谈），调用方直接回 200。
     static void pushBalance(uint8_t rowCount, const char* status, bool hasStatus);
 
     // ---- 供 UI 层 / API 层读取的状态 ----
@@ -59,6 +63,8 @@ class UsageManager {
     static void drawBody();
     static void drawUpdateRow();
     static void drawQuotaRow(int y, uint8_t index);
+    // 推送局部刷新：只重画与屏上快照不一致的行，内容全同则零绘制（返回是否碰屏）
+    static bool redrawChangedQuota();
     static void drawClock();
     static void drawDateLine();
     static void drawSeparator();

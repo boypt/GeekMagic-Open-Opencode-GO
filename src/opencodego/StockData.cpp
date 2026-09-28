@@ -8,6 +8,9 @@ StockData::Row s_rows[StockData::MAX_ROWS] = {};
 uint8_t s_rowCount = 0;
 uint32_t s_updatedAtMs = 0;
 bool s_hasUpdate = false;
+// 额度槽位随股票推送可选附带；-1 = 该槽无值。定长 3 字节，零堆。
+int8_t s_quota[StockData::QUOTA_MAX] = {-1, -1, -1};
+bool s_hasQuota = false;
 }  // namespace
 
 void StockData::begin() {
@@ -32,6 +35,49 @@ void StockData::clear() {
     s_rowCount = 0;
     s_updatedAtMs = 0;
     s_hasUpdate = false;
+    // 额度是股票推送的附属数据，清空行必须一并复位，否则会留下永不刷新的孤儿进度条。
+    for (uint8_t i = 0; i < QUOTA_MAX; ++i) {
+        s_quota[i] = -1;
+    }
+    s_hasQuota = false;
+}
+
+bool StockData::setQuota(const int8_t* percent, uint8_t count) {
+    if (count > QUOTA_MAX) {
+        return false;
+    }
+    if (count > 0 && percent == nullptr) {
+        return false;
+    }
+
+    // 先整体校验再落地，避免半写入状态被渲染到屏上。
+    for (uint8_t i = 0; i < count; ++i) {
+        if (percent[i] < -1 || percent[i] > 100) {
+            return false;
+        }
+    }
+
+    bool any = false;
+    for (uint8_t i = 0; i < QUOTA_MAX; ++i) {
+        s_quota[i] = i < count ? percent[i] : static_cast<int8_t>(-1);
+        if (s_quota[i] >= 0) {
+            any = true;
+        }
+    }
+    s_hasQuota = any;
+    return true;
+}
+
+bool StockData::hasQuota() {
+    return s_hasQuota;
+}
+
+int8_t StockData::quota(uint8_t index) {
+    if (index >= QUOTA_MAX) {
+        return -1;
+    }
+
+    return s_quota[index];
 }
 
 uint8_t StockData::rowCount() {

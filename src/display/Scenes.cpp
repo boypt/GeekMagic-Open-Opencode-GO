@@ -280,8 +280,10 @@ class StockScene : public Scene {
         }
         m_lastUpdated = StockData::updatedAtMs();
         m_count = m_count > StockData::MAX_ROWS ? StockData::MAX_ROWS : m_count;
+        captureQuota();
 
         DisplayManager::clearScreen();
+        drawQuota();
         drawTitle();
         drawRows();
         drawClock(true, true);
@@ -316,6 +318,25 @@ class StockScene : public Scene {
                 }
                 drawRows();
             }
+
+            // 额度条与行数据同属一次股票推送，但差量判定必须彼此独立：
+            // 只动额度时行带保持零绘制，只动行时也不必重画额度带。
+            int8_t quotaNow[StockData::QUOTA_MAX];
+            const bool hasNow = StockData::hasQuota();
+            bool quotaChanged = hasNow != m_hasQuota;
+            for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+                quotaNow[i] = StockData::quota(i);
+                if (quotaNow[i] != m_savedQuota[i]) {
+                    quotaChanged = true;
+                }
+            }
+            if (quotaChanged) {
+                m_hasQuota = hasNow;
+                for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+                    m_savedQuota[i] = quotaNow[i];
+                }
+                drawQuota();
+            }
         }
 
         const time_t now = time(nullptr) + 8 * 3600;
@@ -337,6 +358,25 @@ class StockScene : public Scene {
     static constexpr uint16_t C_DOWN = rgb565(0x00, 0xFF, 0x00);
     /// 平盘 0.00%：中性白，比灰蓝醒目，也不与涨跌色混淆
     static constexpr uint16_t C_NEUTRAL = rgb565(0xFF, 0xFF, 0xFF);
+    // 屏顶额度条：颜色**按行固定**，不再随百分比变 —— 三行各占一个身份色，
+    // 数值完全由条长表达，色相只用来分辨「哪一条是 5H / WK. / MO.」。
+    // 三个色都取自暖橙家族并按明暗度递减（橙红最亮 → 橙棕最沉），既有层次
+    // 又不与股票场景的涨跌红绿/中性白混淆；青绿等冷色在 2px 细条上实机难辨，已弃用。
+    // 源值仍是真 RGB，由本文件的 rgb565() 做 BGR 交换（与全项目同一口径）。
+    static constexpr uint16_t C_TRACK = rgb565(0x28, 0x32, 0x49);
+    static constexpr uint16_t C_BAR_5H = rgb565(0xFF, 0x6B, 0x35);  // 橙红（最亮）
+    static constexpr uint16_t C_BAR_WK = rgb565(0xF2, 0xA6, 0x3C);  // 橙黄
+    static constexpr uint16_t C_BAR_MO = rgb565(0xA9, 0x66, 0x3A);  // 橙棕（最沉）
+    /// 行序 0/1/2 = 5H / WK. / MO.，与额度页三行同序
+    static constexpr uint16_t C_BAR_ROW[StockData::QUOTA_MAX] = {
+        C_BAR_5H, C_BAR_WK, C_BAR_MO};
+    // 屏顶条带占 0..15，标题从 y=16 起，条带下方留 4px 间隙（y=12..15）避免贴字。
+    static constexpr int16_t QUOTA_X = 4;
+    static constexpr int16_t QUOTA_W = 232;
+    static constexpr int16_t QUOTA_H = 2;
+    static constexpr int16_t QUOTA_Y0 = 2;
+    static constexpr int16_t QUOTA_STEP = 4;
+    static constexpr int16_t QUOTA_BAND_H = 16;
     static constexpr int16_t ROW_Y = 50;
     static constexpr uint8_t ROW_STEP = 27;
     static constexpr int16_t CLOCK_Y = 204;
@@ -346,6 +386,9 @@ class StockScene : public Scene {
 
     StockData::Row m_rows[StockData::MAX_ROWS]{};
     StockData::Row m_saved[StockData::MAX_ROWS]{};
+    // 屏上额度快照：只用于判断「是否需要重画条带」，值本身直接取自 StockData
+    int8_t m_savedQuota[StockData::QUOTA_MAX] = {-1, -1, -1};
+    bool m_hasQuota = false;
     uint8_t m_count = 0;
     uint32_t m_lastUpdated = 0;
     int m_lastMinute = -1;
@@ -382,8 +425,39 @@ class StockScene : public Scene {
         out[pos] = '\0';
     }
 
+    auto captureQuota() -> void {
+        m_hasQuota = StockData::hasQuota();
+        for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+            m_savedQuota[i] = StockData::quota(i);
+        }
+    }
+
+    /// 屏顶三条 2px 额度条：只画条，不画任何文字/标签/百分比。
+    /// 条长 = 百分比（唯一的数据通道），条色 = 行身份（5H/WK./MO.），不随数值变。
+    /// 条带自清底，因此它本身就是自洽的局部更新单元，可单独重画。
+    auto drawQuota() -> void {
+        auto* gfx = DisplayManager::getGfx();
+        // 先整条带擦成背景色：没有额度数据时这里留下纯黑，比残留旧条更干净。
+        gfx->fillRect(0, 0, 240, QUOTA_BAND_H, C_BG);
+        if (!m_hasQuota) {
+            return;
+        }
+
+        for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+            const int8_t percent = m_savedQuota[i];
+            const int16_t y = QUOTA_Y0 + i * QUOTA_STEP;
+            gfx->fillRect(QUOTA_X, y, QUOTA_W, QUOTA_H, C_TRACK);
+            if (percent <= 0) {
+                continue;  // 无值(-1) 与 0% 都是空槽，视觉一致，只留轨道
+            }
+            const int fillW = (QUOTA_W * percent + 50) / 100;
+            gfx->fillRect(QUOTA_X, y, fillW, QUOTA_H, C_BAR_ROW[i]);
+        }
+    }
+
     auto drawTitle() -> void {
         auto* gfx = DisplayManager::getGfx();
+        // y=16 起：上方 0..15 是额度条带，两者不重叠，条带不必让位。
         gfx->setTextSize(2);
         gfx->setTextColor(C_WHITE);
         gfx->setCursor(120 - textWidthPx("STOCK", 2) / 2, 16);
@@ -394,6 +468,7 @@ class StockScene : public Scene {
         auto* gfx = DisplayManager::getGfx();
         // 字号 2 的字高为 16px；27px 行距给每行保留 11px 的呼吸空间。
         // 擦除带在 47~179，时钟擦除带从 202 开始，中间保留 22px 安全间隔。
+        // 头部 0~15（额度条带）与 16~31（标题）分属两块，互不覆盖。
         gfx->fillRect(0, ROW_Y - 3, 240, 5 * ROW_STEP - 2, C_BG);
         if (m_count == 0) {
             gfx->setTextSize(2);

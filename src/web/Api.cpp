@@ -2463,7 +2463,10 @@ void handleBalanceGet(Webserver* webserver) {
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 }
 
-static constexpr size_t STOCK_BODY_MAX = 1024;
+// 上界按「5 行行情 + 3 槽额度」的最坏 payload 留余量：rows 约 140B、balance
+// 包装约 60B，留给未来可选字段的余量仍在 1KB 出头；1280 让宿主还能顺带塞
+// labels 之类的附加字段而不撞 413。
+static constexpr size_t STOCK_BODY_MAX = 1280;
 
 static void sendStockError(Webserver* webserver, int code, const char* message) {
     JsonDocument doc;
@@ -2493,9 +2496,24 @@ static void handleStockGet(Webserver* webserver) {
         rowJson["name"] = row.name;
         rowJson["change"] = row.change;
     }
+    // 额度是可选附属数据：没推过就整个键省略，宿主能靠「键是否存在」区分
+    // 「本次没推」与「推了空数组要求清空」两种语义。
+    if (StockData::hasQuota()) {
+        JsonArray progress = doc["balance"]["progress"].to<JsonArray>();
+        for (uint8_t i = 0; i < StockData::QUOTA_MAX; i++) {
+            const int8_t v = StockData::quota(i);
+            if (v < 0) {
+                progress.add(nullptr);
+            } else {
+                progress.add(v);
+            }
+        }
+    }
     doc["ts"] = static_cast<unsigned long>(StockData::updatedAtMs());
     doc["age_s"] = static_cast<unsigned long>(StockData::ageSeconds());
 
+    // 上界估算：5 行 {"name":"600519","change":-1.23} ≈ 5*28=140 + 3 个百分比
+    // 与 balance 包装 ≈ 60 + ts/age_s/rows 外壳 ≈ 40，余量充足。
     char json[512];
     serializeJson(doc, json, sizeof(json));
     setCorsHeaders(webserver);
@@ -2514,7 +2532,7 @@ static void handleStockSet(Webserver* webserver) {
 
     const String& body = webserver->raw().arg("plain");
     if (body.length() >= STOCK_BODY_MAX) {
-        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "body too large (max 1023 bytes)");
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "body too large (max 1279 bytes)");
         return;
     }
 
@@ -2534,6 +2552,54 @@ static void handleStockSet(Webserver* webserver) {
     if (inputRows.size() > StockData::MAX_ROWS) {
         sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "rows must contain at most 5 objects");
         return;
+    }
+
+    // 可选额度块：先整体校验（含元素类型/范围），确认无误后才允许写 StockData，
+    // 免得校验到一半失败却已经污染了屏上状态。
+    // quotaPresent=false 表示 payload 里根本没有 balance 键 → 额度状态完全不动
+    //（取不到额度的宿主继续沿用上次推送的条，而不是被空数据抹掉）。
+    int8_t quota[StockData::QUOTA_MAX] = {-1, -1, -1};
+    uint8_t quotaCount = 0;
+    // 「键缺失」与「键存在但不是对象」必须分开：isNull() 对缺失与显式 null 同为真，
+    // 所以先用它判缺失，再用 as<JsonObjectConst>() + isNull() 判类型（沿用本文件行校验的口径）。
+    bool quotaPresent = !ddoc["balance"].isNull();
+    JsonObjectConst balance = ddoc["balance"].as<JsonObjectConst>();
+    if (quotaPresent && balance.isNull()) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "balance must be an object");
+        return;
+    }
+    if (quotaPresent) {
+        if (!balance["progress"].is<JsonArrayConst>()) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST,
+                           "balance.progress must be an array of 0..3 null|0..100");
+            return;
+        }
+        JsonArrayConst progress = balance["progress"].as<JsonArrayConst>();
+        if (progress.size() > StockData::QUOTA_MAX) {
+            sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "balance.progress must contain at most 3 items");
+            return;
+        }
+        quotaCount = static_cast<uint8_t>(progress.size());
+        for (uint8_t i = 0; i < quotaCount; i++) {
+            JsonVariantConst item = progress[i];
+            if (item.isNull()) {
+                quota[i] = -1;
+                continue;
+            }
+            // is<int>() 对 58 为真、对 58.5 / "58" / 越界整数均为假，正好是本处要的整数判定
+            if (!item.is<int>()) {
+                sendStockError(webserver, HTTP_CODE_BAD_REQUEST,
+                               "balance.progress items must be null or an integer 0..100");
+                return;
+            }
+            const int value = item.as<int>();
+            if (value < 0 || value > 100) {
+                sendStockError(webserver, HTTP_CODE_BAD_REQUEST,
+                               "balance.progress items must be null or an integer 0..100");
+                return;
+            }
+            quota[i] = static_cast<int8_t>(value);
+        }
     }
 
     StockData::Row rows[StockData::MAX_ROWS] = {};
@@ -2586,6 +2652,12 @@ static void handleStockSet(Webserver* webserver) {
         StockData::clear();
     } else if (!StockData::setRows(rows, rowCount)) {
         sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "invalid stock rows");
+        return;
+    }
+    // 行写完再写额度：额度是附属数据，行失效时不该先动它。
+    // quotaPresent 为 false 时完全不调用 setQuota，保留上次的条。
+    if (quotaPresent && !StockData::setQuota(quota, quotaCount)) {
+        sendStockError(webserver, HTTP_CODE_BAD_REQUEST, "invalid balance progress");
         return;
     }
 

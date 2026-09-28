@@ -26,6 +26,7 @@
 #include <string.h>
 
 #include "display/DisplayManager.h"
+#include "display/NoticeScene.h"
 #include "display/SceneManager.h"
 #include "opencodego/UsageManager.h"
 #include "wireless/WiFiManager.h"
@@ -700,6 +701,486 @@ class LiveScene : public Scene {
 static LiveScene s_liveScene;
 static ClockScene s_clockScene;
 
+// ---------- notice：临时通知覆盖层 ----------
+// 打断式告警页：首行一枚大图标（info 圆 / warning 三角 / critical 方 —— 三个
+// 形状彼此可区分，不依赖颜色也能分辨），其余竖直空间全部留给 ASCII 正文。
+// 与常驻页面（余额 / 股票 / 相册 / 时钟）在结构上就不同：满屏黑底、无 logo、
+// 无七段时钟，唯一的常驻元素是右下角倒计时数字 + 底部细进度线（用户据此知道
+// 它会自己消失）。每秒只重画那两块（~1.3k 像素），绝不整屏重绘；无任何闪烁 /
+// 呼吸动画（闪烁刚踩过坑，且对光敏用户不友好）。
+class NoticeOverlayScene : public Scene {
+   public:
+    auto name() const -> const char* override { return "notice"; }
+
+    auto enter(const char* param) -> bool override {
+        (void)param;
+        // switchTo() 在 enter() 返回 true 之后才把 s_current 指向下一场景，
+        // 所以此刻 SceneManager::currentName() 拿到的仍是即将退场的那个场景
+        // —— 正是记录返回目标的机会（Api.cpp 的 handleLivePush 同理）。
+        const bool fresh = s_hasContent;
+        if (fresh) {
+            s_hasContent = false;
+            s_startedMs = millis();
+        }
+
+        if (!s_active) {
+            recordReturnTarget();
+            s_active = true;
+            s_startedMs = millis();
+            if (!fresh) {
+                // 没有预载内容却被直接点名（POST /scene {"scene":"notice"}）：
+                // 不编造正文，只显示图标 + 空正文，走默认时长。
+                s_level = NoticeScene::LevelInfo;
+                s_imageMode = false;
+                s_text[0] = '\0';
+                s_totalSeconds = NoticeScene::kDefaultSeconds;
+            }
+        }
+
+        // 重入（休眠唤醒的 redrawCurrent / 同场景 switchTo）且计时已耗尽又没有
+        // 新内容：一帧都不重画，避免唤醒瞬间闪一帧过期通知。返回动作只挂起，
+        // 交给下一次 update() 兑现 —— 在 enter() 里直接 switchTo 会在外层
+        // switchTo 尚未提交 s_current 时把它改掉。
+        if (!fresh && expired()) {
+            s_pendingReturn = true;
+            return true;
+        }
+
+        s_lastSecond = kNoSecond;
+        if (s_imageMode) {
+            // 整屏即画面：推帧流随后覆盖整屏（与 live 一致），enter 只清底等首帧。
+            // 此形态不叠任何装饰 —— 推入的 115200B 位图会盖掉一切叠加物。
+            DisplayManager::clearScreen();
+        } else {
+            drawNotice();
+        }
+
+        return true;
+    }
+
+    auto update() -> void override {
+        if (!s_active) {
+            return;
+        }
+
+        if (s_hasContent) {
+            // notice 已在屏上时又来一条：换内容 + 重置计时，返回目标保持不变
+            // （不变是因为 !s_active 分支被跳过，返回目标根本没被重记）。
+            s_hasContent = false;
+            s_startedMs = millis();
+            s_lastSecond = kNoSecond;
+            if (s_imageMode) {
+                DisplayManager::clearScreen();
+            } else {
+                drawNotice();
+            }
+            return;
+        }
+
+        if (s_pendingReturn || expired()) {
+            triggerReturn();
+            return;
+        }
+
+        if (s_imageMode) {
+            return;  // 图像形态没有可每秒更新的装饰区
+        }
+
+        const uint16_t remaining = remainingCeil();
+        if (remaining != s_lastSecond) {
+            s_lastSecond = remaining;
+            drawCountdown();
+        }
+    }
+
+    auto exit() -> void override {
+        // 刻意 no-op：不得清 s_active / 返回目标 —— 同场景重入
+        // （redrawCurrent）与「通知中再来一条」都依赖它们保持不变。
+        // 返回动作由 triggerReturn() 在 switchTo 之前自行清活跃标志。
+    }
+
+   private:
+    // ---- 静态内容/状态（全部定长，零堆分配）----
+    static constexpr size_t kReturnCap = 64;  // 与 SCENE_PARAM_MAX 对齐
+    static char s_text[NoticeScene::kTextCap];
+    static char s_returnName[kReturnCap];
+    static char s_returnParam[kReturnCap];
+    static NoticeScene::Level s_level;
+    static uint16_t s_totalSeconds;
+    static uint32_t s_startedMs;
+    static bool s_active;        // 是否正挂在屏上
+    static bool s_imageMode;
+    static bool s_hasContent;    // 有待消费的新预载内容
+    static bool s_pendingReturn; // enter() 挂起、待 update() 兑现的返回
+    static uint16_t s_lastSecond;
+
+    // 预载/查询接口要直接读写上面这组静态状态
+    friend class NoticeScene;
+
+    // ---- 版式常量 ----
+    static constexpr uint16_t kNoSecond = 0xFFFFU;
+    static constexpr int16_t SCREEN = 240;
+    static constexpr int16_t MARGIN = 12;
+    static constexpr int16_t TEXT_W = SCREEN - 2 * MARGIN;  // 216px 正文宽度
+    static constexpr int16_t ICON_SIZE = 64;
+    static constexpr int16_t ICON_X = (SCREEN - ICON_SIZE) / 2;  // 88
+    static constexpr int16_t ICON_Y = 10;
+    static constexpr int16_t LABEL_Y = 80;   // 字号 2 → 字高 16，80~96
+    static constexpr int16_t RULE_Y = 100;   // 头/身分隔细线
+    static constexpr int16_t RULE_H = 2;
+    static constexpr int16_t BODY_TOP = 110;
+    static constexpr int16_t BODY_BOTTOM = 216;  // 不含；正文可用 106px
+    static constexpr int16_t CN_Y = 220;         // 倒计时数字（字号 1，8px 高）
+    static constexpr int16_t BAR_Y = 232;        // 底部进度线
+    static constexpr int16_t BAR_H = 4;
+    static constexpr int16_t BAR_W = TEXT_W;
+    static constexpr uint8_t kMaxLines = 12;  // 字号 1 最多 11 行，留 1 行余量
+
+    // 正文换行后的行首表（渲染时按需拼 ~ 截断，无第二份正文缓冲）
+    int16_t m_lineOff[kMaxLines] = {0};
+    uint8_t m_lineLen[kMaxLines] = {0};
+    uint8_t m_lineCount = 0;
+    bool m_overflow = false;
+
+    static constexpr uint16_t C_BG = rgb565(0x06, 0x08, 0x0E);     // 近黑，比常驻页的纯黑更有质感
+    static constexpr uint16_t C_TEXT = rgb565(0xF2, 0xF5, 0xFF);   // 近似纯白的正文
+    static constexpr uint16_t C_SUB = rgb565(0x8A, 0x94, 0xB8);    // 次要信息
+    static constexpr uint16_t C_TRACK = rgb565(0x1E, 0x24, 0x36);  // 进度线底槽
+    static constexpr uint16_t C_INFO = rgb565(0x4D, 0x6B, 0xFE);   // 主题蓝（沿用现有强调色）
+    static constexpr uint16_t C_WARN = rgb565(0xFF, 0xB3, 0x00);   // 琥珀黄
+    static constexpr uint16_t C_CRIT = rgb565(0xFF, 0x33, 0x3C);   // 警示红
+
+    static auto levelColor(NoticeScene::Level level) -> uint16_t {
+        switch (level) {
+            case NoticeScene::LevelWarning:
+                return C_WARN;
+            case NoticeScene::LevelCritical:
+                return C_CRIT;
+            default:
+                return C_INFO;
+        }
+    }
+
+    static auto levelName(NoticeScene::Level level) -> const char* {
+        switch (level) {
+            case NoticeScene::LevelWarning:
+                return "WARNING";
+            case NoticeScene::LevelCritical:
+                return "CRITICAL";
+            default:
+                return "INFO";
+        }
+    }
+
+    static auto clampSeconds(uint16_t seconds) -> uint16_t {
+        if (seconds == 0U) {
+            return NoticeScene::kDefaultSeconds;
+        }
+        return seconds > NoticeScene::kMaxSeconds ? NoticeScene::kMaxSeconds : seconds;
+    }
+
+    // 回绕安全：millis() 每 ~49.7 天回绕一次，无符号差值依然正确
+    static auto elapsedMs() -> uint32_t { return static_cast<uint32_t>(millis() - s_startedMs); }
+
+    static auto totalMs() -> uint32_t { return static_cast<uint32_t>(s_totalSeconds) * 1000UL; }
+
+    static auto expired() -> bool { return elapsedMs() >= totalMs(); }
+
+    static auto remainingCeil() -> uint16_t {
+        const uint32_t total = totalMs();
+        const uint32_t used = elapsedMs();
+        if (used >= total) {
+            return 0U;
+        }
+        return static_cast<uint16_t>((total - used + 999UL) / 1000UL);
+    }
+
+    static auto recordReturnTarget() -> void {
+        const char* current = SceneManager::currentName();
+        const char* param = SceneManager::currentParam();
+        // 空名字或恰好是自己（redrawCurrent 之外的异常兜底）→ 落回开机落点
+        if (current == nullptr || current[0] == '\0' || strcmp(current, "notice") == 0) {
+            strlcpy(s_returnName, "sysinfo", kReturnCap);
+        } else {
+            strlcpy(s_returnName, current, kReturnCap);
+        }
+        strlcpy(s_returnParam, param != nullptr ? param : "", kReturnCap);
+    }
+
+    // 返回动作：先清活跃标志（exit() 不清，所以由这里负责），再切回原场景。
+    static auto triggerReturn() -> void {
+        char name[kReturnCap];
+        char param[kReturnCap];
+        strlcpy(name, s_returnName, kReturnCap);
+        strlcpy(param, s_returnParam, kReturnCap);
+
+        s_active = false;
+        s_pendingReturn = false;
+        s_hasContent = false;
+        s_returnName[0] = '\0';
+        s_returnParam[0] = '\0';
+
+        if (!SceneManager::switchTo(name, param)) {
+            Logger::warn("NoticeScene: return target failed, fallback to sysinfo", "Scene");
+            SceneManager::switchTo("sysinfo");
+        }
+    }
+
+    // ---- 绘制 ----
+
+    // 首行大图标：三种轮廓（圆 / 三角 / 方）+ 内嵌字形（i / ! / X），
+    // 色弱用户也能一眼分辨。纯 Arduino_GFX 图元手绘，不引入位图，
+    // 因此不存在裸解引用 flash 的风险（坑 #1）。
+    auto drawIcon(Arduino_GFX* gfx, uint16_t color) -> void {
+        const int16_t x = ICON_X;
+        const int16_t y = ICON_Y;
+        const int16_t s = ICON_SIZE;
+        const char* glyph = "i";
+
+        if (s_level == NoticeScene::LevelWarning) {
+            gfx->fillTriangle(x + s / 2, y, x + s, y + s, x, y + s, color);
+            glyph = "!";
+        } else if (s_level == NoticeScene::LevelCritical) {
+            gfx->fillRect(x + 4, y + 4, s - 8, s - 8, color);
+            glyph = "X";
+        } else {
+            gfx->fillCircle(x + s / 2, y + s / 2, s / 2, color);
+        }
+
+        // 三角形的视觉重心低于几何中心，字形下移 4px 才显得居中
+        const int16_t glyphShift = (s_level == NoticeScene::LevelWarning) ? 4 : 0;
+        const int16_t glyphHeight = 8 * 3;  // 字号 3 的字高
+        gfx->setTextSize(3);
+        gfx->setTextColor(C_BG);  // 深色字压在饱和色块上，对比最强
+        gfx->setCursor(x + s / 2 - textWidthPx(glyph, 3) / 2,
+                       y + s / 2 - glyphHeight / 2 + glyphShift);
+        gfx->print(glyph);
+    }
+
+    // 每秒只重画这两块：右下角 "Ns"（约 40x12）+ 底部 216x4 进度线
+    auto drawCountdown() -> void {
+        auto* gfx = DisplayManager::getGfx();
+        const uint16_t color = levelColor(s_level);
+        const uint32_t total = totalMs();
+        const uint32_t used = elapsedMs();
+        const uint32_t left = used >= total ? 0UL : total - used;
+
+        char digits[8];
+        snprintf(digits, sizeof(digits), "%us", static_cast<unsigned>(remainingCeil()));
+        const int digitsWidth = textWidthPx(digits, 1);
+        const int digitsX = SCREEN - MARGIN - digitsWidth;
+        gfx->fillRect(digitsX - 2, CN_Y - 2, digitsWidth + 4, 12, C_BG);
+        gfx->setTextSize(1);
+        gfx->setTextColor(C_SUB);
+        gfx->setCursor(digitsX, CN_Y);
+        gfx->print(digits);
+
+        gfx->fillRect(MARGIN, BAR_Y, BAR_W, BAR_H, C_TRACK);
+        const int filled = total == 0UL ? 0 : static_cast<int>((left * BAR_W) / total);
+        if (filled > 0) {
+            gfx->fillRect(MARGIN, BAR_Y, filled, BAR_H, color);
+        }
+    }
+
+    // 正文排版：从最大字号往下试，选第一个能装下全部换行后内容的字号。
+    // 6px 内建字体 → 每行可容 TEXT_W / (6 * size) 个字符。
+    static auto maxCharsFor(uint8_t size) -> int { return TEXT_W / (6 * size); }
+    static auto lineStepFor(uint8_t size) -> int16_t { return static_cast<int16_t>(10 * size); }
+    static auto glyphHeightFor(uint8_t size) -> int16_t { return static_cast<int16_t>(8 * size); }
+    static auto maxLinesFor(uint8_t size) -> uint8_t {
+        const int16_t bodyHeight = BODY_BOTTOM - BODY_TOP;  // 106px
+        const int16_t used = bodyHeight - glyphHeightFor(size);
+        return used <= 0 ? 1U : static_cast<uint8_t>(used / lineStepFor(size) + 1);
+    }
+
+    // 按词换行 + 尊重 '\n' 硬换行；超长单词（无空格可断）按字宽硬断。
+    // 装不下的余量记进 m_overflow，由渲染时给最后一行补 '~'。
+    auto layoutBody(uint8_t size, uint8_t maxLines) -> void {
+        m_lineCount = 0;
+        m_overflow = false;
+        const int maxChars = maxCharsFor(size);
+        const size_t length = strlen(s_text);
+        size_t cursor = 0;
+
+        while (cursor < length && m_lineCount < maxLines) {
+            // 一段（到下一个 '\n' 或文本末尾）
+            size_t paragraphEnd = cursor;
+            while (paragraphEnd < length && s_text[paragraphEnd] != '\n') {
+                paragraphEnd++;
+            }
+
+            if (paragraphEnd == cursor) {
+                // 空段 = 发送方要的空行，必须保留（"\n\n" 不能被吞成 "\n"）
+                pushLine(cursor, 0);
+                cursor = paragraphEnd + 1;
+                continue;
+            }
+
+            size_t pos = cursor;
+            while (pos < paragraphEnd) {
+                if (m_lineCount >= maxLines) {
+                    m_overflow = true;
+                    return;
+                }
+                const size_t avail = paragraphEnd - pos;
+                if (avail <= static_cast<size_t>(maxChars)) {
+                    pushLine(pos, static_cast<uint8_t>(avail));
+                    pos = paragraphEnd;
+                    break;
+                }
+                // 在 [pos+1, pos+maxChars] 里找最后一个可断点（空格之后）
+                size_t cut = 0;
+                for (size_t q = pos + maxChars; q > pos; q--) {
+                    if (s_text[q - 1] == ' ') {
+                        cut = q;
+                        break;
+                    }
+                }
+                if (cut == 0) {
+                    cut = pos + maxChars;  // 无空格：按字宽硬断
+                    pushLine(pos, static_cast<uint8_t>(cut - pos));
+                    pos = cut;
+                    continue;
+                }
+                const size_t segLen = cut - pos - 1;
+                if (segLen == 0) {
+                    pos = cut;  // 一串空格：不产出空行，直接跳过
+                    continue;
+                }
+                pushLine(pos, static_cast<uint8_t>(segLen));
+                pos = cut;
+            }
+
+            cursor = paragraphEnd + 1;  // 跳过 '\n'；文本末尾时自然越界结束
+        }
+
+        if (cursor < length) {
+            m_overflow = true;  // 触及行数上限但仍有正文
+        }
+    }
+
+    auto pushLine(size_t offset, uint8_t len) -> void {
+        m_lineOff[m_lineCount] = static_cast<int16_t>(offset);
+        m_lineLen[m_lineCount] = len;
+        m_lineCount++;
+    }
+
+    auto drawBody(Arduino_GFX* gfx, uint8_t size) -> void {
+        if (m_lineCount == 0) {
+            return;
+        }
+        const int16_t step = lineStepFor(size);
+        const int16_t blockHeight = (m_lineCount - 1) * step + glyphHeightFor(size);
+        const int16_t bodyHeight = BODY_BOTTOM - BODY_TOP;
+        const int16_t top = BODY_TOP + (bodyHeight - blockHeight) / 2;  // 竖直居中
+
+        gfx->setTextSize(size);
+        gfx->setTextColor(C_TEXT);
+        for (uint8_t i = 0; i < m_lineCount; i++) {
+            int len = m_lineLen[i];
+            // 溢出时给最后一行补 '~'（与 stock 场景截断约定一致）。
+            // 末行本身是空行时也补 '~'，否则截断标记会连同空行一起消失。
+            const bool truncate = m_overflow && (i + 1 == m_lineCount);
+            if (truncate && len > 0) {
+                len -= 1;
+            }
+            char buffer[SCREEN / 6 + 1];  // 最多 maxChars 个字符 + NUL（栈上，41B）
+            memcpy(buffer, s_text + m_lineOff[i], static_cast<size_t>(len));
+            const int shown = truncate ? len + 1 : len;
+            if (truncate) {
+                buffer[len] = '~';
+            }
+            buffer[shown] = '\0';
+            const int16_t x = MARGIN + ((TEXT_W - shown * 6 * size) / 2);
+            gfx->setCursor(x > MARGIN ? x : MARGIN, top + i * step);
+            gfx->print(buffer);
+        }
+    }
+
+    auto drawNotice() -> void {
+        auto* gfx = DisplayManager::getGfx();
+        gfx->fillScreen(C_BG);
+
+        const uint16_t color = levelColor(s_level);
+        drawIcon(gfx, color);
+
+        const char* name = levelName(s_level);
+        gfx->setTextSize(2);
+        gfx->setTextColor(color);
+        gfx->setCursor(SCREEN / 2 - textWidthPx(name, 2) / 2, LABEL_Y);
+        gfx->print(name);
+
+        gfx->fillRect(MARGIN, RULE_Y, TEXT_W, RULE_H, C_SUB);
+
+        // 字号选择：4 → 3 → 2 → 1，取第一个装得下的。短消息用大字号不显空，
+        // 长消息自动降级；连字号 1 都装不下时按字号 1 排版并给末行补 '~'。
+        // 循环体必然跑到 size == 1，m_lineCount / m_overflow 留下的就是最终排版。
+        uint8_t chosen = 1;
+        for (uint8_t size = 4; size >= 1; size--) {
+            layoutBody(size, maxLinesFor(size));
+            chosen = size;
+            if (!m_overflow) {
+                break;
+            }
+        }
+        drawBody(gfx, chosen);
+
+        drawCountdown();
+        s_lastSecond = remainingCeil();
+    }
+};
+
+// NoticeScene 的静态内容/状态（接口在头文件，实现只落在这里）
+char NoticeOverlayScene::s_text[NoticeScene::kTextCap] = {0};
+char NoticeOverlayScene::s_returnName[NoticeOverlayScene::kReturnCap] = {0};
+char NoticeOverlayScene::s_returnParam[NoticeOverlayScene::kReturnCap] = {0};
+NoticeScene::Level NoticeOverlayScene::s_level = NoticeScene::LevelInfo;
+uint16_t NoticeOverlayScene::s_totalSeconds = NoticeScene::kDefaultSeconds;
+uint32_t NoticeOverlayScene::s_startedMs = 0;
+bool NoticeOverlayScene::s_active = false;
+bool NoticeOverlayScene::s_imageMode = false;
+bool NoticeOverlayScene::s_hasContent = false;
+bool NoticeOverlayScene::s_pendingReturn = false;
+uint16_t NoticeOverlayScene::s_lastSecond = 0;
+
+// out-of-class 定义（C++11 下若被 ODR-use 则必须补，稳妥起见都补上）
+constexpr uint16_t NoticeScene::kMaxSeconds;
+constexpr uint16_t NoticeScene::kDefaultSeconds;
+constexpr size_t NoticeScene::kTextCap;
+
+auto NoticeScene::prepareText(Level level, const char* text, uint16_t seconds) -> void {
+    NoticeOverlayScene::s_level = level;
+    NoticeOverlayScene::s_imageMode = false;
+    strlcpy(NoticeOverlayScene::s_text, text != nullptr ? text : "",
+            sizeof(NoticeOverlayScene::s_text));
+    NoticeOverlayScene::s_totalSeconds = NoticeOverlayScene::clampSeconds(seconds);
+    NoticeOverlayScene::s_hasContent = true;
+}
+
+auto NoticeScene::prepareImage(uint16_t seconds) -> void {
+    NoticeOverlayScene::s_imageMode = true;
+    NoticeOverlayScene::s_totalSeconds = NoticeOverlayScene::clampSeconds(seconds);
+    NoticeOverlayScene::s_hasContent = true;
+}
+
+auto NoticeScene::isActive() -> bool { return NoticeOverlayScene::s_active; }
+
+auto NoticeScene::isImageMode() -> bool { return NoticeOverlayScene::s_imageMode; }
+
+auto NoticeScene::level() -> Level { return NoticeOverlayScene::s_level; }
+
+auto NoticeScene::text() -> const char* {
+    return NoticeOverlayScene::s_imageMode ? "" : NoticeOverlayScene::s_text;
+}
+
+auto NoticeScene::totalSeconds() -> uint16_t { return NoticeOverlayScene::s_totalSeconds; }
+
+auto NoticeScene::remainingSeconds() -> uint16_t {
+    return NoticeOverlayScene::s_active ? NoticeOverlayScene::remainingCeil() : 0U;
+}
+
+static NoticeOverlayScene s_noticeScene;
+
 auto registerBuiltinScenes() -> void {
     SceneManager::addScene(&s_sysInfoScene);
     SceneManager::addScene(&s_balanceScene);
@@ -707,4 +1188,5 @@ auto registerBuiltinScenes() -> void {
     SceneManager::addScene(&s_stockScene);
     SceneManager::addScene(&s_clockScene);
     SceneManager::addScene(&s_liveScene);
+    SceneManager::addScene(&s_noticeScene);
 }

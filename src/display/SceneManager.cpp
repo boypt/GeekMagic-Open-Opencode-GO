@@ -18,6 +18,7 @@
  */
 
 #include "display/SceneManager.h"
+#include "display/NoticeScene.h"
 
 #include <Arduino.h>
 #include <Logger.h>
@@ -56,6 +57,18 @@ auto SceneManager::switchTo(const char* name, const char* param) -> bool {
     Scene* next = find(name);
     if (next == nullptr) {
         Logger::warn((String("SceneManager: unknown scene ") + String(name)).c_str(), "Scene");
+        return false;
+    }
+
+    // ---- notice 覆盖层闸门（"期间不理会其他场景请求"的唯一实现点）----
+    // 必须判 NoticeScene::isActive()，绝对不能判 currentName()=="notice"：
+    // notice 自己的返回流程 triggerReturn()（Scenes.cpp）是**先清 s_active 再
+    // switchTo**，所以按 isActive() 判能放行自己的返回；按场景名判会把返回也
+    // 拦掉 → 通知永远不消失的死锁。
+    // 落点在 find() 之后、任何 exit()/enter()/屏操作之前：被拦时一个像素都不碰。
+    if (NoticeScene::isActive() && strcmp(next->name(), "notice") != 0) {
+        // 纯字符串字面量，不做 String 拼接（坑 #7 堆碎片）
+        Logger::info("SceneManager: notice overlay active, switch ignored", "Scene");
         return false;
     }
 

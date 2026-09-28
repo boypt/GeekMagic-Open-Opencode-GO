@@ -28,6 +28,7 @@
 #include "web/Api.h"
 #include "display/DisplayManager.h"
 #include "display/SceneManager.h"
+#include "display/NoticeScene.h"
 #include "led/AmbientLight.h"
 #include <Arduino_GFX_Library.h>
 #include <WiFiClient.h>
@@ -77,9 +78,16 @@ void handleDisplaySleepSet(Webserver* webserver);
 void handleDeleteGif(Webserver* webserver);
 static void handleStockGet(Webserver* webserver);
 static void handleStockSet(Webserver* webserver);
+static void handleNoticeGet(Webserver* webserver);
+static void handleNoticeSet(Webserver* webserver);
+static void handleNoticeImageUpload(Webserver* webserver);
+static void handleNoticeImageDone(Webserver* webserver);
 static constexpr int WIFI_CONNECT_TIMEOUT_MS = 15000;
 static constexpr size_t NTP_CONFIG_DOC_SIZE = 512;
 static constexpr int BEARER_LEN = 7;
+/// ESP8266WebServer 的 HTTP_CODE_* 枚举里没有 409（只存在于 ESP8266HTTPClient，
+/// 不值得为它把那个头文件拉进来），自备字面量。
+static constexpr int HTTP_CODE_CONFLICT_409 = 409;
 
 /**
  * @brief Register API endpoints for the webserver
@@ -257,6 +265,21 @@ void registerApiEndpoints(Webserver* webserver) {
     // responses=200:application/json,400:application/json,401:application/json
     webserver->raw().on("/api/v1/stock", HTTP_POST, [webserver]() { handleStockSet(webserver); });
 
+    // @openapi {get} /notice version=v1 group=Notice summary="Get temporary notice overlay state (text or image mode)" requiresAuth=true
+    // responses=200:application/json,401:application/json
+    webserver->raw().on("/api/v1/notice", HTTP_GET, [webserver]() { handleNoticeGet(webserver); });
+
+    // @openapi {post} /notice version=v1 group=Notice summary="Show a temporary notice overlay (big icon + ASCII body, auto-returns to the previous scene)" requiresAuth=true
+    // requestBody=application/json requestBodySchema=level:string,seconds:integer,text:string
+    // example={"level":"warning","seconds":10,"text":"Disk almost full"}
+    // responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on("/api/v1/notice", HTTP_POST, [webserver]() { handleNoticeSet(webserver); });
+
+    // @openapi {post} /notice/image version=v1 group=Notice summary="Show a temporary notice overlay drawing one streamed frame (240x240 RGB565, multipart, ?seconds=1..30)" requiresAuth=true
+    // requestBody=multipart/form-data responses=200:application/json,400:application/json,401:application/json
+    webserver->raw().on(
+        "/api/v1/notice/image", HTTP_POST, [webserver]() { handleNoticeImageDone(webserver); },
+        [webserver]() { handleNoticeImageUpload(webserver); });
 
     webserver->raw().onNotFound([webserver]() {
         if (webserver->raw().method() == HTTP_OPTIONS) {
@@ -756,43 +779,66 @@ void handleAlbumUploadDone(Webserver* webserver) {
     sendGifUploadResult(webserver, albumUploadedName, albumUploadError);
 }
 
+// ---- 16bpp 推帧共用的行组装器（live 与 notice/image 两条流共用一份实现）----
+// 组装整行 480B → R/B 字段交换补偿 → writePixels 写屏；行状态由调用方持有，
+// 绝不复制第二份 R/B 交换逻辑（AGENTS.md 硬件章：BGR 面板三处口径必须一致）。
+static void pushFrameBytes(uint8_t* row, int& rowY, int& rowFill, const uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (rowY >= 240) {
+            return;  // 超出整幅的余数忽略
+        }
+
+        row[rowFill++] = data[i];
+
+        if (rowFill == 480) {
+            auto* tft = reinterpret_cast<Arduino_TFT*>(DisplayManager::getGfx());
+            tft->startWrite();
+            tft->writeAddrWindow(0, rowY, 240, 1);
+            // 同 AlbumScene：标准 RGB565(LE) 直推在本面板红蓝互换，做 R/B 字段交换补偿
+            auto* px = reinterpret_cast<uint16_t*>(row);
+            for (int p = 0; p < 240; p++) {
+                const uint16_t v = px[p];
+                px[p] = static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
+            }
+            tft->writePixels(reinterpret_cast<uint16_t*>(row), 240);
+            tft->endWrite();
+
+            rowFill = 0;
+            rowY++;
+        }
+    }
+}
+
+// ---- 抑制期的半帧复位：把行状态归零，恢复绘制后下一帧即整行对齐 ----
+// （抑制期间不可能凑满一行，所以最多只残留半行）
+static void resetSuppressedRowState(int& rowY, int& rowFill) {
+    if (rowY != 0 || rowFill != 0) {
+        rowY = 0;
+        rowFill = 0;
+    }
+}
+
 // ---- live 实时推图：multipart 分块流式直绘（不落盘、不整帧进 RAM）----
 // 帧 = 240x240 RGB565(LE) 115200B；行缓冲 480B 组装整行后立即写屏
 static bool s_liveAuthed = true;
 static bool s_liveAborted = false;
 static int s_liveRowY = 0;
 static int s_liveRowFill = 0;
-// alignas(4) 不是洁癖：本缓冲会被 reinterpret_cast<uint16_t*> 做 16 位读写，
-// ESP8266 上奇地址 16 位访问直接 Exception 9 LoadStoreError，而链接器只把它放在
-// 前面静态量结束处、不保证 2/4 字节对齐 —— 相邻多一个单字节 bool 就可能挤成奇地址。
+// alignas(4) 不是洁癖：pushFrameBytes() 用 reinterpret_cast<uint16_t*> 对本缓冲做
+// 16 位读写（ESP8266 上奇地址 16 位访问直接 Exception 9 LoadStoreError），而链接器
+// 只会把它放在前面静态量结束处、不保证 2/4 字节对齐 —— 相邻多一个单字节 bool 就
+// 可能把它挤到奇地址。任何会被 16/32 位视图访问的缓冲都必须显式 alignas(4)。
 alignas(4) static uint8_t s_liveRow[480];
 
 static void livePushBytes(const uint8_t* data, size_t len) {
-    auto* tft = reinterpret_cast<Arduino_TFT*>(DisplayManager::getGfx());
-
-    for (size_t i = 0; i < len; i++) {
-        if (s_liveRowY >= 240) {
-            return;  // 超出整幅的余数忽略
-        }
-
-        s_liveRow[s_liveRowFill++] = data[i];
-
-        if (s_liveRowFill == 480) {
-            tft->startWrite();
-            tft->writeAddrWindow(0, s_liveRowY, 240, 1);
-            // 同 AlbumScene：标准 RGB565(LE) 直推在本面板红蓝互换，做 R/B 字段交换补偿
-            auto* px = reinterpret_cast<uint16_t*>(s_liveRow);
-            for (int i = 0; i < 240; i++) {
-                const uint16_t v = px[i];
-                px[i] = static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
-            }
-            tft->writePixels(reinterpret_cast<uint16_t*>(s_liveRow), 240);
-            tft->endWrite();
-
-            s_liveRowFill = 0;
-            s_liveRowY++;
-        }
+    // 只在 live 场景落笔：通知覆盖层（或任何其它场景）在场时照收字节但丢弃，
+    // 否则推帧会把画面直接画穿到别人的屏上。
+    if (strcmp(SceneManager::currentName(), "live") != 0) {
+        resetSuppressedRowState(s_liveRowY, s_liveRowFill);
+        return;
     }
+
+    pushFrameBytes(s_liveRow, s_liveRowY, s_liveRowFill, data, len);
 }
 
 void handleLivePush(Webserver* webserver) {
@@ -1634,6 +1680,23 @@ void handleSceneGet(Webserver* webserver) {
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 }
 
+// 场景名是否存在：SceneManager::find() 是私有的，用公开的场景列表自检。
+// switchTo() 对「未知场景」和「被 notice 闸门拦下」都只返回 false，
+// 两者语义不同（400 vs 409），必须先区分开。
+static bool isKnownScene(const char* name) {
+    if (name == nullptr || name[0] == '\0') {
+        return false;
+    }
+
+    for (int i = 0; i < SceneManager::sceneCount(); i++) {
+        if (strcmp(SceneManager::sceneNameAt(i), name) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 /**
  * @brief Switch display scene (old scene exits, new scene fully redraws)
  */
@@ -1663,12 +1726,20 @@ void handleSceneSet(Webserver* webserver) {
     }
 
     const bool ok = SceneManager::switchTo(scene, param != nullptr ? param : "");
+    // notice 闸门拦下的切换不是「未知场景」，是「被临时通知覆盖层挡着」→ 回 409。
+    // isKnownScene() 先把未知场景摘出去：它同样是 switchTo 返回 false，但属 400。
+    const bool blockedByNotice = !ok && isKnownScene(scene) && NoticeScene::isActive();
 
     JsonDocument resp;
     resp["status"] = ok ? "ok" : "error";
     resp["current"] = SceneManager::currentName();
 
-    if (!ok) {
+    if (blockedByNotice) {
+        char message[96];
+        snprintf(message, sizeof(message), "notice active (%us remaining), scene switch ignored",
+                 static_cast<unsigned>(NoticeScene::remainingSeconds()));
+        resp["message"] = message;
+    } else if (!ok) {
         resp["message"] = "scene switch failed (unknown scene or scene refused)";
     }
 
@@ -1676,7 +1747,8 @@ void handleSceneSet(Webserver* webserver) {
     serializeJson(resp, jsonOut);
 
     setCorsHeaders(webserver);
-    webserver->raw().send(ok ? HTTP_CODE_OK : HTTP_CODE_BAD_REQUEST, "application/json", jsonOut);
+    webserver->raw().send(ok ? HTTP_CODE_OK : (blockedByNotice ? HTTP_CODE_CONFLICT_409 : HTTP_CODE_BAD_REQUEST),
+                          "application/json", jsonOut);
 
     Logger::info((String("Scene switch to ") + String(scene) + (ok ? " ok" : " failed")).c_str(), "API");
 }
@@ -2526,6 +2598,356 @@ static void handleStockSet(Webserver* webserver) {
     doc["ok"] = true;
     char json[32];
     serializeJson(doc, json, sizeof(json));
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+// ===========================================================================
+// notice —— 临时通知覆盖层（API 接线层）
+// 场景本体在 Scenes.cpp（只读），这里只做三件事：校验、预载（prepareText /
+// prepareImage）、激活（switchTo("notice")）。预载 ≠ 激活，顺序不可颠倒：
+// 全部字段校验通过之前一个字节都不许写进预载缓冲。
+// 期间不理会其他场景切换请求由 SceneManager::switchTo() 的闸门保证。
+// ===========================================================================
+
+static constexpr size_t NOTICE_BODY_MAX = 1024;  // 与其它端点同惯例
+static constexpr size_t NOTICE_TEXT_MAX = NoticeScene::kTextCap - 1;  // 199 字节正文上限
+
+static const char* const kNoticeLevelNames[3] = {"info", "warning", "critical"};
+
+static void sendNoticeError(Webserver* webserver, int code, const char* message) {
+    JsonDocument doc;
+    doc["status"] = "error";
+    doc["message"] = message;
+
+    char json[160];
+    serializeJson(doc, json, sizeof(json));
+    setCorsHeaders(webserver);
+    webserver->raw().send(code, "application/json", json);
+}
+
+/// 大小写不敏感的 ASCII 比较（不建 String，坑 #7）
+static auto asciiLowerEq(const char* a, const char* b) -> bool {
+    size_t i = 0;
+    while (a[i] != '\0' && b[i] != '\0') {
+        char ca = a[i];
+        char cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') {
+            ca = static_cast<char>(ca - 'A' + 'a');
+        }
+        if (cb >= 'A' && cb <= 'Z') {
+            cb = static_cast<char>(cb - 'A' + 'a');
+        }
+        if (ca != cb) {
+            return false;
+        }
+        i++;
+    }
+    // 长度不同（一边先见 NUL）也判不等
+    return a[i] == '\0' && b[i] == '\0';
+}
+
+/// level：大小写不敏感接受 info / warning / critical，其余一律 false
+static auto parseNoticeLevel(const char* value, NoticeScene::Level& out) -> bool {
+    if (value == nullptr) {
+        return false;
+    }
+    if (asciiLowerEq(value, "info")) {
+        out = NoticeScene::LevelInfo;
+        return true;
+    }
+    if (asciiLowerEq(value, "warning")) {
+        out = NoticeScene::LevelWarning;
+        return true;
+    }
+    if (asciiLowerEq(value, "critical")) {
+        out = NoticeScene::LevelCritical;
+        return true;
+    }
+    return false;
+}
+
+/// seconds：只接受 1..kMaxSeconds 的**纯十进制整数**（无符号、无空白、无小数点、
+/// 不接受 "5" 这类字符串语义），越界/负数/字符串一律 false。
+static auto parseNoticeSeconds(const char* value, uint16_t& out) -> bool {
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+
+    long parsed = 0;
+    for (const char* p = value; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;  // 负号 / 小数点 / '+' / 空白 / 字母
+        }
+        parsed = parsed * 10 + (*p - '0');
+        if (parsed > 100000L) {
+            return false;  // 早就越界，不必继续累加
+        }
+    }
+
+    if (parsed < 1 || parsed > static_cast<long>(NoticeScene::kMaxSeconds)) {
+        return false;
+    }
+
+    out = static_cast<uint16_t>(parsed);
+    return true;
+}
+
+/// 正文归一化 + 逐字节合法性校验（这是拦截 CJK 上屏的关键，见坑 #11）：
+/// \r\n 归一成 \n，孤立 \r 视作 \n；只允许 0x20..0x7E 与 '\n'，
+/// 其余（控制字符 / >=0x80 的汉字与 UTF-8 续字节）一律 false。
+/// 返回 false = 字节非法；outLength == 0 = 合法但空（由调用方判 400）。
+static auto normalizeNoticeText(const char* src, char* dst, size_t cap, size_t& outLength) -> bool {
+    size_t written = 0;
+
+    for (const char* p = src; p != nullptr && *p != '\0'; p++) {
+        char ch = *p;
+
+        if (ch == '\r') {
+            if (*(p + 1) == '\n') {
+                continue;  // \r\n → 由随后的 \n 落笔
+            }
+            ch = '\n';  // 孤立 \r 视作换行
+        }
+
+        if (ch != '\n') {
+            const unsigned char byte = static_cast<unsigned char>(ch);
+            if (byte < 0x20 || byte > 0x7E) {
+                return false;
+            }
+        }
+
+        if (written + 1 >= cap) {
+            return false;  // 超长：留不出末尾 NUL
+        }
+        dst[written++] = ch;
+    }
+
+    dst[written] = '\0';
+    outLength = written;
+    return true;
+}
+
+/**
+ * @brief POST /api/v1/notice —— 文字通知（大图标 + ASCII 正文，1..30 秒后自动切回）
+ * body: {"level":"info|warning|critical","seconds":5,"text":"..."}
+ */
+static void handleNoticeSet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    if (!webserver->raw().hasArg("plain") || webserver->raw().arg("plain").length() == 0) {
+        sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "Missing JSON body");
+        return;
+    }
+
+    const String& body = webserver->raw().arg("plain");
+    if (body.length() >= NOTICE_BODY_MAX) {
+        sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "body too large (max 1023 bytes)");
+        return;
+    }
+
+    JsonDocument ddoc;
+    if (deserializeJson(ddoc, body)) {
+        sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "Invalid JSON");
+        return;
+    }
+
+    // ---- 字段校验（全部通过之前不预载任何字节）----
+    // isUnbound() 判「键不存在」；键存在但类型/取值不对一律 400（含显式 null）
+    NoticeScene::Level level = NoticeScene::LevelInfo;
+    JsonVariantConst levelValue = ddoc["level"];
+    if (!levelValue.isUnbound()) {
+        if (!levelValue.is<const char*>() || !parseNoticeLevel(levelValue.as<const char*>(), level)) {
+            sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "level must be info, warning or critical");
+            return;
+        }
+    }
+
+    uint16_t seconds = NoticeScene::kDefaultSeconds;
+    JsonVariantConst secondsValue = ddoc["seconds"];
+    if (!secondsValue.isUnbound()) {
+        if (!secondsValue.is<int>()) {
+            sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "seconds must be an integer 1..30");
+            return;
+        }
+        const int raw = secondsValue.as<int>();
+        if (raw < 1 || raw > static_cast<int>(NoticeScene::kMaxSeconds)) {
+            sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "seconds must be an integer 1..30");
+            return;
+        }
+        seconds = static_cast<uint16_t>(raw);
+    }
+
+    if (!ddoc["text"].is<const char*>()) {
+        sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "text must be a string");
+        return;
+    }
+
+    char text[NoticeScene::kTextCap];
+    size_t textLength = 0;
+    if (!normalizeNoticeText(ddoc["text"].as<const char*>(), text, NOTICE_TEXT_MAX + 1, textLength)) {
+        sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST,
+                        "text must be 1..199 printable ASCII bytes (\\n allowed, non-ASCII rejected)");
+        return;
+    }
+    if (textLength == 0) {
+        sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "text must not be empty");
+        return;
+    }
+
+    // ---- 预载 → 激活 → 应答 ----
+    NoticeScene::prepareText(level, text, seconds);
+    SceneManager::switchTo("notice");
+
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["scene"] = "notice";
+    doc["seconds"] = seconds;
+    doc["remaining"] = NoticeScene::remainingSeconds();
+    char json[128];
+    serializeJson(doc, json, sizeof(json));
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+/**
+ * @brief GET /api/v1/notice —— 通知状态查询（脚本与 --check 用）
+ */
+static void handleNoticeGet(Webserver* webserver) {
+    if (!requireBearerToken(webserver)) {
+        return;
+    }
+
+    JsonDocument doc;
+    const bool active = NoticeScene::isActive();
+    doc["active"] = active;
+
+    if (active) {
+        doc["mode"] = NoticeScene::isImageMode() ? "image" : "text";
+        doc["level"] = kNoticeLevelNames[NoticeScene::level() % 3];
+        doc["text"] = NoticeScene::text();
+        doc["total"] = NoticeScene::totalSeconds();
+        doc["remaining"] = NoticeScene::remainingSeconds();
+    } else {
+        doc["mode"] = "none";
+        doc["total"] = 0;
+        doc["remaining"] = 0;
+    }
+
+    String json;
+    serializeJson(doc, json);
+    setCorsHeaders(webserver);
+    webserver->raw().send(HTTP_CODE_OK, "application/json", json);
+}
+
+// ---- notice/image：multipart 分块流式直绘（帧格式与 /album/live 完全一致）----
+// 240x240 RGB565(LE) 115200B；480B 行缓冲逐行直绘、不保存。
+// seconds 走 query 参数（multipart body 是裸帧，装不下 JSON）。
+static bool s_noticeAuthed = false;
+static bool s_noticeSecondsOk = false;
+static bool s_noticeAborted = false;
+static uint16_t s_noticeSeconds = NoticeScene::kDefaultSeconds;
+static int s_noticeRowY = 0;
+static int s_noticeRowFill = 0;
+// 同 s_liveRow：会被 pushFrameBytes 以 uint16_t* 视图访问，必须 4 字节对齐
+alignas(4) static uint8_t s_noticeRow[480];
+
+static void noticeImagePushBytes(const uint8_t* data, size_t len) {
+    // 只在 notice 场景落笔：倒计时到期切回别的场景后，残留的帧不许再画。
+    if (strcmp(SceneManager::currentName(), "notice") != 0) {
+        resetSuppressedRowState(s_noticeRowY, s_noticeRowFill);
+        return;
+    }
+
+    pushFrameBytes(s_noticeRow, s_noticeRowY, s_noticeRowFill, data, len);
+}
+
+static void handleNoticeImageUpload(Webserver* webserver) {
+    HTTPUpload& upload = webserver->raw().upload();
+
+    if (upload.status == UPLOAD_FILE_START) {
+        s_noticeAuthed = validateBearerToken(webserver);
+        s_noticeSecondsOk = false;
+        s_noticeAborted = false;
+        s_noticeSeconds = NoticeScene::kDefaultSeconds;
+        s_noticeRowY = 0;
+        s_noticeRowFill = 0;
+
+        if (!s_noticeAuthed) {
+            return;
+        }
+
+        // seconds 走 query 参数；缺省 kDefaultSeconds，非法值一帧都不画
+        // （upload 阶段发不出应答，由 done 回调回 400）
+        if (webserver->raw().hasArg("seconds")) {
+            s_noticeSecondsOk = parseNoticeSeconds(webserver->raw().arg("seconds").c_str(), s_noticeSeconds);
+        } else {
+            s_noticeSecondsOk = true;
+        }
+
+        if (!s_noticeSecondsOk) {
+            Logger::warn("Notice image: invalid seconds query", "API::Notice");
+            return;
+        }
+
+        // 预载 ≠ 激活：先 prepareImage 再 switchTo
+        NoticeScene::prepareImage(s_noticeSeconds);
+        SceneManager::switchTo("notice");
+
+        return;
+    }
+
+    if (!s_noticeAuthed || !s_noticeSecondsOk) {
+        return;
+    }
+
+    if (upload.status == UPLOAD_FILE_WRITE) {
+        noticeImagePushBytes(upload.buf, upload.currentSize);
+    } else if (upload.status == UPLOAD_FILE_ABORTED) {
+        s_noticeAborted = true;
+    }
+}
+
+static void handleNoticeImageDone(Webserver* webserver) {
+    if (!s_noticeAuthed) {
+        JsonDocument resp;
+        resp["status"] = "error";
+        resp["message"] = "Invalid or missing token";
+
+        String jsonOut;
+        serializeJson(resp, jsonOut);
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_UNAUTHORIZED, "application/json", jsonOut);
+        return;
+    }
+
+    if (!s_noticeSecondsOk) {
+        sendNoticeError(webserver, HTTP_CODE_BAD_REQUEST, "seconds must be an integer 1..30");
+        return;
+    }
+
+    JsonDocument resp;
+    if (s_noticeAborted) {
+        resp["status"] = "error";
+        resp["message"] = "upload aborted";
+        resp["rows"] = s_noticeRowY;
+
+        char json[128];
+        serializeJson(resp, json, sizeof(json));
+        setCorsHeaders(webserver);
+        webserver->raw().send(HTTP_CODE_BAD_REQUEST, "application/json", json);
+        return;
+    }
+
+    resp["ok"] = true;
+    resp["scene"] = "notice";
+    resp["seconds"] = s_noticeSeconds;
+    resp["rows"] = s_noticeRowY;
+
+    char json[128];
+    serializeJson(resp, json, sizeof(json));
     setCorsHeaders(webserver);
     webserver->raw().send(HTTP_CODE_OK, "application/json", json);
 }

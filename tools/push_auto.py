@@ -5,22 +5,32 @@
 调度层不使用 asyncio、线程、事件循环或 to_thread；网络调用保持同步，阻塞
 urllib 调用只发生在 handler yield 的 Fetch*/Post* 任务中。
 
-状态图::
+状态图（开市窗口可配置，下文用「收盘」「开盘」代指）::
 
-    AWAKE_OPEN --行情过期/15:30 收盘--> AWAKE_CLOSED --09:20 探针通过--> AWAKE_OPEN
+    AWAKE_OPEN --行情过期/收盘--> AWAKE_CLOSED --开盘探针通过--> AWAKE_OPEN
          |                              |                                     |
          +--进入休眠--> SLEEPING <-------+------唤醒(08:00)-------------------+
 
-每状态闹钟表::
+每状态闹钟表（开盘/收盘 = 开市窗口的起止，默认 09:20/15:30）::
 
     AWAKE_OPEN     Every(stock,15s), Every(quota_due,300s),
-                   DailyAt(market_check,15:30), DailyAt(sleep_at,20:00)
-    AWAKE_CLOSED   Every(balance,300s), DailyAt(market_check,09:20),
+                   DailyAt(market_check,收盘), DailyAt(sleep_at,20:00)
+    AWAKE_CLOSED   Every(balance,300s), DailyAt(market_check,开盘),
                    DailyAt(sleep_at,20:00)
     SLEEPING       Every(keepalive,600s), DailyAt(wake_at,08:00)
 
+开市窗口默认 09:20~15:30，可用 --market-open/--market-close（或环境变量
+MARKET_OPEN / MARKET_CLOSE）覆盖。两点不变式：
+
+1. 窗口是**半开区间** ``start <= 秒 < end``。这条不是洁癖 —— 收盘闹钟 DailyAt
+   恰好落在 15:30:00.000 那一拍，闭区间会让 is_market_open 仍返回 True，收盘闹钟
+   自己判自己「还开市」而空转，状态卡在 AWAKE_OPEN 每 15s 推行情直到 20:00 入睡。
+2. **行情节拍每拍自愈**。Every(open_interval) 自身不重新判时间，所以任何一次收盘
+   检查丢失（机器挂起、handler 异常、状态被外部改动）都必须由下一拍行情兜底：
+   handle_stock 开头发现已过窗口就自己转休市（≤15s 内纠正）。
+
 休眠区间 20:00~08:00 **跨午夜**（is_sleep_time 已支持 from > to 的情形）：收盘
-15:30 到 20:00 之间照常按休市节拍推额度，20:00 闹钟入睡，次日 08:00 唤醒。
+到 20:00 之间照常按休市节拍推额度，20:00 闹钟入睡，次日 08:00 唤醒。
 起止时间从命令行 flag 读，也可用环境变量 SLEEP_FROM / SLEEP_TO 覆盖 —— 部署机上
 就是 systemd 的 EnvironmentFile（/etc/sd2.conf），改那里不用动 unit 的 ExecStart。
 
@@ -128,12 +138,18 @@ def local_seconds(value):
     return value.tm_hour * 3600 + value.tm_min * 60 + value.tm_sec
 
 
-def is_market_open(value, data_date=None, today=None):
-    """星期 + 09:20~15:30 + 个股行情日期的外部开市判定。"""
+def is_market_open(value, windows=MARKET_WINDOWS, data_date=None, today=None):
+    """星期 + 开市窗口（半开区间 start <= 秒 < end）+ 个股行情日期的外部开市判定。
+
+    窗口默认是模块常量 MARKET_WINDOWS（09:20~15:30），实盘由 Scheduler 从
+    --market-open/--market-close 解析后传进来。半开而非闭区间是刻意的：收盘闹钟
+    DailyAt("15:30") 落在 15:30:00.000 那一拍，闭区间会让这一刻仍判为开市、收盘闹钟
+    自己把自己判成「还开市」而空转。
+    """
     if value.tm_wday > 4:
         return False
     seconds = local_seconds(value)
-    if not any(start <= seconds <= end for start, end in MARKET_WINDOWS):
+    if not any(start <= seconds < end for start, end in windows):
         return False
     if not data_date:
         return True
@@ -150,6 +166,21 @@ def parse_clock(value, option_name):
         return hour * 3600 + minute * 60
     except (TypeError, ValueError):
         raise ValueError("%s 必须是 HH:MM 格式" % option_name)
+
+
+def parse_market_windows(open_value, close_value):
+    """把 --market-open/--market-close 解析成 ((start_sec, end_sec),)。"""
+    start = parse_clock(open_value, "--market-open/MARKET_OPEN")
+    end = parse_clock(close_value, "--market-close/MARKET_CLOSE")
+    if start == end:
+        raise ValueError("--market-open/--market-close 不能相同")
+    if start > end:
+        raise ValueError("--market-open 必须早于 --market-close")
+    return ((start, end),)
+
+
+def format_hhmm(seconds):
+    return "%02d:%02d" % (seconds // 3600, (seconds % 3600) // 60)
 
 
 def is_sleep_time(value, sleep_from, sleep_to):
@@ -356,6 +387,9 @@ class AlarmRegistry:
     def unregister(self, name):
         self._alarms.pop(name, None)
 
+    def get(self, name):
+        return self._alarms.get(name)
+
     def unregister_state(self, state):
         prefix = state.value + ":"
         for name in list(self._alarms):
@@ -423,12 +457,16 @@ class AlarmRegistry:
 
 class Scheduler:
     def __init__(self, args, device_base, symbols, clock=None, backend=None,
-                 quiet=False, aliases=None):
+                 quiet=False, aliases=None, windows=None):
         self.args = args
         self.device_base = device_base
         self.symbols = symbols
         # {代码: 简称}，推送前替换行名；None/空 = 全用原代码
         self.aliases = aliases or {}
+        # 开市窗口 ((start_sec, end_sec),)。main 已解析好就传进来，否则自己从 args
+        # 解析 —— 绝不读可变全局（模块常量只是默认值）。
+        self.windows = windows or parse_market_windows(args.market_open,
+                                                       args.market_close)
         self.clock = clock or RealClock()
         self.backend = backend
         self.quiet = quiet
@@ -471,8 +509,23 @@ class Scheduler:
         end = parse_clock(self.args.sleep_to, "--sleep-to")
         return is_sleep_time(self.bj(), start, end)
 
+    def market_open_at(self):
+        return format_hhmm(self.windows[0][0])
+
+    def market_close_at(self):
+        return format_hhmm(self.windows[0][1])
+
+    def market_window_text(self):
+        return "%s~%s" % (self.market_open_at(), self.market_close_at())
+
     def market_provisional_open(self):
-        return True if self.args.demo else is_market_open(self.bj())
+        # --demo 只跳过「API 行情日期」判定（demo 数据没有真实日期），不跳过时间
+        # 窗口：窗口是时间策略，不是取数问题，无条件短路会让 demo 永远开市。
+        return is_market_open(self.bj(), windows=self.windows)
+
+    def log_market_closed(self, reason):
+        """转休市的日志只有这一处文案，收盘闹钟与行情节拍自愈共用。"""
+        return Log("%s（%s），转休市节拍" % (reason, self.clock_text()))
 
     def market_open(self):
         if not self.market_provisional_open():
@@ -495,7 +548,7 @@ class Scheduler:
                 "AWAKE_OPEN:quota_due", Every(self.args.balance_every),
                 self.handle_quota_due), now, max(now, due))
             self.registry.register(Alarm(
-                "AWAKE_OPEN:market_check", DailyAt("15:30"),
+                "AWAKE_OPEN:market_check", DailyAt(self.market_close_at()),
                 self.handle_market_check), now)
             if not self.args.no_sleep:
                 self.registry.register(Alarm(
@@ -508,7 +561,7 @@ class Scheduler:
                 "AWAKE_CLOSED:balance", Every(self.args.closed_interval),
                 self.handle_balance_due), now, max(now, first))
             self.registry.register(Alarm(
-                "AWAKE_CLOSED:market_check", DailyAt("09:20"),
+                "AWAKE_CLOSED:market_check", DailyAt(self.market_open_at()),
                 self.handle_market_check), now)
             if not self.args.no_sleep:
                 self.registry.register(Alarm(
@@ -549,11 +602,11 @@ class Scheduler:
         会长时间一片空白（看不出是没跑还是在跑）。末尾顺带说明日志为什么是静的。
         """
         yield Log("启动：状态=%s 设备=%s 行情 %ds / 额度 %ds / 非开市 %ds / "
-                  "休眠 %s-%s / 简称 %s%s"
+                  "开市 %s / 休眠 %s-%s / 简称 %s%s"
                   % (self.state.value, self.device_base or "(未配置)",
                      self.args.open_interval, self.args.balance_every,
-                     self.args.closed_interval, self.args.sleep_from,
-                     self.args.sleep_to, self.alias_text(),
+                     self.args.closed_interval, self.market_window_text(),
+                     self.args.sleep_from, self.args.sleep_to, self.alias_text(),
                      "" if self.args.verbose
                      else "（例行节拍日志已静默，加 --verbose 查看每拍明细）"))
 
@@ -757,6 +810,13 @@ class Scheduler:
 
     def handle_stock(self):
         if self.state == State.AWAKE_OPEN:
+            # 每拍自愈：Every(open_interval) 自身不判时间，收盘检查丢了（机器挂起、
+            # handler 异常、状态被外部改）就只能靠这一拍兜底，最多 15s 纠正。
+            if not self.market_provisional_open():
+                yield EnterState(Event.MARKET_CLOSED)
+                yield self.log_market_closed(
+                    "行情节拍自愈：已过开市窗口 %s" % self.market_window_text())
+                return (yield from self.balance_and_post())
             yield EnterState(Event.STOCK_TICK)
         result = yield FetchStock(self.symbols)
         if not result.ok:
@@ -801,6 +861,8 @@ class Scheduler:
         if self.state == State.AWAKE_OPEN:
             if not self.market_open():
                 yield EnterState(Event.MARKET_CLOSED)
+                yield self.log_market_closed(
+                    "已过开市窗口 %s" % self.market_window_text())
                 yield from self.balance_and_post()
             return
         if self.state != State.AWAKE_CLOSED or not self.market_provisional_open():
@@ -1287,6 +1349,13 @@ def build_arg_parser():
     policy.add_argument("--balance-every", type=int, default=300,
                         help="开市额度间隔秒数，默认 300（5 分钟；单独推，"
                              "不带行情、不切屏）")
+    policy.add_argument("--market-open",
+                        default=os.environ.get("MARKET_OPEN", "09:20"),
+                        help="开市开始 HH:MM，默认 09:20（也可用 MARKET_OPEN）")
+    policy.add_argument("--market-close",
+                        default=os.environ.get("MARKET_CLOSE", "15:30"),
+                        help="开市结束 HH:MM，默认 15:30（半开区间：含开盘不含收盘；"
+                             "也可用 MARKET_CLOSE）")
     policy.add_argument("--sleep-from",
                         default=os.environ.get("SLEEP_FROM", "20:00"),
                         help="每日休眠开始 HH:MM，默认 20:00（跨午夜到 --sleep-to；"
@@ -1306,44 +1375,56 @@ def build_arg_parser():
     common.add_argument("--self-test", dest="self_test", action="store_true",
                         help="用 VirtualClock 和假后端运行内置策略验收")
     common.add_argument("--demo", action="store_true",
-                        help="额度/股票均用本地随机数据；不联网且跳过开市判定")
+                        help="额度/股票均用本地随机数据，不联网；"
+                             "仍遵守开市时间窗口（只跳过 API 行情日期判定）")
     common.add_argument("--verbose", action="store_true",
                         help="连 15s 行情的成功行也打（默认只打低频状态与全部异常）")
     return parser
 
 
 def validate_args(args):
+    """返回 (device_base, symbols, aliases, windows, error)。
+
+    windows 是解析好的 ((start_sec, end_sec),)，成功路径下永远有值（默认窗口）；
+    提前返回的失败路径给 MARKET_WINDOWS，调用方看到 error 就不会用它。
+    """
     device_base = normalize_device_base(args.device)
     try:
         symbols = parse_symbols(args.symbols)
     except ValueError as ex:
-        return device_base, [], {}, str(ex)
+        return device_base, [], {}, MARKET_WINDOWS, str(ex)
     try:
         aliases = parse_symbol_names(symbols, args.symbol_names)
     except ValueError as ex:
-        return device_base, symbols, {}, str(ex)
+        return device_base, symbols, {}, MARKET_WINDOWS, str(ex)
+    try:
+        windows = parse_market_windows(args.market_open, args.market_close)
+    except ValueError as ex:
+        return device_base, symbols, aliases, MARKET_WINDOWS, str(ex)
     try:
         sleep_from = parse_clock(args.sleep_from, "--sleep-from/SLEEP_FROM")
         sleep_to = parse_clock(args.sleep_to, "--sleep-to/SLEEP_TO")
     except ValueError as ex:
-        return device_base, symbols, aliases, str(ex)
+        return device_base, symbols, aliases, windows, str(ex)
     if sleep_from == sleep_to:
-        return device_base, symbols, aliases, "--sleep-from/--sleep-to 不能相同"
+        return device_base, symbols, aliases, windows, "--sleep-from/--sleep-to 不能相同"
     for name in ("timeout", "open_interval", "closed_interval", "balance_every",
                  "sleep_keepalive"):
         if getattr(args, name) <= 0:
-            return device_base, symbols, aliases, "--%s 必须 > 0" % name.replace("_", "-")
+            return (device_base, symbols, aliases, windows,
+                    "--%s 必须 > 0" % name.replace("_", "-"))
     if not (args.sina_url or "").strip():
-        return device_base, symbols, aliases, "缺少 --sina-url（或环境变量 SINA_URL）"
+        return device_base, symbols, aliases, windows, "缺少 --sina-url（或环境变量 SINA_URL）"
     # --stock-dry-run 只测取数，不需要设备地址与 token
     if args.check or not (args.dry_run or args.stock_dry_run):
         if not device_base:
-            return device_base, symbols, aliases, "缺少 --device（或环境变量 DEVICE）"
+            return device_base, symbols, aliases, windows, "缺少 --device（或环境变量 DEVICE）"
         if not args.device_token:
-            return device_base, symbols, aliases, "缺少 --device-token（或环境变量 DEVICE_TOKEN）"
+            return (device_base, symbols, aliases, windows,
+                    "缺少 --device-token（或环境变量 DEVICE_TOKEN）")
     if not (args.upstream_url or "").strip() and (args.upstream_key or args.demo):
-        return device_base, symbols, aliases, "缺少 --upstream-url"
-    return device_base, symbols, aliases, ""
+        return device_base, symbols, aliases, windows, "缺少 --upstream-url"
+    return device_base, symbols, aliases, windows, ""
 
 
 def show_dry_run(endpoint, payload):
@@ -1351,13 +1432,14 @@ def show_dry_run(endpoint, payload):
     print(json.dumps(payload, ensure_ascii=False))
 
 
-def stock_dry_run(args, symbols, aliases=None):
+def stock_dry_run(args, symbols, aliases=None, windows=None):
     """真实拉取股票行情并打印 payload，全程不连接设备。
 
     与 ``--dry-run`` 的区别：后者跟随时间策略、且用本地随机数据代替取数；
     这里是真的请求新浪，用来单独验证取数链路、字段解析与开市判定。
     """
     aliases = aliases or {}
+    windows = windows or parse_market_windows(args.market_open, args.market_close)
     if args.demo:
         rows = [{"name": symbol, "change": round_change(random.uniform(-5.0, 5.0))}
                 for symbol in symbols]
@@ -1372,8 +1454,10 @@ def stock_dry_run(args, symbols, aliases=None):
 
     now_bj = time.gmtime(time.time() + 8 * 3600)
     weekday = "周一至周五" if now_bj.tm_wday <= 4 else "周末"
-    open_now = is_market_open(now_bj, data_date=data_date)
+    open_now = is_market_open(now_bj, windows=windows, data_date=data_date)
     print("北京时间 %s（%s）" % (time.strftime("%Y-%m-%d %H:%M:%S", now_bj), weekday))
+    print("开市窗口 %s~%s（含开盘不含收盘）"
+          % (format_hhmm(windows[0][0]), format_hhmm(windows[0][1])))
     print("行情日期 %s → 开市判定：%s" % (data_date or "(取不到)",
                                           "开市" if open_now else "休市"))
     if aliases:
@@ -1481,6 +1565,7 @@ def self_test():
                       sina_url=DEFAULT_SINA_URL, open_interval=15,
                       closed_interval=300, balance_every=300,
                       sleep_from="20:00", sleep_to="08:00",
+                      market_open="09:20", market_close="15:30",
                       sleep_keepalive=600, loop=False, dry_run=False,
                       check=False, demo=True, self_test=False,
                       no_quota_bars=False, verbose=False)
@@ -1527,7 +1612,19 @@ def self_test():
         results.append(name)
         print("[PASS] %02d %s" % (len(results), name))
     
-    def make(start=0.0, aliases=None, **kwargs):
+    def bj_epoch(hour, minute=0, second=0, day=1):
+        """北京时间 → epoch（beijing_time_at 的逆运算，不依赖本机 TZ）。"""
+        return ((day - 1) * 86400 + hour * 3600 + minute * 60 + second
+                - BEIJING_TZ_OFFSET_SEC)
+
+    def bj_stamp(hour, minute=0, second=0, day=1):
+        """北京时间 → is_market_open 吃的结构（1970-01-01 是周四，day=3 是周六）。"""
+        return beijing_time_at(bj_epoch(hour, minute, second, day))
+
+    # 默认起跑点必须落在默认开市窗口内：行情节拍每拍自愈，窗口外起跑会在第一拍
+    # 就转休市。epoch 7200 = 北京 1970-01-01 10:00（周四，窗口内）。
+    def make(start=None, aliases=None, **kwargs):
+        start = bj_epoch(10) if start is None else start
         clock = VirtualClock(start)
         backend = Backend()
         scheduler = Scheduler(args_for(**kwargs), "", DEFAULT_SYMBOLS.split(","),
@@ -1547,14 +1644,14 @@ def self_test():
         return [body for body in stock_bodies(backend) if "balance" in body]
     
     # 1. 开市连续股票 tick，且永不推 /api/v1/balance 抢场景。
-    clock, backend, s = make(0, no_sleep=True)
+    clock, backend, s = make(no_sleep=True)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=3)
     ok("开市 15s 股票 tick 连续触发", len(row_bodies(backend)) == 3 and
        "post/api/v1/balance" not in backend.calls)
     
     # 2. quota_due 闹钟只发额度，不切状态也不推 /balance。
-    clock, backend, s = make(0, no_sleep=True, open_interval=3600)
+    clock, backend, s = make(no_sleep=True, open_interval=3600)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)          # 先消费开市首帧股票
     backend.calls[:] = []
@@ -1570,7 +1667,7 @@ def self_test():
        all("rows" not in b for b in quota_bodies(backend)))
     
     # 3. 行情与额度分别推送：额度那条不带 rows，行情那条不带 balance。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15)
+    clock, backend, s = make(no_sleep=True, open_interval=15)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
     ok("额度与行情分别推送互不夹带",
@@ -1581,7 +1678,7 @@ def self_test():
        not any("股票+额度已推送" in line for line in s.log_lines))
     
     # 4. 额度取不到时不发额度推送（设备保留上次的条）。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15)
+    clock, backend, s = make(no_sleep=True, open_interval=15)
     backend.balance_failures = 1
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
@@ -1590,7 +1687,7 @@ def self_test():
        any("额度未配置或上游失败" in line for line in s.log_lines))
     
     # 5. --no-quota-bars 时开市完全不发额度（连上游都不碰）。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15, no_quota_bars=True)
+    clock, backend, s = make(no_sleep=True, open_interval=15, no_quota_bars=True)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
     clock.advance(300)
@@ -1599,7 +1696,7 @@ def self_test():
        "fetch_balance" not in backend.calls and bool(row_bodies(backend)))
     
     # 6. 开市额度上游失败：留在开市，不退回额度推送。
-    clock, backend, s = make(0, no_sleep=True, open_interval=3600)
+    clock, backend, s = make(no_sleep=True, open_interval=3600)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
     backend.balance_failures = 5
@@ -1613,7 +1710,7 @@ def self_test():
        not quota_bodies(backend))
     
     # 7. 进入开市先补拉额度（独立一条），首帧行情随后才推。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15)
+    clock, backend, s = make(no_sleep=True, open_interval=15)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
     ok("开市预取额度先于首帧行情",
@@ -1622,14 +1719,13 @@ def self_test():
        len(row_bodies(backend)) == 1)
     
     # 8. 休市 300s。
-    clock, backend, s = make(0, no_sleep=True)
+    clock, backend, s = make(no_sleep=True)
     s.start(State.AWAKE_CLOSED)
     s.run(max_events=2)
     ok("非开市 300s 额度节拍", backend.calls.count("post/api/v1/balance") == 2)
     
     # 9. 启动时刻已落在默认休眠区间（20:00~08:00 跨午夜，北京 00:00 在区间内）。
-    midnight = -8 * 3600
-    clock, backend, s = make(midnight)
+    clock, backend, s = make(bj_epoch(0))
     s.start()
     ok("启动落在休眠区间直接休眠并发送 sleep true", s.state == State.SLEEPING and
        backend.calls.count("sleep:True") == 1)
@@ -1646,8 +1742,8 @@ def self_test():
     s.run(max_events=1)
     ok("休眠中到 keepalive 重发 sleep true", backend.calls.count("sleep:True") == 1)
     
-    # 12. 08:00 唤醒顺序（休市时段）。
-    clock, backend, s = make(-60, demo=False, upstream_key="k")
+    # 12. 08:00 唤醒顺序（休市时段，窗口起点 09:20 之前）。
+    clock, backend, s = make(bj_epoch(8) - 60, demo=False, upstream_key="k")
     s.start(State.SLEEPING)
     clock.advance(60)
     s.run(max_events=1)
@@ -1656,7 +1752,9 @@ def self_test():
        backend.calls[-1] == "post/api/v1/balance")
     
     # 13. 唤醒时刻正落在开市时段：只补额度缓存，不推 /api/v1/balance 抢屏。
-    clock, backend, s = make(-60, demo=True)
+    #     唤醒闹钟得对齐窗口起点：sleep_to=09:20 + 北京 09:19 起跑休眠，+60s 到
+    #     09:20:00 恰是半开窗口的起点（默认 08:00 唤醒点在窗口外，测不到这条）。
+    clock, backend, s = make(bj_epoch(9, 19), demo=True, sleep_to="09:20")
     s.start(State.SLEEPING)
     clock.advance(60)
     s.run(max_events=1)
@@ -1664,17 +1762,18 @@ def self_test():
        backend.calls[0] == "sleep:False" and s.state == State.AWAKE_OPEN and
        "post/api/v1/balance" not in backend.calls and
        "fetch_balance" in backend.calls)
-    
-    # 14. 过期行情日期转休市。
-    clock, backend, s = make(10 * 3600, no_sleep=True)
+
+    # 14. 过期行情日期转休市。必须在窗口内起跑，否则会被行情节拍的时间窗口自愈
+    #     拦掉，测不到 stale_date 分支。
+    clock, backend, s = make(bj_epoch(10), no_sleep=True)
     backend.stock_date = "2000-01-01"
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
     ok("行情日期过期转休市节拍", s.state == State.AWAKE_CLOSED and
        not row_bodies(backend))
     
-    # 15. 跨午夜区间。
-    clock, backend, s = make(15 * 3600, sleep_from="23:00", sleep_to="07:00")
+    # 15. 跨午夜区间（北京 23:00 起）。
+    clock, backend, s = make(bj_epoch(23), sleep_from="23:00", sleep_to="07:00")
     s.start()
     is_sleep = s.state == State.SLEEPING
     clock.advance(8 * 3600)
@@ -1682,7 +1781,7 @@ def self_test():
     ok("自定义跨午夜休眠区间", is_sleep and "sleep:False" in backend.calls)
     
     # 16. 非法转移 fail loud。
-    clock, backend, s = make(0, no_sleep=True)
+    clock, backend, s = make(no_sleep=True)
     s.start(State.AWAKE_OPEN)
     try:
         s.transition(Event.UNKNOWN)
@@ -1692,7 +1791,7 @@ def self_test():
     ok("非法状态转移抛错", raised)
     
     # 17. 处理跨过多个周期只执行一次，积压周期被跳过。
-    clock, backend, s = make(0, no_sleep=True, open_interval=1)
+    clock, backend, s = make(no_sleep=True, open_interval=1)
     backend.slow_stock = True
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
@@ -1700,7 +1799,7 @@ def self_test():
        any("跳过" in line for line in s.log_lines))
     
     # 18. 例行节拍行默认全部静默（--verbose 才打），启动摘要照打。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15)
+    clock, backend, s = make(no_sleep=True, open_interval=15)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=2)
     ok("例行节拍行默认静默、启动摘要照打",
@@ -1709,7 +1808,7 @@ def self_test():
        any("启动：状态=" in line for line in s.log_lines) and
        len(row_bodies(backend)) == 2)
     
-    clock, backend, s = make(0, no_sleep=True, open_interval=15, verbose=True)
+    clock, backend, s = make(no_sleep=True, open_interval=15, verbose=True)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=2)
     ok("--verbose 恢复例行节拍行",
@@ -1718,7 +1817,7 @@ def self_test():
        len(row_bodies(backend)) == 2)
     
     # 20. 默认休眠 20:00：19:00 还醒着，20:00 闹钟触发入睡。
-    clock, backend, s = make(11 * 3600, open_interval=3600, balance_every=3600)
+    clock, backend, s = make(bj_epoch(19), open_interval=3600, balance_every=3600)
     s.start()                    # 北京 19:00：不在休眠区间
     clock.advance(3600)          # 到 20:00
     s.run(max_events=1)
@@ -1777,7 +1876,7 @@ def self_test():
        mismatch == 1 and non_ascii == 1)
     
     # 24. 配了简称就用简称上屏（且启动摘要是能确认配置生效的）。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15,
+    clock, backend, s = make(no_sleep=True, open_interval=15,
                              aliases={"sh600519": "HS300"})
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
@@ -1789,7 +1888,7 @@ def self_test():
            for line in s.log_lines))
     
     # 25. 没配简称时一字不改，仍推原代码。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15)
+    clock, backend, s = make(no_sleep=True, open_interval=15)
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
     ok("未配简称时沿用代码",
@@ -1797,7 +1896,7 @@ def self_test():
        any("简称 未配置" in line for line in s.log_lines))
     
     # 26. 简称只影响行名，涨跌幅数值与条数不受影响。
-    clock, backend, s = make(0, no_sleep=True, open_interval=15,
+    clock, backend, s = make(no_sleep=True, open_interval=15,
                              aliases={"sh600519": "X"})
     s.start(State.AWAKE_OPEN)
     s.run(max_events=1)
@@ -1805,7 +1904,62 @@ def self_test():
     ok("简称不改变涨跌幅数值",
        len(rows) == 1 and rows[0]["change"] == 1.0)
     
-    print("SELF-TEST PASS: %d/26" % len(results))
+    # 27. 开市窗口是半开区间：含开盘不含收盘，周末恒休市。
+    #     走模块常量 MARKET_WINDOWS（不传 windows），所以不依赖命令行/环境变量。
+    ok("开市窗口半开区间边界",
+       is_market_open(bj_stamp(9, 20, 0)) and
+       not is_market_open(bj_stamp(9, 19, 59)) and
+       is_market_open(bj_stamp(15, 29, 59)) and
+       not is_market_open(bj_stamp(15, 30, 0)) and
+       not is_market_open(bj_stamp(15, 30, 1)) and
+       not is_market_open(bj_stamp(10, 0, 0, day=3)))   # 1970-01-03 周六
+
+    # 28. 收盘闹钟丢了，行情节拍自己兜底转休市（≤15s 自愈）。
+    clock, backend, s = make(bj_epoch(15, 29), no_sleep=True, open_interval=15)
+    s.start(State.AWAKE_OPEN)
+    s.unregister("AWAKE_OPEN:market_check")   # 模拟检查丢失
+    s.run(max_events=1)                       # 15:29:00 正常推一帧行情
+    healthy = s.state == State.AWAKE_OPEN and len(row_bodies(backend)) == 1
+    clock.advance(3600)                       # 跨过 15:30 到 16:29
+    s.run(max_events=1)                       # 下一拍行情
+    ok("收盘闹钟丢失时行情节拍自愈转休市",
+       healthy and s.state == State.AWAKE_CLOSED and
+       len(row_bodies(backend)) == 1 and
+       [p for p, _ in backend.posts].count("/api/v1/balance") == 1 and
+       any("行情节拍自愈" in line and "转休市节拍" in line
+           for line in s.log_lines))
+
+    # 29. 开市窗口可配：判定与闹钟都用配置值，不是硬编码 09:20/15:30。
+    windows = parse_market_windows("09:30", "13:30")
+    clock, backend, s = make(bj_epoch(13), no_sleep=True,
+                             market_open="09:30", market_close="13:30")
+    s.start(State.AWAKE_OPEN)
+    close_alarm = s.registry.get("AWAKE_OPEN:market_check")
+    s.transition(Event.MARKET_CLOSED)
+    open_alarm = s.registry.get("AWAKE_CLOSED:market_check")
+    close_at = beijing_time_at(close_alarm.next_at) if close_alarm else None
+    open_at = beijing_time_at(open_alarm.next_at) if open_alarm else None
+    ok("自定义开市窗口驱动判定与闹钟",
+       is_market_open(bj_stamp(13, 29), windows=windows) and
+       not is_market_open(bj_stamp(13, 30), windows=windows) and
+       is_market_open(bj_stamp(9, 30), windows=windows) and
+       not is_market_open(bj_stamp(9, 29, 59), windows=windows) and
+       close_at is not None and (close_at.tm_hour, close_at.tm_min) == (13, 30) and
+       open_at is not None and (open_at.tm_hour, open_at.tm_min) == (9, 30) and
+       s.market_window_text() == "09:30~13:30")
+
+    # 30. --demo 不再无条件开市：窗口外强制开市也立刻转休市，窗口内照常推行情。
+    clock, backend, s = make(bj_epoch(16), no_sleep=True, demo=True)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=1)
+    outside_ok = s.state == State.AWAKE_CLOSED and not row_bodies(backend)
+    clock, backend, s = make(bj_epoch(10), no_sleep=True, demo=True)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=1)
+    ok("--demo 仍遵守开市窗口", outside_ok and s.state == State.AWAKE_OPEN and
+       len(row_bodies(backend)) == 1)
+
+    print("SELF-TEST PASS: %d/30" % len(results))
     
 
 def check_device_sync(args, device_base):
@@ -1820,7 +1974,7 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     if args.self_test:
         return self_test()
-    device_base, symbols, aliases, error = validate_args(args)
+    device_base, symbols, aliases, windows, error = validate_args(args)
     if error:
         eprint("参数错误: %s" % error)
         return 3
@@ -1832,9 +1986,9 @@ def main(argv=None):
             eprint("设备失败: %s" % ex)
             return 2
     if args.stock_dry_run:
-        return stock_dry_run(args, symbols, aliases)
+        return stock_dry_run(args, symbols, aliases, windows)
     scheduler = Scheduler(args, device_base, symbols, clock=RealClock(),
-                          aliases=aliases)
+                          aliases=aliases, windows=windows)
     try:
         scheduler.start()
         scheduler.run(max_events=None if args.loop else 1)

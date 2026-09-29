@@ -187,6 +187,15 @@ sh/sz 下位置一致。所以「字段少的是指数」只在 s_ 简版下成�
 三段，元素是 0..100 的剩余百分比或 null（无窗口）；上游取数失败时这一拍什么
 都不推，设备保留上次的条。--no-quota-bars 可让开市期间完全不发额度。
 
+``--demo-stock`` / ``--demo-balance`` 各自只让对应通道用本地随机数据、不联网。**单独
+开其中一个 = 钉死那个场景**：--demo-stock 钉 AWAKE_OPEN、只推 ``/api/v1/stock
+{"rows"}``、不碰额度通道（不需要 --upstream-key）；--demo-balance 钉 AWAKE_CLOSED、
+只推 ``/api/v1/balance``（设备端只有这条端点接管 balance 场景，开市时脚本从不推它，
+所以盘中想看额度页只能走钉死模式）。钉死时忽略开市窗口与休眠，节拍分别用
+``--open-interval``（默认 15s）/ ``--closed-interval``（默认 300s）。**两个都给、或
+都不给、或用 ``--demo``（向后兼容别名）= 只造假数据**，走完整时间策略：开市窗口、
+休眠、行情日期判定、两条通道都照常。
+
 日志分两层：普通日志只有**启动摘要**、**状态转移**和**全部失败/异常**；例行节拍
 的成功行（15s 行情、5min 额度、休眠 keepalive）走 Verbose 任务，默认丢弃，
 `--verbose` 才逐拍输出。否则 journal 每分钟 4 行正常噪音，真异常反而被淹没。
@@ -634,6 +643,8 @@ class Scheduler:
     def __init__(self, args, device_base, symbols, clock=None, backend=None,
                  quiet=False, aliases=None, windows=None):
         self.args = args
+        # 两条通道的 demo 开关各自独立：--demo 是两者的向后兼容别名。
+        self.demo_stock, self.demo_balance = demo_modes(args)
         self.device_base = device_base
         self.symbols = symbols
         # {代码: 简称}，推送前替换行名；None/空 = 全用原代码
@@ -694,8 +705,8 @@ class Scheduler:
         return "%s~%s" % (self.market_open_at(), self.market_close_at())
 
     def market_provisional_open(self):
-        # --demo 只跳过「API 行情日期」判定（demo 数据没有真实日期），不跳过时间
-        # 窗口：窗口是时间策略，不是取数问题，无条件短路会让 demo 永远开市。
+        # 随机数据没有真实行情日期，「API 行情日期」判定对 demo 无意义；时间窗口
+        # 本身照判（只有单独开一个 flag 的「钉死」模式才整体无视它）。
         return is_market_open(self.bj(), windows=self.windows)
 
     def log_market_closed(self, reason):
@@ -712,20 +723,29 @@ class Scheduler:
     def register_state_alarms(self, state, initial=False):
         self.registry.unregister_state(state)
         now = self.now()
+        # 钉死模式（只开了一个 demo flag）：只留本场景自己的那个节拍闹钟，其余一律
+        # 不注册 —— 它们每一个都会把屏幕从钉死的场景上抢走。
+        pinned = self.pinned_state()
         if state == State.AWAKE_OPEN:
             self.registry.register(Alarm(
                 "AWAKE_OPEN:stock", Every(self.args.open_interval),
                 self.handle_stock), now, now if initial else now + self.args.open_interval)
-            due = now + self.args.balance_every
-            if self.last_balance_at is not None:
-                due = self.last_balance_at + self.args.balance_every
-            self.registry.register(Alarm(
-                "AWAKE_OPEN:quota_due", Every(self.args.balance_every),
-                self.handle_quota_due), now, max(now, due))
-            self.registry.register(Alarm(
-                "AWAKE_OPEN:market_check", DailyAt(self.market_close_at()),
-                self.handle_market_check), now)
-            if not self.args.no_sleep:
+            if pinned != State.AWAKE_OPEN:
+                # quota_due 推的是 /api/v1/stock 的 balance 块：不接管屏幕，但会真去
+                # 请求上游、并在缺 key 时刷一条失败日志。钉死时整条额度通道不该被碰。
+                due = now + self.args.balance_every
+                if self.last_balance_at is not None:
+                    due = self.last_balance_at + self.args.balance_every
+                self.registry.register(Alarm(
+                    "AWAKE_OPEN:quota_due", Every(self.args.balance_every),
+                    self.handle_quota_due), now, max(now, due))
+                # market_check 到收盘点会转 AWAKE_CLOSED，那条路径 POST
+                # /api/v1/balance → 设备接管 balance 场景，把 stock 场景顶掉。
+                self.registry.register(Alarm(
+                    "AWAKE_OPEN:market_check", DailyAt(self.market_close_at()),
+                    self.handle_market_check), now)
+            # sleep_at 同理会进 SLEEPING 变黑屏，钉死场景下不注册。
+            if not self.args.no_sleep and pinned != State.AWAKE_OPEN:
                 self.registry.register(Alarm(
                     "AWAKE_OPEN:sleep_at", DailyAt(self.args.sleep_from),
                     self.handle_sleep_enter, guard=lambda ctx: self.sleeping_now()), now)
@@ -735,10 +755,14 @@ class Scheduler:
             self.registry.register(Alarm(
                 "AWAKE_CLOSED:balance", Every(self.args.closed_interval),
                 self.handle_balance_due), now, max(now, first))
-            self.registry.register(Alarm(
-                "AWAKE_CLOSED:market_check", DailyAt(self.market_open_at()),
-                self.handle_market_check), now)
-            if not self.args.no_sleep:
+            # market_check 在开盘点会转 AWAKE_OPEN：先推纯额度再推 {"rows": ...}，
+            # 设备立即接管 stock 场景，把钉死的 balance 场景顶掉。
+            if pinned != State.AWAKE_CLOSED:
+                self.registry.register(Alarm(
+                    "AWAKE_CLOSED:market_check", DailyAt(self.market_open_at()),
+                    self.handle_market_check), now)
+            # sleep_at 会进 SLEEPING 变黑屏，钉死场景下不注册。
+            if not self.args.no_sleep and pinned != State.AWAKE_CLOSED:
                 self.registry.register(Alarm(
                     "AWAKE_CLOSED:sleep_at", DailyAt(self.args.sleep_from),
                     self.handle_sleep_enter, guard=lambda ctx: self.sleeping_now()), now)
@@ -770,6 +794,32 @@ class Scheduler:
             return "未配置（沿用代码）"
         return ",".join(self.aliases.get(symbol, symbol) for symbol in self.symbols)
 
+    def pinned_state(self):
+        """单独开一个 demo flag 时被钉死的状态；两个都开/都没开 = None（走完整时间策略）。
+
+        --demo-balance 钉在 AWAKE_CLOSED：只有那条路径会 POST /api/v1/balance，
+        而设备端只有 /api/v1/balance 会接管 balance 场景。开市时脚本从不推它，
+        所以「只造假额度」在开市时段永远看不到额度页 —— 钉死才解决得了。
+        --demo-stock 钉在 AWAKE_OPEN：只推 {"rows": ...}，设备立即接管 stock 场景。
+        """
+        if self.demo_stock != self.demo_balance:   # 恰好一个为真
+            return State.AWAKE_OPEN if self.demo_stock else State.AWAKE_CLOSED
+        return None
+
+    def demo_text(self):
+        """启动摘要里标出哪条通道在造假（--demo-stock/--demo-balance 独立）。"""
+        stock = "随机" if self.demo_stock else "真实"
+        balance = "随机" if self.demo_balance else "真实"
+        return "股票=%s/额度=%s" % (stock, balance)
+
+    def pin_text(self):
+        """钉死模式的场景标注；未钉死时返回空串（启动摘要保持原样不变）。"""
+        pinned = self.pinned_state()
+        if pinned is None:
+            return ""
+        return " 场景 钉死=%s（忽略开市窗口与休眠）" % (
+            "stock" if pinned == State.AWAKE_OPEN else "balance")
+
     def log_start(self):
         """启动摘要 —— 普通日志里唯一常驻的「一切正常」信息。
 
@@ -777,15 +827,21 @@ class Scheduler:
         会长时间一片空白（看不出是没跑还是在跑）。末尾顺带说明日志为什么是静的。
         """
         yield Log("启动：状态=%s 设备=%s 行情 %ds / 额度 %ds / 非开市 %ds / "
-                  "开市 %s / 休眠 %s-%s / 简称 %s%s"
+                  "开市 %s / 休眠 %s-%s / 简称 %s / 取数 %s%s%s"
                   % (self.state.value, self.device_base or "(未配置)",
                      self.args.open_interval, self.args.balance_every,
                      self.args.closed_interval, self.market_window_text(),
                      self.args.sleep_from, self.args.sleep_to, self.alias_text(),
+                     self.demo_text(), self.pin_text(),
                      "" if self.args.verbose
                      else "（例行节拍日志已静默，加 --verbose 查看每拍明细）"))
 
     def start(self, force_state=None):
+        # 钉死模式优先于一切：也覆盖调用方显式传入的 force_state，也绕过下面的
+        # 休眠分支 —— 否则 --demo-balance 在 23:00 起跑会直接黑屏，钉死就白钉了。
+        pinned = self.pinned_state()
+        if pinned is not None:
+            force_state = pinned
         if self.sleeping_now() and force_state is None:
             self.state = State.AWAKE_CLOSED
             self.register_state_alarms(self.state, initial=True)
@@ -796,8 +852,9 @@ class Scheduler:
             State.AWAKE_OPEN if self.market_open() else State.AWAKE_CLOSED)
         self.register_state_alarms(self.state, initial=True)
         self.run_handler(self.log_start())
-        if self.state == State.AWAKE_OPEN:
-            # 开市先补拉一次额度，首帧股票推送就带上进度条。
+        if self.state == State.AWAKE_OPEN and pinned != State.AWAKE_OPEN:
+            # 开市先补拉一次额度，首帧股票推送就带上进度条。钉死 stock 场景时
+            # 刻意不补拉：额度通道整条不该被碰，否则会多一条「缺少 --upstream-key」。
             self.run_handler(self.handle_quota_due())
 
     def register(self, alarm):
@@ -860,7 +917,7 @@ class Scheduler:
         if self.backend is not None:
             return self.backend.fetch_stock(self)
         try:
-            if self.args.demo or self.args.dry_run:
+            if self.demo_stock or self.args.dry_run:
                 rows = [{"name": symbol,
                          "change": round_change(random.uniform(-5.0, 5.0))}
                         for symbol in self.symbols]
@@ -875,9 +932,9 @@ class Scheduler:
         if self.backend is not None:
             return self.backend.fetch_balance(self)
         try:
-            if not self.args.demo and not self.args.upstream_key:
+            if not self.demo_balance and not self.args.upstream_key:
                 return Result(False, error="缺少 --upstream-key", code=1)
-            usage = (build_demo_usage() if self.args.demo else
+            usage = (build_demo_usage() if self.demo_balance else
                      fetch_upstream(self.args.upstream_url, self.args.upstream_key,
                                     self.args.timeout, self.args.insecure))
             return Result(True, build_payload(usage))
@@ -987,7 +1044,10 @@ class Scheduler:
         if self.state == State.AWAKE_OPEN:
             # 每拍自愈：Every(open_interval) 自身不判时间，收盘检查丢了（机器挂起、
             # handler 异常、状态被外部改）就只能靠这一拍兜底，最多 15s 纠正。
-            if not self.market_provisional_open():
+            # 钉死 stock 场景时**刻意关掉**自愈：自愈会转 AWAKE_CLOSED，那条路径
+            # POST /api/v1/balance 会接管 balance 场景，把钉死的 stock 顶掉。
+            if (self.pinned_state() != State.AWAKE_OPEN and
+                    not self.market_provisional_open()):
                 yield EnterState(Event.MARKET_CLOSED)
                 yield self.log_market_closed(
                     "行情节拍自愈：已过开市窗口 %s" % self.market_window_text())
@@ -1099,7 +1159,11 @@ class Scheduler:
 
         # 单轮模式在休市且没有额度 key 时，仍允许真实股票链路完成一次恢复；
         # 循环模式不会这样兜底，避免改变正常休市策略。
-        if (max_events == 1 and not self.args.loop and not self.args.demo and
+        # 这里判的是「股票通道」而不是「额度通道」：本分支只在额度推送失败
+        # （rc == 1）时才走到，存在的意义就是补推一帧**真实**行情，所以股票
+        # 走 demo 时我们刻意不拿随机数冒充「恢复」。顺带一提，--demo-balance
+        # 开着时额度根本不会失败，这条分支到不了，--demo 行为与拆分前一致。
+        if (max_events == 1 and not self.args.loop and not self.demo_stock and
                 not self.args.upstream_key and self.state == State.AWAKE_CLOSED and
                 self.rc == 1):
             self.run_handler(self.handle_stock())
@@ -1377,6 +1441,18 @@ def round_change(value):
     result = float(Decimal(str(value)).quantize(
         Decimal("0.01"), rounding=ROUND_HALF_UP))
     return 0.0 if result == 0 else result
+
+
+def demo_modes(args):
+    """返回 (股票用随机数, 额度用随机数)。
+
+    --demo 是 --demo-stock 与 --demo-balance 的向后兼容别名，等价于两个都开。
+    用 getattr 而不是直接取属性，是为了让只带旧字段的 Namespace（内置 self_test
+    的 args_for 就是）也不会 AttributeError。
+    """
+    legacy = bool(getattr(args, "demo", False))
+    return (bool(getattr(args, "demo_stock", False)) or legacy,
+            bool(getattr(args, "demo_balance", False)) or legacy)
 
 
 @dataclass(frozen=True)
@@ -2036,7 +2112,7 @@ def build_arg_parser():
                        help="新浪 URL 前缀（也可用 SINA_URL）")
     stock.add_argument("--stock-dry-run", action="store_true",
                        help="只真实拉取并打印股票行情 payload，不连接设备"
-                            "（用于测试取数链路；加 --demo 则用本地随机数据；"
+                            "（用于测试取数链路；加 --demo-stock 则用本地随机数据；"
                             "屏顶额度进度条 payload 只由调度路径生成）")
     stock.add_argument("--no-quota-bars", action="store_true",
                        help="开市时股票推送不带额度数据（屏幕顶部不画进度条）")
@@ -2075,8 +2151,23 @@ def build_arg_parser():
     common.add_argument("--self-test", dest="self_test", action="store_true",
                         help="用 VirtualClock 和假后端运行内置策略验收")
     common.add_argument("--demo", action="store_true",
-                        help="额度/股票均用本地随机数据，不联网；"
-                             "仍遵守开市时间窗口（只跳过 API 行情日期判定）")
+                        help="额度与股票都用本地随机数据、不联网；"
+                             "等价于 --demo-stock --demo-balance（向后兼容别名）"
+                             "，走完整时间策略：开市窗口、休眠、两条通道都照常")
+    common.add_argument("--demo-stock", action="store_true",
+                        help="**单独开**=钉死 stock 场景：用本地随机行情（不请求新浪），"
+                             "忽略开市窗口与休眠，只推 POST /api/v1/stock {\"rows\"}，"
+                             "完全不碰额度通道（不需要 --upstream-key，屏顶无进度条），"
+                             "节拍用 --open-interval（默认 15s）；"
+                             "与 --demo-balance 同时给 = 只造假数据、走完整时间策略")
+    common.add_argument("--demo-balance", action="store_true",
+                        help="**单独开**=钉死 balance 场景：用本地随机额度"
+                             "（不请求 OpenCode 上游），忽略开市窗口与休眠，"
+                             "只推 POST /api/v1/balance —— 设备端只有这条端点会"
+                             "接管 balance 场景，开市时脚本从不推它，"
+                             "所以想在盘中看额度页必须走这个钉死模式；"
+                             "节拍用 --closed-interval（默认 300s）；"
+                             "与 --demo-stock 同时给 = 只造假数据、走完整时间策略")
     common.add_argument("--verbose", action="store_true",
                         help="连 15s 行情的成功行也打（默认只打低频状态与全部异常）")
     return parser
@@ -2088,6 +2179,7 @@ def validate_args(args):
     windows 是解析好的 ((start_sec, end_sec),)，成功路径下永远有值（默认窗口）；
     提前返回的失败路径给 MARKET_WINDOWS，调用方看到 error 就不会用它。
     """
+    _, demo_balance = demo_modes(args)
     device_base = normalize_device_base(args.device)
     try:
         symbols = parse_symbols(args.symbols)
@@ -2127,7 +2219,7 @@ def validate_args(args):
         if not args.device_token:
             return (device_base, symbols, aliases, windows,
                     "缺少 --device-token（或环境变量 DEVICE_TOKEN）")
-    if not (args.upstream_url or "").strip() and (args.upstream_key or args.demo):
+    if not (args.upstream_url or "").strip() and (args.upstream_key or demo_balance):
         return device_base, symbols, aliases, windows, "缺少 --upstream-url"
     return device_base, symbols, aliases, windows, ""
 
@@ -2151,7 +2243,7 @@ def stock_dry_run(args, symbols, aliases=None, windows=None):
     aliases = aliases or {}
     windows = windows or parse_market_windows(args.market_open, args.market_close)
     quotes = None
-    if args.demo:
+    if demo_modes(args)[0]:
         rows = [{"name": symbol, "change": round_change(random.uniform(-5.0, 5.0))}
                 for symbol in symbols]
         data_date = None
@@ -2209,9 +2301,10 @@ def stock_dry_run(args, symbols, aliases=None, windows=None):
 
 
 def run_balance(args, device_base):
-    if not args.demo and not args.upstream_key:
+    demo_balance = demo_modes(args)[1]
+    if not demo_balance and not args.upstream_key:
         return 1, False
-    if args.demo:
+    if demo_balance:
         labels, progress, resets, status = build_payload(build_demo_usage())
         status = "DEMO " + status.replace("UPDATE ", "")
         usage_ok = True
@@ -2243,7 +2336,7 @@ def run_balance(args, device_base):
 
 
 def run_stock(args, device_base, symbols, aliases=None):
-    if args.demo or args.dry_run:
+    if demo_modes(args)[0] or args.dry_run:
         # dry-run 也不能访问新浪；使用本地样例保证离线可重复。
         rows = [{"name": symbol,
                  "change": round_change(random.uniform(-5.0, 5.0))}
@@ -3424,6 +3517,108 @@ def self_test():
        # sh/sz 仍然有简版，别把这次修正过头
        SinaQuotes.supports_simple("sh000300") and
        "s_sh000300" in SinaQuotes().build_url(["sh000300"], True))
+
+    # demo 拆成两条独立通道：flag 解析层。
+    demo_parser = build_arg_parser()
+    def demo_of(*flags):
+        return demo_modes(demo_parser.parse_args(list(flags)))
+    ok("demo flag 解析（--demo 是两个的别名）",
+       demo_of() == (False, False) and
+       demo_of("--demo-stock") == (True, False) and
+       demo_of("--demo-balance") == (False, True) and
+       demo_of("--demo") == (True, True) and
+       demo_of("--demo-stock", "--demo-balance") == (True, True))
+
+    # --demo-stock 单独开：股票走随机（不触网），额度仍要求 key（缺 key 早退，
+    # 同样不触网），两者的分界必须看得见。故意不传 backend，走真实取数分支。
+    stock_only = Scheduler(
+        args_for(demo=False, demo_stock=True, device="x", device_token="y"),
+        "x", DEFAULT_SYMBOLS.split(","), clock=VirtualClock(bj_epoch(10)),
+        quiet=True)
+    stock_result = stock_only.fetch_stock()
+    balance_result = stock_only.fetch_balance()
+    ok("--demo-stock 只伪造股票，额度照常要 key",
+       stock_result.ok and stock_result.data[1] is None and
+       len(stock_result.data[0]) == len(DEFAULT_SYMBOLS.split(",")) and
+       all(isinstance(row["change"], float) for row in stock_result.data[0]) and
+       (not balance_result.ok) and
+       "缺少 --upstream-key" in (balance_result.error or ""))
+
+    # --demo-balance 单独开：额度走随机（不触网），股票侧必须仍然是「真实」。
+    # 这里不调 fetch_stock()（那会联网），只看开关本身没被打开。
+    balance_only = Scheduler(
+        args_for(demo=False, demo_balance=True, device="x", device_token="y"),
+        "x", DEFAULT_SYMBOLS.split(","), clock=VirtualClock(bj_epoch(10)),
+        quiet=True)
+    ok("--demo-balance 只伪造额度，股票仍走真实",
+       balance_only.fetch_balance().ok and
+       demo_modes(balance_only.args) == (False, True) and
+       balance_only.demo_stock is False)
+
+    # 旧调用点（args_for 默认 demo=True）必须继续等价于两个都开。
+    ok("--demo 旧调用点仍等价于两个通道都开",
+       demo_modes(args_for()) == (True, True) and
+       demo_modes(args_for(demo=True)) == (True, True))
+
+    # 83-87. 钉死模式：单独开一个 demo flag = 把场景钉死。开市时段里
+    # --demo-balance 以前只会推 {"rows": ...}（15s 行情接管 stock 场景），
+    # /api/v1/balance 那条只在 AWAKE_CLOSED 跑，所以盘中永远看不到额度页。
+    # 下面五条分别锁住「开市/窗口外/休眠时段/反向 pin/不越过收盘自愈」。
+
+    # 盘中（窗口内）起跑，显式传 AWAKE_OPEN 也必须被 pin 覆盖成 AWAKE_CLOSED，
+    # 且一帧行情都不推 —— 这就是用户踩到的那个 bug。
+    clock, backend, s = make(bj_epoch(10), no_sleep=True, demo=False,
+                             demo_balance=True)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=2)
+    ok("--demo-balance 钉死 balance：盘中只推 /api/v1/balance",
+       s.state == State.AWAKE_CLOSED and
+       [p for p, _ in backend.posts] == ["/api/v1/balance"] * 2 and
+       not row_bodies(backend) and not quota_bodies(backend))
+
+    # 钉死不受开市窗口影响：16:00 早已收盘，仍钉在 AWAKE_CLOSED 只推额度。
+    clock, backend, s = make(bj_epoch(16), no_sleep=True, demo=False,
+                             demo_balance=True)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=1)
+    ok("--demo-balance 钉死无视开市窗口",
+       s.state == State.AWAKE_CLOSED and
+       [p for p, _ in backend.posts] == ["/api/v1/balance"])
+
+    # 钉死不受休眠窗口影响：23:00 落在 20:00~08:00 内，且故意不传 no_sleep，
+    # 走 s.start() 的正常入口 —— 若休眠分支先命中就会黑屏（本来什么也不推）。
+    clock, backend, s = make(bj_epoch(23), demo=False, demo_balance=True)
+    s.start()
+    s.run(max_events=1)
+    ok("--demo-balance 钉死无视休眠窗口（23:00 不入睡）",
+       s.state == State.AWAKE_CLOSED and
+       not any(c.startswith("sleep:") for c in backend.calls) and
+       [p for p, _ in backend.posts] == ["/api/v1/balance"])
+
+    # 反向 pin：--demo-stock 单独开钉在 AWAKE_OPEN，额度通道整条不该被碰 ——
+    # 显式传 AWAKE_CLOSED 也必须被覆盖，且 prefetch/quota_due 闹钟都没跑。
+    clock, backend, s = make(bj_epoch(16), no_sleep=True, demo=False,
+                             demo_stock=True)
+    s.start(State.AWAKE_CLOSED)
+    s.run(max_events=1)
+    ok("--demo-stock 钉死 stock：不碰额度通道",
+       s.state == State.AWAKE_OPEN and
+       len(row_bodies(backend)) == 1 and not quota_bodies(backend) and
+       "fetch_balance" not in backend.calls and
+       "/api/v1/balance" not in [p for p, _ in backend.posts])
+
+    # 钉死的 stock 场景跨过 15:30 不自愈（自愈会转 AWAKE_CLOSED → 额度抢屏幕）。
+    clock, backend, s = make(bj_epoch(15, 29), no_sleep=True, demo=False,
+                             demo_stock=True)
+    s.start(State.AWAKE_OPEN)
+    s.run(max_events=1)
+    clock.advance(3600)          # → 16:29，已过收盘
+    s.run(max_events=1)
+    ok("--demo-stock 钉死跨过 15:30 不自愈",
+       s.state == State.AWAKE_OPEN and
+       len(row_bodies(backend)) == 2 and
+       [p for p, _ in backend.posts].count("/api/v1/balance") == 0 and
+       not any("行情节拍自愈" in line for line in s.log_lines))
 
     print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     

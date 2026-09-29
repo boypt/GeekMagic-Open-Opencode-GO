@@ -401,19 +401,29 @@ class StockScene : public Scene {
     /// 行序 0/1/2 = 5H / WK. / MO.，与额度页三行同序
     static constexpr uint16_t C_BAR_ROW[StockData::QUOTA_MAX] = {
         C_BAR_5H, C_BAR_WK, C_BAR_MO};
-    // 额度指示 = 右上角三重同心圆环，整体外径 40px，占位 x=194..234 / y=3..43。
-    // 环区与其它元素互不相犯：居中标题 x≈90..150、行情行擦除带从 y=47 起、
-    // 时钟从 y=202 起，所以圆环只擦自己那 41×41 的方框。
-    static constexpr int16_t RING_CX = 214;
-    static constexpr int16_t RING_CY = 23;
+    // 额度指示 = **右下角**三重同心圆环，整体外径 40px，擦底方框 41×41。
+    // 贴右下角各留 5px 余量：方框占 x=193..233 / y=194..234（屏幕 240×240），
+    // 圆心 (213,214)，最外半径 20，故实际像素恰在框内不越界。
+    // 环区与其它元素在两个方向上都错开，互不覆盖：
+    //   · 行情行擦除带止于 y=180（环从 y=194 起，纵向 14px 空档）
+    //   · 时钟擦除带只到 x=149（CLOCK_X−2 .. CLOCK_X+CLOCK_W+1），
+    //     环从 x=193 起，横向 44px 空档
+    // 所以圆环只擦自己那 41×41 的方框，而时钟的整条擦除也绝不越过 x=149。
+    static constexpr int16_t RING_BOX = 41;   // 擦底方框边长（含外缘各 1px 余量）
+    static constexpr int16_t RING_X = 193;
+    static constexpr int16_t RING_Y = 194;
+    static constexpr int16_t RING_CX = RING_X + 20;
+    static constexpr int16_t RING_CY = RING_Y + 20;
     static constexpr int16_t RING_R[StockData::QUOTA_MAX] = {20, 14, 8};
     static constexpr uint8_t RING_THICK = 2;   // 每环 2px 描边（向内取）
-    static constexpr int16_t RING_BOX = 41;   // 擦底方框边长（含外缘各 1px 余量）
-    static constexpr int16_t RING_X = RING_CX - 20;
-    static constexpr int16_t RING_Y = RING_CY - 20;
     static constexpr int16_t ROW_Y = 50;
     static constexpr uint8_t ROW_STEP = 27;
+    // 时钟**左对齐**（不再水平居中）：字号 3 每字 18px，8 字符共 144px，
+    // 占 x=4..147，右侧空出来的 148..192 恰好让给右下角圆环。
+    // 擦除带上沿 CLOCK_Y−2=202，与行情行带（止于 180）也不相接。
     static constexpr int16_t CLOCK_Y = 204;
+    static constexpr int16_t CLOCK_X = 4;
+    static constexpr int16_t CLOCK_W = 144;   // == textWidthPx("00:00:00", 3)
     static constexpr int16_t NAME_X = 4;
     static constexpr int16_t VALUE_RIGHT = 236;
     static constexpr int8_t NAME_GAP = 4;
@@ -466,15 +476,16 @@ class StockScene : public Scene {
         }
     }
 
-    /// 右上角三重同心额度环：外/中/内 = 5H / WK. / MO.，无任何文字。
+    /// 右下角三重同心额度环：外/中/内 = 5H / WK. / MO.，无任何文字。
     /// 弧长 = 百分比（唯一的数据通道，50% 半圈、100% 整圈），环色 = 行身份，不随数值变。
     /// 从 12 点起顺时针扫：x = cx + r·sin(deg)，y = cy − r·cos(deg)。
     /// 轨道恒画满整圈（无值 -1 / 0% 只留轨道，没有任何数据时也是三圈空轨道）。
-    /// 环区自清底，因此它本身就是自洽的局部更新单元（41×41，约屏面 0.7%），
-    /// 可以与行情行带完全独立地单独重画。
+    /// 环区自清底（fillRect 只覆盖 RING_X/RING_Y 起的 41×41，落在 x≤233 / y≤234），
+    /// 因此它本身就是自洽的局部更新单元（约屏面 0.7%），既不触碰左上标题、
+    /// 中部行情行带，也碰不到左侧时钟（时钟擦除带止于 x=149）。
     auto drawQuota() -> void {
         auto* gfx = DisplayManager::getGfx();
-        // 只擦环区，不碰标题/行带/时钟。
+        // 只擦环区（x=193..233 / y=194..234），不碰标题/行带/时钟。
         gfx->fillRect(RING_X, RING_Y, RING_BOX, RING_BOX, C_BG);
 
         // 1° 步长：外环周长 126px，1° 只有 0.35px 弧长，逐点落笔不会断线；
@@ -507,7 +518,8 @@ class StockScene : public Scene {
 
     auto drawTitle() -> void {
         auto* gfx = DisplayManager::getGfx();
-        // y=16 起、水平居中（x≈90..150）；额度环在右上角 x≥194，两者互不重叠。
+        // y=16 起、水平居中（x≈90..150）；额度环已移到右下角 y≥194，
+        // 顶部这一带只剩标题，与环区毫无交集。
         gfx->setTextSize(2);
         gfx->setTextColor(C_WHITE);
         gfx->setCursor(120 - textWidthPx("STOCK", 2) / 2, 16);
@@ -517,8 +529,9 @@ class StockScene : public Scene {
     auto drawRows() -> void {
         auto* gfx = DisplayManager::getGfx();
         // 字号 2 的字高为 16px；27px 行距给每行保留 11px 的呼吸空间。
-        // 擦除带在 47~179，时钟擦除带从 202 开始，中间保留 22px 安全间隔。
-        // 头部 16~31（标题）与右上角额度环（y≤43）都在这块之外，互不覆盖。
+        // 擦除带在 47~180，左下角时钟擦除带从 y=202 开始（且只占 x=2..149），
+        // 中间保留 22px 纵向间隔；头部 16~31 的标题与右下角额度环
+        // （y≥194）也都在这块之外，互不覆盖。
         gfx->fillRect(0, ROW_Y - 3, 240, 5 * ROW_STEP - 2, C_BG);
         if (m_count == 0) {
             gfx->setTextSize(2);
@@ -579,12 +592,17 @@ class StockScene : public Scene {
         auto* gfx = DisplayManager::getGfx();
         gfx->setTextSize(3);
         gfx->setTextColor(C_WHITE);
-        const int16_t clockX = 120 - textWidthPx("00:00:00", 3) / 2;
+        // 左对齐到 CLOCK_X，整条时钟恒为 CLOCK_W 宽（字形宽度固定，数字位数不变）。
+        const int16_t clockX = CLOCK_X;
         const int16_t minuteWidth = textWidthPx("00:00:", 3);
         const int16_t secondX = clockX + minuteWidth;
         const int16_t secondWidth = textWidthPx("00", 3);
         if (fullRedraw) {
-            gfx->fillRect(0, CLOCK_Y - 2, 240, 28, C_BG);
+            // 关键：**只擦时钟自己那一条**（x=2..149），绝不能像原先那样
+            // fillRect(0, …, 240, 28) 横扫整行 —— 圆环已移到右下角
+            // x=193..233 / y=194..234，整行擦除会把三层同心环抹掉。
+            // 左右各留 2px 余量，保证字号下沿与首尾字形都不残留。
+            gfx->fillRect(CLOCK_X - 2, CLOCK_Y - 2, CLOCK_W + 4, 28, C_BG);
         }
         if (fullRedraw || minuteChanged) {
             // 分钟跳变时整条擦除不会执行，必须先擦掉本区域再画，否则新旧分钟

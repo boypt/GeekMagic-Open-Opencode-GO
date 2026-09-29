@@ -261,6 +261,37 @@ class SystemInfoScene : public Scene {
     }
 };
 
+// 1/255 定标的正弦表（0..90°，四分之一波）。画圆弧要按角度取圆周坐标，
+// 为了不把 libm 的 sinf/cosf（连带浮点库和一堆代码）带进固件，这里用 91 字节
+// 查表 + 象限映射取整条圆周的 sin/cos，误差 ≤ 0.5/255 ≈ 0.04px，240×240
+// 屏上完全看不出来。91 字节常驻静态区（.rodata），不参与堆分配。
+static const uint8_t kSinUnitDeg[91] = {
+      0,   4,   9,  13,  18,  22,  27,  31,  35,  40,  44,  49,  53,  57,  62,
+     66,  70,  75,  79,  83,  87,  91,  96, 100, 104, 108, 112, 116, 120, 124,
+    127, 131, 135, 139, 143, 146, 150, 153, 157, 160, 164, 167, 171, 174, 177,
+    180, 183, 186, 190, 192, 195, 198, 201, 204, 206, 209, 211, 214, 216, 219,
+    221, 223, 225, 227, 229, 231, 233, 235, 236, 238, 240, 241, 243, 244, 245,
+    246, 247, 248, 249, 250, 251, 252, 253, 253, 254, 254, 254, 255, 255, 255,
+    255,
+};
+
+/// sin(deg) 的 1/255 定标值（-255..255）。0..359° 全域。
+static auto sinUnitDeg(uint16_t deg) -> int16_t {
+    deg %= 360U;
+    // 折到第一象限取表：sin 在 [0,180] 与 [180,360] 分别是 sin(t) 与 -sin(t-180)
+    const uint16_t folded = deg < 90U   ? deg
+                          : deg < 180U  ? 180U - deg
+                          : deg < 270U  ? deg - 180U
+                                        : 360U - deg;
+    const int16_t magnitude = static_cast<int16_t>(kSinUnitDeg[folded]);
+    return deg >= 180U ? -magnitude : magnitude;
+}
+
+/// cos(deg) = sin(deg + 90°)，复用同一张表。
+static auto cosUnitDeg(uint16_t deg) -> int16_t {
+    return sinUnitDeg(deg + 90U);
+}
+
 // ---------- stock：推送的股票行情 ----------
 // 固定五个槽位让 1~5 行的切换不跳动；数据变化只擦写行带，不触碰整屏。
 class StockScene : public Scene {
@@ -319,8 +350,8 @@ class StockScene : public Scene {
                 drawRows();
             }
 
-            // 额度条与行数据同属一次股票推送，但差量判定必须彼此独立：
-            // 只动额度时行带保持零绘制，只动行时也不必重画额度带。
+            // 额度环与行数据同属一次股票推送，但差量判定必须彼此独立：
+            // 只动额度时行带保持零绘制，只动行时也不必重画圆环。
             int8_t quotaNow[StockData::QUOTA_MAX];
             const bool hasNow = StockData::hasQuota();
             bool quotaChanged = hasNow != m_hasQuota;
@@ -358,10 +389,10 @@ class StockScene : public Scene {
     static constexpr uint16_t C_DOWN = rgb565(0x00, 0xFF, 0x00);
     /// 平盘 0.00%：中性白，比灰蓝醒目，也不与涨跌色混淆
     static constexpr uint16_t C_NEUTRAL = rgb565(0xFF, 0xFF, 0xFF);
-    // 屏顶额度条：颜色**按行固定**，不再随百分比变 —— 三行各占一个身份色，
-    // 数值完全由条长表达，色相只用来分辨「哪一条是 5H / WK. / MO.」。
+    // 额度环：颜色**按行固定**，不再随百分比变 —— 三个环各占一个身份色，
+    // 数值完全由弧长表达，色相只用来分辨「哪一个环是 5H / WK. / MO.」。
     // 三个色都取自暖橙家族并按明暗度递减（橙红最亮 → 橙棕最沉），既有层次
-    // 又不与股票场景的涨跌红绿/中性白混淆；青绿等冷色在 2px 细条上实机难辨，已弃用。
+    // 又不与股票场景的涨跌红绿/中性白混淆。
     // 源值仍是真 RGB，由本文件的 rgb565() 做 BGR 交换（与全项目同一口径）。
     static constexpr uint16_t C_TRACK = rgb565(0x28, 0x32, 0x49);
     static constexpr uint16_t C_BAR_5H = rgb565(0xFF, 0x6B, 0x35);  // 橙红（最亮）
@@ -370,13 +401,16 @@ class StockScene : public Scene {
     /// 行序 0/1/2 = 5H / WK. / MO.，与额度页三行同序
     static constexpr uint16_t C_BAR_ROW[StockData::QUOTA_MAX] = {
         C_BAR_5H, C_BAR_WK, C_BAR_MO};
-    // 屏顶条带占 0..15，标题从 y=16 起，条带下方留 4px 间隙（y=12..15）避免贴字。
-    static constexpr int16_t QUOTA_X = 4;
-    static constexpr int16_t QUOTA_W = 232;
-    static constexpr int16_t QUOTA_H = 2;
-    static constexpr int16_t QUOTA_Y0 = 2;
-    static constexpr int16_t QUOTA_STEP = 4;
-    static constexpr int16_t QUOTA_BAND_H = 16;
+    // 额度指示 = 右上角三重同心圆环，整体外径 40px，占位 x=194..234 / y=3..43。
+    // 环区与其它元素互不相犯：居中标题 x≈90..150、行情行擦除带从 y=47 起、
+    // 时钟从 y=202 起，所以圆环只擦自己那 41×41 的方框。
+    static constexpr int16_t RING_CX = 214;
+    static constexpr int16_t RING_CY = 23;
+    static constexpr int16_t RING_R[StockData::QUOTA_MAX] = {20, 14, 8};
+    static constexpr uint8_t RING_THICK = 2;   // 每环 2px 描边（向内取）
+    static constexpr int16_t RING_BOX = 41;   // 擦底方框边长（含外缘各 1px 余量）
+    static constexpr int16_t RING_X = RING_CX - 20;
+    static constexpr int16_t RING_Y = RING_CY - 20;
     static constexpr int16_t ROW_Y = 50;
     static constexpr uint8_t ROW_STEP = 27;
     static constexpr int16_t CLOCK_Y = 204;
@@ -432,32 +466,48 @@ class StockScene : public Scene {
         }
     }
 
-    /// 屏顶三条 2px 额度条：只画条，不画任何文字/标签/百分比。
-    /// 条长 = 百分比（唯一的数据通道），条色 = 行身份（5H/WK./MO.），不随数值变。
-    /// 条带自清底，因此它本身就是自洽的局部更新单元，可单独重画。
+    /// 右上角三重同心额度环：外/中/内 = 5H / WK. / MO.，无任何文字。
+    /// 弧长 = 百分比（唯一的数据通道，50% 半圈、100% 整圈），环色 = 行身份，不随数值变。
+    /// 从 12 点起顺时针扫：x = cx + r·sin(deg)，y = cy − r·cos(deg)。
+    /// 轨道恒画满整圈（无值 -1 / 0% 只留轨道，没有任何数据时也是三圈空轨道）。
+    /// 环区自清底，因此它本身就是自洽的局部更新单元（41×41，约屏面 0.7%），
+    /// 可以与行情行带完全独立地单独重画。
     auto drawQuota() -> void {
         auto* gfx = DisplayManager::getGfx();
-        // 先整条带擦成背景色：没有额度数据时这里留下纯黑，比残留旧条更干净。
-        gfx->fillRect(0, 0, 240, QUOTA_BAND_H, C_BG);
-        if (!m_hasQuota) {
-            return;
-        }
+        // 只擦环区，不碰标题/行带/时钟。
+        gfx->fillRect(RING_X, RING_Y, RING_BOX, RING_BOX, C_BG);
 
-        for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
-            const int8_t percent = m_savedQuota[i];
-            const int16_t y = QUOTA_Y0 + i * QUOTA_STEP;
-            gfx->fillRect(QUOTA_X, y, QUOTA_W, QUOTA_H, C_TRACK);
-            if (percent <= 0) {
-                continue;  // 无值(-1) 与 0% 都是空槽，视觉一致，只留轨道
+        // 1° 步长：外环周长 126px，1° 只有 0.35px 弧长，逐点落笔不会断线；
+        // 一次整环重画约 360 角度 × 3 环 × 2px = 2160 像素，远小于一屏。
+        for (uint16_t deg = 0; deg < 360U; ++deg) {
+            const int16_t unitX = sinUnitDeg(deg);
+            const int16_t unitY = cosUnitDeg(deg);
+            for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+                const int8_t percent = m_savedQuota[i];
+                // deg/360 与 percent/100 交叉相乘比较，避免浮点：deg 最大 359、
+                // percent 最大 100，32 位乘法绰绰有余。
+                // 无值（-1）与 0% 都只剩轨道。完全没有额度数据时（m_hasQuota
+                // 为 false）三段必全是 -1 —— setQuota 只在至少一段 >=0 时才置位
+                // hasQuota，clear() 也把三段复位成 -1 —— 所以这里不提前返回，
+                // 三圈轨道照画，只是没有进度弧。
+                const bool onArc = percent > 0 &&
+                    static_cast<uint32_t>(deg) * 100U <
+                        static_cast<uint32_t>(percent) * 360U;
+                const uint16_t color = onArc ? C_BAR_ROW[i] : C_TRACK;
+                // 2px 描边按半径向内取（r 与 r−1），四个方向厚度一致；
+                // 像素偏移把半径折成 16.8 定标（r×257）后用移位，避免逐像素除法。
+                for (uint8_t k = 0; k < RING_THICK; ++k) {
+                    const int16_t s = static_cast<int16_t>(RING_R[i] - k) * 257;
+                    gfx->drawPixel(RING_CX + ((unitX * s) >> 16),
+                                   RING_CY - ((unitY * s) >> 16), color);
+                }
             }
-            const int fillW = (QUOTA_W * percent + 50) / 100;
-            gfx->fillRect(QUOTA_X, y, fillW, QUOTA_H, C_BAR_ROW[i]);
         }
     }
 
     auto drawTitle() -> void {
         auto* gfx = DisplayManager::getGfx();
-        // y=16 起：上方 0..15 是额度条带，两者不重叠，条带不必让位。
+        // y=16 起、水平居中（x≈90..150）；额度环在右上角 x≥194，两者互不重叠。
         gfx->setTextSize(2);
         gfx->setTextColor(C_WHITE);
         gfx->setCursor(120 - textWidthPx("STOCK", 2) / 2, 16);
@@ -468,7 +518,7 @@ class StockScene : public Scene {
         auto* gfx = DisplayManager::getGfx();
         // 字号 2 的字高为 16px；27px 行距给每行保留 11px 的呼吸空间。
         // 擦除带在 47~179，时钟擦除带从 202 开始，中间保留 22px 安全间隔。
-        // 头部 0~15（额度条带）与 16~31（标题）分属两块，互不覆盖。
+        // 头部 16~31（标题）与右上角额度环（y≤43）都在这块之外，互不覆盖。
         gfx->fillRect(0, ROW_Y - 3, 240, 5 * ROW_STEP - 2, C_BG);
         if (m_count == 0) {
             gfx->setTextSize(2);

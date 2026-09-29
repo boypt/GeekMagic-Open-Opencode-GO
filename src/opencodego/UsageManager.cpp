@@ -72,15 +72,24 @@ static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
                                               (static_cast<uint16_t>(g & 0xFC) << 3) | (b >> 3));
     return static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
 }
-static constexpr uint16_t C_BG = rgb565(0x00, 0x00, 0x00);
-static constexpr uint16_t C_BORDER = rgb565(0x28, 0x32, 0x49);
-static constexpr uint16_t C_SUB = rgb565(0x8A, 0x94, 0xB8);
-static constexpr uint16_t C_LABEL = rgb565(0x9A, 0xA5, 0xC8);
-static constexpr uint16_t C_ACCENT = rgb565(0x4D, 0x6B, 0xFE);
-static constexpr uint16_t C_WHITE = rgb565(0xFF, 0xFF, 0xFF);
-static constexpr uint16_t C_GREEN = rgb565(0x34, 0xD3, 0x99);
-static constexpr uint16_t C_RED = rgb565(0xFF, 0x6B, 0x6B);
-static constexpr uint16_t C_YELLOW = rgb565(0xF6, 0xC3, 0x43);
+// 暖色主题：琥珀 → 橙 → 红 的单色温递进，底色压成极深暖棕，
+// 营造「余温 / 炭火」氛围；不用纯黑是为了让暖光有依附的暗场，
+// 同时比纯黑略高一档的底色让进度条空轨道不显得突兀。
+// 文字类（C_SUB/C_LABEL/C_WHITE）刻意保持高明度，240x240 上 6x10
+// 小字在暖色系里最容易被暗棕吞掉，所以不用「低亮度暖棕」当文字。
+static constexpr uint16_t C_BG     = rgb565(0x12, 0x0A, 0x06);  // 极深暖棕（炭底）
+static constexpr uint16_t C_BORDER = rgb565(0x40, 0x28, 0x1A);  // 空轨道 / 分隔竖线：深棕
+static constexpr uint16_t C_SUB    = rgb565(0xB0, 0x8A, 0x6A);  // 次级文字：暖灰褐
+static constexpr uint16_t C_LABEL  = rgb565(0xC9, 0xA2, 0x77);  // 行标签：暖沙色
+static constexpr uint16_t C_ACCENT = rgb565(0xFF, 0x6B, 0x35);  // 装饰短线：橙红
+static constexpr uint16_t C_WHITE  = rgb565(0xFF, 0xF2, 0xE3);  // 七段数字/百分比：暖白
+// 进度条三档（暖色下重新映射：>=50 充裕=琥珀金，>=20 偏低=橙，<20 告急=红）。
+// 色相 45°→22°→6° 单向递减 + 低档最饱和最亮，是暖色系里唯一能一眼
+// 分级且「越低越刺眼」的排法；C_RED 同时用于 `--` 负号与失败提示，
+// 保持高对比纯红才不会看不清。
+static constexpr uint16_t C_OK     = rgb565(0xFF, 0xC5, 0x3D);  // 充裕（琥珀金）
+static constexpr uint16_t C_MID    = rgb565(0xFF, 0x7A, 0x2F);  // 偏低（橙）
+static constexpr uint16_t C_RED    = rgb565(0xFF, 0x3B, 0x30);  // 告急（红）
 
 // ---- 字体（U8g2_for_Adafruit_GFX，替代旧 TFT_eSPI FreeSans/内置字体）----
 // - 时钟大数字不用字体：自绘七段数码管（见下方 drawSegDigit），恢复旧工程
@@ -415,7 +424,7 @@ void UsageManager::drawQuotaRow(int y, uint8_t index) {
     gfx->fillRect(trackX, trackY, trackW, trackH, C_BORDER);
     if (hasProgress && progress > 0) {
         const int fillW = (trackW * progress + 50) / 100;
-        const uint16_t fillColor = progress >= 50 ? C_GREEN : (progress >= 20 ? C_YELLOW : C_RED);
+        const uint16_t fillColor = progress >= 50 ? C_OK : (progress >= 20 ? C_MID : C_RED);
         gfx->fillRect(trackX, trackY, fillW, trackH, fillColor);
     }
 

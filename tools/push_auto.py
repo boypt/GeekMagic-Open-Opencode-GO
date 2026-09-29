@@ -76,6 +76,35 @@ dance。``int_nikkei`` 有 10 字节，超过设备端 name 的 9 字节上限�
 的语法上限放宽到 16 字节，但超 9 字节的代码**必须**在 SYMBOL_NAMES 里配简称
 （没配简称才会原样上屏）。
 
+外盘期货是**第四种形态**（``hf_`` 前缀，如 hf_NQ/hf_ES/hf_XAU）::
+
+    hf_NQ   15 字段 [0]现价 [7]昨收 [12]日期 [13]中文名 [14]'0'
+    hf_XAU  14 字段 ← 尾部少一个，所以**不能**按字段数判形态
+
+它**没有现成的涨跌幅百分比**（不像 int_ 的 fields[3] 直给），必须自算
+``(f[0]−f[7])/f[7]*100``（要求 f[7] > 0），再交给 round_change 归一到 2 位。实测
+hf_NQ 30507.430 / 昨收 30566.250 → −0.19%。f[12] 的日期**故意不参与 A 股日期
+投票** —— 外盘期货在 A 股节假日照常交易，混进投票会让节假日被误判成开市；所以
+纯 ``hf_`` 列表的 data_date 同样是 None。名称取 f[13]（中文，只进日志）。实测样本
+（日期投票之外都用它）：hf_NQ / hf_ES / hf_YM / hf_CL / hf_HSI / hf_CHA50CFD
+都是 15 字段，hf_XAU 是 14。
+
+**港股 ``hk*``（hk00700 等）本轮显式不支持**：实测 19 字段，f[0]=英文名
+f[1]=中文名 f[17]=日期（**斜杠格式** 2026/09/29，与 A 股不同）f[18]=时间 ——
+字段数、名称位置、日期格式都和上面四种都不同，套任何一种都会误算。所以它在
+形态分流的**最前面**被拦下，给出「hk_ 形态暂不支持」的跳过原因，绝不放行到
+int_ 的 4 字段分支。以后要接就新加一条形态分支。
+
+**代码大小写是非对称的，别「顺手统一成一种」** —— 实测::
+
+    SH000300 → EMPTY      hf_NQ  → 15 字段正常（纳斯达克指数期货）
+    sh000300 → 34 字段正常  hf_nq  → EMPTY
+    Sz399006 → EMPTY      int_nikkei → 4 字段正常（本来就全小写）
+
+所以 **A 股必须小写、外盘期货必须保大小写**。normalize_symbol 只把匹配
+``^(sh|sz|bj)\\d{6}$`` 的代码转小写（用户写 ``SH000300`` 会被修正成 ``sh000300``），
+其余形态原样送出；判定与字典归并用小写副本，**请求 URL 用保大小写的代码**。
+
 **布局按 key 带不带 s_ 前缀分流，不按字段数。** 完整版的指数和个股是同一套布局
 （沪市 34 字段 / 深市 33 字段，尾部多一个空字段）：``fields[2]``=昨收、
 ``fields[3]``=最新价/最新点位，涨跌幅 = ``(fields[3]−fields[2])/fields[2]``，
@@ -148,10 +177,19 @@ MAX_SYMBOL_BYTES = 16
 # 支持 s_ 简版的前缀（注意代码是 sh000300 这种「sh+数字」，没有下划线）。依据是实测：
 # sh/sz/bj 的每个代码请求 s_<code> 都返回 6 字段简版；而 int_nikkei 的 s_int_nikkei
 # 恒为空串（海外指数没有简版形态），hk*/hf_* 同理。不按「看起来像不像 A 股」外推，
-# 只有这一条是实测过的。
+# 只有这一条是实测过的。判定一律走 code.lower()（见 normalize_symbol）。
 SIMPLE_PREFIXES = ("sh", "sz", "bj")
-# 无 s_ 简版的形态（int_ 海外指数等）：4 字段且**没有日期字段**，不参与日期投票。
-NOSIMPLE_PREFIXES = ("int_", "hk", "hf_")
+# 无 s_ 简版的形态：int_ 海外指数是 4 字段，hf_ 外盘期货是 15/14 字段，两者都**没有
+# A 股那种可投票的行情日期**，不参与日期投票。
+NOSIMPLE_PREFIXES = ("int_", "hf_")
+# 已知存在但本轮**不实现**的形态，命中即给中文原因跳过，绝不放行到别的分支里被误算。
+# hk*（港股）实测 19 字段：f[0]=英文名 f[1]=中文名 f[17]=日期 **斜杠格式** 2026/09/29
+# f[18]=时间 —— 字段数、名称位置、日期格式都和 s_ 简版 / A 股完整版 / int_ / hf_ 四种
+# 都不一样，套任何一种都会算出看着像样的垃圾。要接的话在这里换成一个新分支。
+UNSUPPORTED_PREFIXES = ("hk",)
+UNSUPPORTED_REASONS = {
+    "hk": "hk_ 形态暂不支持（港股 19 字段、日期是斜杠格式，与其余四种形态都不同）",
+}
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 SINA_REFERER = "https://finance.sina.com.cn"
 MARKET_WINDOWS = ((9 * 3600 + 20 * 60, 15 * 3600 + 30 * 60),)
@@ -1123,15 +1161,43 @@ def fetch_upstream(url, key, timeout, insecure, retries=2):
     raise RuntimeError(last_error or "上游请求失败")
 
 
+def normalize_symbol(symbol):
+    """剥掉文档里常见的 s_ 前缀 + 按形态归一化大小写，返回裸代码。
+
+    **大小写规则是非对称的，别「顺手统一成一种」** —— 依据是实测：
+
+        SH000300  → EMPTY   ← 大写 A 股代码取不到
+        sh000300  → 34 字段正常
+        Sz399006  → EMPTY
+        s_Sh000300 → EMPTY
+        hf_NQ     → 15 字段正常（新浪标名「纳斯达克指数期货」）
+        hf_nq     → EMPTY   ← 小写外盘代码取不到
+        int_nikkei → 4 字段正常（本来就是全小写）
+
+    所以只有匹配 ``^(sh|sz|bj)\\d{6}$``（大小写不敏感判定）的 A 股代码转小写；其余
+    （``hf_*`` / ``int_*`` / ``hk*`` 等）**原样保留大小写**。s_ 前缀大小写不敏感地剥。
+    """
+    code = (symbol or "").strip()
+    if code[:2].lower() == "s_":
+        code = code[2:]
+    parts = (code[:2].lower(), code[2:])
+    if parts[0] in SIMPLE_PREFIXES and len(parts[1]) == 6 and parts[1].isdigit():
+        return code.lower()
+    return code
+
+
 def parse_symbols(value):
     """解析标的并验证 ASCII、长度和数量约束。
+
+    大小写走 normalize_symbol 的**非对称规则**（A 股转小写、外盘保大小写），不是一刀切
+    lower() —— 详见该函数 docstring 里的实测对照。
 
     长度上限是 MAX_SYMBOL_BYTES(16) 而不是设备端 name 的 9 字节：取数层把代码当
     name 推给设备，但**只有没配简称时才会原样上屏**（见 require_aliases_for_long_codes）。
     """
     symbols = []
     for item in str(value or "").split(","):
-        symbol = item.strip().lower()
+        symbol = normalize_symbol(item)
         if not symbol:
             raise ValueError("--symbols 含空的标的项")
         if len(symbol.encode("ascii", "ignore")) != len(symbol):
@@ -1243,14 +1309,21 @@ def _quote_field(fields, index):
 
 
 class SinaQuotes:
-    """新浪行情客户端：按 key 前缀分三条形态，一次请求混写。
+    """新浪行情客户端：按 key 前缀分四条形态，一次请求混写。
 
     - 简版（``s_<code>``，仅 SIMPLE_PREFIXES 支持）6 字段，只要涨跌幅，正是设备要的
     - 完整版（``<code>``，A 股裸代码）多一个日期字段，节假日/停市兜底判定靠它
-    - **无简版形态**（``int_`` 海外指数，实测 ``s_int_nikkei`` 恒为空串）只有 4
-      字段：名称,现价,涨跌额,涨跌幅% —— fields[3] 同样是直接给的百分比。**它没有
-      日期字段**，所以不参与日期投票：行情日期/节假日兜底只对 A 股代码有效，纯
-      ``int_`` 列表拿不到 data_date（返回 None）。
+    - **海外指数**（``int_`` 前缀，实测 ``s_int_nikkei`` 恒为空串，即无简版形态）
+      只有 4 字段：名称,现价,涨跌额,涨跌幅% —— fields[3] 同样是直接给的百分比
+    - **外盘期货**（``hf_`` 前缀，如 ``hf_NQ``/``hf_ES``/``hf_XAU``）15 字段
+      （``hf_XAU`` 实测 14，尾部少一个）：[0]现价 [7]昨收 [12]日期 [13]中文名。
+      **没有现成涨跌幅**，自己算 (f[0]−f[7])/f[7]*100；f[12] 的日期**不参与**
+      A 股日期投票（外盘在 A 股节假日照常交易，混进投票会把节假日误判成开市）
+    - **港股 ``hk*`` 本轮显式不支持**（实测 19 字段、日期是斜杠格式，与上面四种都
+      不同），命中就给中文原因跳过，绝不放行到 int_ 的 4 字段分支被误算
+    - **大小写非对称，别统一**（实测 ``SH000300``/``hf_nq`` 都是空串，只有
+      ``sh000300``/``hf_NQ`` 有数据）：A 股代码转小写，其余形态原样保大小写 ——
+      见 normalize_symbol。判定/归并用小写副本，**请求 URL 用保大小写的代码**。
     - 一个 URL 里混着写（``list=s_sh000300,sh000300`` 实测两行都返回），所以每拍
       只发一次请求：**每个标的都同时捎带完整版**，多出来的行只用来投票日期
     - 「哪些前缀支持简版」按 SIMPLE_PREFIXES 判断，依据是**逐个实测**（见常量处
@@ -1264,9 +1337,15 @@ class SinaQuotes:
 
     @staticmethod
     def supports_simple(code):
-        """该代码有没有 s_ 简版形态。实测只有 sh/sz/bj 的 A 股代码有。"""
+        """该代码有没有 s_ 简版形态。实测只有 sh/sz/bj 的 A 股代码有。
+
+        判定一律对小写副本做（用户可能写 SH000300），但 **build_url 发出去的代码是
+        保大小写的原样** —— 这是 normalize_symbol 那条非对称规则的另一半。
+        """
         code = (code or "").lower()
         if any(code.startswith(prefix) for prefix in NOSIMPLE_PREFIXES):
+            return False
+        if any(code.startswith(prefix) for prefix in UNSUPPORTED_PREFIXES):
             return False
         return any(code.startswith(prefix) for prefix in SIMPLE_PREFIXES)
 
@@ -1281,9 +1360,8 @@ class SinaQuotes:
 
     @staticmethod
     def normalize(symbol):
-        """剥掉文档里常见的 s_ 前缀，返回裸代码。"""
-        code = (symbol or "").strip().lower()
-        return code[2:] if code.startswith("s_") else code
+        """剥 s_ 前缀 + 按形态归一化大小写，返回裸代码（委托 normalize_symbol）。"""
+        return normalize_symbol(symbol)
 
     def build_url(self, codes, simple=True):
         """构造请求 URL。simple=True 是简版为主 + 每个标的捎带完整版，False 是纯完整版。
@@ -1372,32 +1450,38 @@ class SinaQuotes:
         - 节假日 → 没有任何标的会报今天，max 仍是上一交易日，≠ 今天 → 正确休市；
         - 因此 max 不会掩盖真正的休市。
         """
+        # 归并字典一律用**小写 key**（新浪 key 大小写敏感，但形态判定与行序只关心
+        # 「是不是同一个代码」）；quote.code 保留请求时的原样大小写。
+        wanted = {code.lower() for code in codes}
         simple, full, reasons, dates = {}, {}, {}, []
         for line in (raw or "").splitlines():
             parts = self._split_line(line)
             if parts is None:
                 continue
             key, data_str = parts
+            low = key.lower()
+            bare = low[2:] if low.startswith("s_") else low
             quote, reason = self._parse_quote(key, data_str)
             if quote is not None:
-                if key.startswith("s_"):
-                    simple[quote.code] = quote
+                if low.startswith("s_"):
+                    simple[quote.code.lower()] = quote
                 else:
-                    full[quote.code] = quote
+                    full[quote.code.lower()] = quote
                     if quote.date:
                         # YYYY-MM-DD 字典序即时间序，直接取 max。
                         dates.append(quote.date)
-            elif key.startswith("s_") or key in codes:
+            elif low.startswith("s_") or bare in wanted:
                 # 完整版行与简版行重复，失败原因归到同一个代码上。
-                reasons[key[2:] if key.startswith("s_") else key] = reason
+                reasons[bare] = reason
         data_date = max(dates) if dates else None
         quotes = []
         for code in codes:
             # 同一代码两种行都在响应里时以简版为准（涨跌幅已是百分比），
             # 完整版只贡献 date —— 每个代码只能出一行。
-            quote = simple.get(code) or full.get(code)
+            low = code.lower()
+            quote = simple.get(low) or full.get(low)
             if quote is None:
-                eprint("跳过 %s：%s" % (code, reasons.get(code, "空行情或价格无效")))
+                eprint("跳过 %s：%s" % (code, reasons.get(low, "空行情或价格无效")))
                 continue
             quotes.append(quote)
             if len(quotes) >= MAX_ROWS:
@@ -1406,7 +1490,12 @@ class SinaQuotes:
 
     @staticmethod
     def _split_line(line):
-        """`var hq_str_<key>="<data>";` → (key, data)；不合法返回 None。"""
+        """`var hq_str_<key>="<data>";` → (key, data)；不合法返回 None。
+
+        key **保留原样大小写**（只清首尾空白）：`hf_NQ` 与 `hf_nq` 是两个不同的新浪
+        key，后者返回空串，所以这里下大写会把「用户写错大小写」这个事实抹掉。形态
+        判定与字典归并一律用 key.lower()，见 _parse。
+        """
         line = (line or "").strip()
         prefix = "var hq_str_"
         if not line.startswith(prefix) or '"' not in line:
@@ -1417,7 +1506,7 @@ class SinaQuotes:
         key, quoted = body.split("=", 1)
         if len(quoted) < 2 or not quoted.startswith('"') or not quoted.endswith('";'):
             return None
-        key = key.strip().lower()
+        key = key.strip()
         if not key:
             return None
         return key, quoted[1:-2]
@@ -1426,24 +1515,35 @@ class SinaQuotes:
     def _parse_quote(key, data_str):
         """解析一行 → (SinaQuote, 跳过原因)。
 
-        布局**按 key 带什么前缀分流，不按字段数** —— 完整版的指数和个股是
-        同一套布局（沪市 34 字段 / 深市 33 字段，尾部多一个空字段），按字段数
+        形态判定**按 key 的小写副本带什么前缀分流，不按字段数** —— 完整版的指数和
+        个股是同一套布局（沪市 34 字段 / 深市 33 字段，尾部多一个空字段），按字段数
         分「个股 vs 指数」会把指数误判成个股，只是下面那个公式对两者都成立，
-        才碰巧没出错：
+        才碰巧没出错。key 本身保大小写（`hf_NQ` 与 `hf_nq` 是不同的新浪 key），
+        只有分流与归并用 lower()：
 
         - 简版（key 带 s_）6 字段：名称,点位,涨跌额,涨跌幅%,成交量(手),成交额(万)。
           fields[3] **直接就是涨跌幅百分比**，不用自己除。开盘前深市指数
           （创业板指/国证2000/深证成指）点位就是 0.00，所以只能拿 fields[3]
           当有效性门槛，点位 0 是合法值。
-        - 无简版（key 带 int_/hk/hf_ 等海外前缀）**4 字段**：名称,现价,涨跌额,
-          涨跌幅%。实测 ``int_nikkei`` 4 字段（44946.64,-408.35,-0.90）而
-          ``s_int_nikkei`` 返回空串 —— 这类标的没有 s_ 简版形态，涨跌幅同样是
-          fields[3] 直接给的（恒生是 3 位小数 -0.600，交给 round_change 归一到
-          2 位）。**不要**对它套 A 股完整版的 (f[3]−f[2])/f[2] 公式：那里
-          fields[2] 是昨收，这里是涨跌额，套上去会算出 +0.02% 这种看着像样的
-          垃圾。有效性只认 fields[3] 是有限数（名称非空已在入口判过），
-          因为它没有 fields[30] 的行情日期 —— 不参与日期投票，节假日兜底只
-          对 A 股代码有效。
+        - 海外指数（key 带 int_）**4 字段**：名称,现价,涨跌额,涨跌幅%。实测
+          ``int_nikkei`` 4 字段（44946.64,-408.35,-0.90）而 ``s_int_nikkei``
+          返回空串 —— 这类标的没有 s_ 简版形态，涨跌幅同样是 fields[3] 直接给的
+          （恒生是 3 位小数 -0.600，交给 round_change 归一到 2 位）。**不要**对它套
+          A 股完整版的 (f[3]−f[2])/f[2] 公式：那里 fields[2] 是昨收，这里是涨跌额，
+          套上去会算出 +0.02% 这种看着像样的垃圾。它没有 A 股那种行情日期
+          —— 不参与日期投票，节假日兜底只对 A 股代码有效。
+        - 外盘期货（key 带 hf_）**15 字段**（``hf_XAU`` 实测 14，尾部少一个，所以
+          判字段数会漏掉它）：[0]现价 [1]空 [2]买价 [3]卖价 [4]最高 [5]最低
+          [6]时间 [7]昨收 [8]开盘 [9]持仓量 [10]? [11]? [12]日期 [13]中文名
+          [14]'0'。**它没有现成的涨跌幅百分比**（不像 int_ 的 fields[3] 直给），
+          必须自己算 (f[0]−f[7])/f[7]*100，且要求 f[7] > 0。示例 hf_NQ
+          30507.430 / 昨收 30566.250 → −0.19%。f[12] 的日期**故意填 "" 不参与
+          A 股日期投票**：外盘期货在 A 股节假日照常交易，混进投票会让节假日被
+          误判成开市。名称取 f[13]（中文，只进日志/--stock-dry-run）；取不到也
+          **不丢行** —— 有效性只认 f[0] 现价与 f[7] 昨收，名字对设备毫无用处。
+        - 港股（key 带 hk）**本轮显式不支持**：实测 19 字段且日期是斜杠格式
+          （f[17]='2026/09/29'），与上面四种都不同。必须在这里拦下，绝不能让它
+          落进 int_ 的 4 字段分支把别的数字当涨跌幅。
         - 完整版（key 不带上述前缀）：fields[2]=昨收、fields[3]=最新价/最新点位，
           涨跌幅 = (fields[3]−fields[2])/fields[2]（个股与指数同一公式）；
           fields[30]=行情日期、fields[31]=行情时间，sh/sz 下位置一致。开盘前
@@ -1453,15 +1553,20 @@ class SinaQuotes:
         name = fields[0].strip() if fields else ""
         if not name:
             return None, "空行情"
-        code = key[2:] if key.startswith("s_") else key
+        low = key.lower()
+        is_simple = low.startswith("s_")
+        code = key[2:] if is_simple else key
         try:
-            if key.startswith("s_"):
+            if any(low.startswith(prefix) for prefix in UNSUPPORTED_PREFIXES):
+                reason = UNSUPPORTED_REASONS.get(low[:2], "形态暂不支持")
+                return None, reason
+            elif is_simple:
                 point = _quote_field(fields, 1)
                 change_amount = _quote_field(fields, 2)
                 percent = _quote_field(fields, 3)   # 简版涨跌幅已是百分比
                 date = ""
-            elif any(key.startswith(prefix) for prefix in NOSIMPLE_PREFIXES):
-                # 无简版形态（int_ 海外指数等）：4 字段，涨跌幅同为 fields[3] 直给。
+            elif low.startswith("int_"):
+                # 海外指数：4 字段，涨跌幅同为 fields[3] 直给。
                 if len(fields) <= 3:
                     return None, ("无简版形态字段不足（需要 名称,现价,涨跌额,"
                                   "涨跌幅%% 四项）")
@@ -1469,6 +1574,23 @@ class SinaQuotes:
                 change_amount = _quote_field(fields, 2)
                 percent = _quote_field(fields, 3)
                 date = ""                        # 该形态没有行情日期字段
+            elif low.startswith("hf_"):
+                # 外盘期货 15/14 字段：涨跌幅自算，只认 f[0] 现价与 f[7] 昨收。
+                if len(fields) <= 7:
+                    return None, "hf_ 形态字段不足（需要 现价,昨收 两项）"
+                price = _quote_field(fields, 0)
+                previous_close = _quote_field(fields, 7)
+                if (not math.isfinite(previous_close) or
+                        not math.isfinite(price) or previous_close <= 0):
+                    return None, "hf_ 形态现价或昨收无效"
+                point = price
+                change_amount = price - previous_close   # 期货不给现成涨跌额，自算
+                percent = (price - previous_close) / previous_close * 100.0
+                # f[12] 的日期不参与 A 股日期投票（外盘在 A 股节假日照常交易）。
+                date = ""
+                # f[13] 是中文名，取不到也**不因此丢行**（只进日志，不上屏）。
+                if len(fields) > 13 and fields[13].strip():
+                    name = fields[13].strip()
             else:
                 if len(fields) <= 3:
                     return None, "完整版字段不足（读不到 fields[2]/fields[3]）"
@@ -1888,6 +2010,18 @@ def self_test():
         except ValueError as ex:
             return str(ex)
         return ""
+
+    def _fetch_failure(client, symbols):
+        """跑 client.fetch 并同时收回异常文本与 stderr（跳过原因只打在 stderr 上）。"""
+        import contextlib
+        import io
+        buffer = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(buffer):
+                client.fetch(symbols)
+        except Exception as ex:
+            return str(ex), buffer.getvalue()
+        return "", buffer.getvalue()
     
     def bj_epoch(hour, minute=0, second=0, day=1):
         """北京时间 → epoch（beijing_time_at 的逆运算，不依赖本机 TZ）。"""
@@ -2442,6 +2576,152 @@ def self_test():
     # 17 字节仍然超出语法上限（长度校验本身没被放宽）。
     ok("超过 16 字节的代码仍被语法校验拦下",
        "1..16 字节" in str(_raised(lambda: parse_symbols("int_abcdefghijklmnopq"))))
+
+    # 49~56 外盘期货 hf_（15/14 字段）+ 大小写非对称规则。全部离线，用真实字段布局。
+    def hf_line(key, fields):
+        return 'var hq_str_%s="%s";' % (key, ",".join(fields))
+
+    def hf_quote(price, previous_close, name="纳斯达克指数期货",
+                 date_text="2026-09-29", tail="0"):
+        """hf_ 15 字段样本（tail 传 None 造出 hf_XAU 的 14 字段形态）。
+
+        实测布局：[0]现价 [1]''（hf_XAU 有值）[2]买价 [3]卖价 [4]最高 [5]最低
+        [6]时间 [7]昨收 [8]开盘 [9]持仓量 [10]? [11]? [12]日期 [13]中文名 [14]'0'
+        """
+        fields = [str(price), "", "30500.000", "30520.000", "30700.000",
+                  "30400.000", "10:26:53", str(previous_close), "30566.250",
+                  "18234", "1", "2", date_text, name]
+        if tail is not None:
+            fields.append(tail)
+        return fields
+
+    # 49. hf_NQ 15 字段：涨跌幅自算 (f[0]−f[7])/f[7] = -0.19，名称取 f[13]。
+    quotes, date = client._parse(
+        hf_line("hf_NQ", hf_quote(30507.430, 30566.250)),
+        ["hf_NQ"])
+    ok("hf_ 十五字段自算涨跌幅",
+       len(quotes) == 1 and quotes[0].code == "hf_NQ" and
+       quotes[0].point == 30507.43 and quotes[0].percent == -0.19 and
+       quotes[0].name == "纳斯达克指数期货" and
+       round(quotes[0].change_amount, 3) == -58.82 and date is None)
+
+    # 50. hf_XAU 是 14 字段（尾部少一个）：按字段数硬判形态会漏掉它。
+    quotes, date = client._parse(
+        hf_line("hf_XAU", hf_quote(3512.40, 3498.10, name="纽约黄金", tail=None)),
+        ["hf_XAU"])
+    ok("hf_ 十四字段（hf_XAU）同样能解析",
+       len(quotes) == 1 and quotes[0].code == "hf_XAU" and
+       abs(quotes[0].percent - 0.41) < 0.005 and date is None)
+
+    # 51. f[12] 的日期**不参与** A 股日期投票：外盘在 A 股节假日照常交易，混进
+    #     投票会让节假日被误判成开市。
+    _, only_hf = client._parse(
+        hf_line("hf_NQ", hf_quote(30507.430, 30566.250, date_text=stale_text)),
+        ["hf_NQ"])
+    _, mixed_date = client._parse("\n".join([
+        hf_line("hf_NQ", hf_quote(30507.430, 30566.250, date_text=stale_text)),
+        full_line("sh000300", "沪深300", 4341.42, 4340.5791, today_text),
+    ]), ["sh000300", "hf_NQ"])
+    ok("hf_ 日期不参与 A 股日期投票",
+       only_hf is None and mixed_date == today_text)
+
+    # 52. 大小写非对称：A 股大写被修正成小写（且仍带 s_ 简版），外盘保大小写。
+    normalized = [SinaQuotes.normalize(s)
+                  for s in ("SH000300", " hf_NQ ", "S_Sh000300", "int_nikkei")]
+    mixed_url = SinaQuotes().build_url(normalized, True).split("list=")[1].split(",")
+    ok("大小写归一化：A 股转小写、外盘保大小写",
+       normalized == ["sh000300", "hf_NQ", "sh000300", "int_nikkei"] and
+       "s_sh000300" in mixed_url and "sh000300" in mixed_url and
+       "hf_NQ" in mixed_url and
+       # 外盘绝不能被套上 s_ 简版（s_hf_NQ 实测恒为空串）
+       not any(code.lower().startswith("s_hf") for code in mixed_url) and
+       # 归并用小写副本，URL 用保大小写的代码
+       "s_SH000300" not in mixed_url)
+
+    # 53. 纯 hf_NQ 列表：单请求、URL 里无 s_、出行、data_date is None。
+    class _HfOnly(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, "\n".join([
+                hf_line("hf_NQ", hf_quote(30507.430, 30566.250)),
+                hf_line("hf_ES", hf_quote(5688.25, 5701.75, name="标普500期货")),
+            ])
+
+    hf_only = _HfOnly()
+    rows, date = hf_only.fetch(["hf_NQ", "hf_ES"])
+    ok("纯 hf_ 列表单请求出行且无 s_ 简版",
+       len(hf_only.seen_urls) == 1 and
+       hf_only.seen_urls[0].split("list=")[1] == "hf_NQ,hf_ES" and
+       rows == [{"name": "hf_NQ", "change": -0.19},
+                {"name": "hf_ES", "change": -0.24}] and date is None)
+
+    # 54. hk* 显式不支持：给中文原因、不产出行、**不能**被当 4 字段算出涨跌幅。
+    #     真实 hk00700 是 19 字段，套 int_ 的 f[3] 会把 403.000 当成 403%。
+    hk_raw = ('var hq_str_hk00700="TENCENT,腾讯控股,402.000,400.000,403.000,'
+              '399.000,401.500,12345678,888888.000,1.250,0.30,0.00,0.00,'
+              '2026/09/29,16:08:00";')
+    quotes, date = client._parse(hk_raw, ["hk00700"])
+    _, hk_reason = client._parse_quote("hk00700", hk_raw[15:-2])
+    ok("hk_ 形态显式不支持且不误算",
+       quotes == [] and date is None and
+       "hk_ 形态暂不支持" in hk_reason and
+       # 关键语义：既不产出行，也绝不会「算出一个数」出来
+       not any(isinstance(item, float) for item in quotes))
+
+    class _HkOnly(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, hk_raw
+
+    hk_only = _HkOnly()
+    hk_error, hk_log = _fetch_failure(hk_only, ["hk00700"])
+    ok("hk_ 请求整拍失败并说明原因",
+       len(hk_only.seen_urls) == 1 and "未解析到有效行情" in hk_error and
+       "hk00700" in hk_log and "hk_ 形态暂不支持" in hk_log)
+
+    # 55. 用户把外盘代码写全小写（hf_nq）：新浪返回空串 → 整拍失败，且日志里能看到
+    #     是哪个代码。这正是「外盘必须保大小写」这条规则的代价。
+    class _LowerHf(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, 'var hq_str_hf_nq="";'
+
+    lower_hf = _LowerHf()
+    lower_error, lower_log = _fetch_failure(lower_hf, ["hf_nq"])
+    ok("hf_ 全小写取不到数据并报出该代码",
+       "未解析到有效行情" in lower_error and "hf_nq" in lower_log and
+       "list=hf_nq" in lower_hf.seen_urls[0])
+
+    # 56. hf_ 的有效性守卫：昨收为 0 / 字段不足都要跳过，且原因说得清。
+    zero_close = client._parse(hf_line("hf_NQ", hf_quote(30507.430, 0.0)),
+                               ["hf_NQ"])[0]
+    short_fields = client._parse(
+        'var hq_str_hf_NQ="30507.430,,";', ["hf_NQ"])[0]
+    ok("hf_ 昨收无效与字段不足都跳过",
+       zero_close == [] and short_fields == [] and
+       SinaQuotes._parse_quote("hf_NQ", ",".join(hf_quote(1.0, 0.0)))[1] ==
+       "hf_ 形态现价或昨收无效" and
+       SinaQuotes._parse_quote("hf_NQ", "1,2,3")[1] ==
+       "hf_ 形态字段不足（需要 现价,昨收 两项）")
+
+    # 57. A 股大写代码在真实请求串里被修正成小写（parse_symbols → normalize 一致）。
+    ok("parse_symbols 与 normalize 大小写口径一致",
+       parse_symbols("SH000300, hf_NQ ,int_nikkei") ==
+       ["sh000300", "hf_NQ", "int_nikkei"] and
+       validate_args(args_for(symbols="SH000300", symbol_names="CSI300",
+                              device="x", device_token="y"))[1] == ["sh000300"])
 
     print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     

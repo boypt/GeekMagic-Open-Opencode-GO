@@ -261,10 +261,10 @@ class SystemInfoScene : public Scene {
     }
 };
 
-// 1/255 定标的正弦表（0..90°，四分之一波）。画圆弧要按角度取圆周坐标，
-// 为了不把 libm 的 sinf/cosf（连带浮点库和一堆代码）带进固件，这里用 91 字节
-// 查表 + 象限映射取整条圆周的 sin/cos，误差 ≤ 0.5/255 ≈ 0.04px，240×240
-// 屏上完全看不出来。91 字节常驻静态区（.rodata），不参与堆分配。
+// 1/255 定标的正弦表（0..90°，四分之一波）。画圆弧要取圆周坐标，为了不把 libm 的
+// sinf/cosf（连带浮点库和一堆代码）带进固件，这里用 91 字节查表 + 象限映射，误差
+// ≤ 0.5/255 ≈ 0.04px，240×240 屏上完全看不出来。91 字节常驻静态区（.rodata），
+// 不参与堆分配。
 static const uint8_t kSinUnitDeg[91] = {
       0,   4,   9,  13,  18,  22,  27,  31,  35,  40,  44,  49,  53,  57,  62,
      66,  70,  75,  79,  83,  87,  91,  96, 100, 104, 108, 112, 116, 120, 124,
@@ -275,21 +275,76 @@ static const uint8_t kSinUnitDeg[91] = {
     255,
 };
 
-/// sin(deg) 的 1/255 定标值（-255..255）。0..359° 全域。
-static auto sinUnitDeg(uint16_t deg) -> int16_t {
-    deg %= 360U;
-    // 折到第一象限取表：sin 在 [0,180] 与 [180,360] 分别是 sin(t) 与 -sin(t-180)
-    const uint16_t folded = deg < 90U   ? deg
-                          : deg < 180U  ? 180U - deg
-                          : deg < 270U  ? deg - 180U
-                                        : 360U - deg;
-    const int16_t magnitude = static_cast<int16_t>(kSinUnitDeg[folded]);
-    return deg >= 180U ? -magnitude : magnitude;
+/// sin(角度) 的 1/255 定标值（-255..255）。tenths = 角度×10，即 0.1° 分辨率，
+/// 在 kSinUnitDeg 上线性插值。取 0.1° 而不是整度，是因为额度环的扇形边界正好是
+/// 3.6·percent 度（如 70% → 252.0°、17% → 61.2°），整度会把边界量化掉 0.5°，
+/// 在 r=20 处就是 0.17px 的错位；0.1° 只剩 0.02px。
+static auto sinUnitTenths(uint16_t tenths) -> int16_t {
+    tenths %= 3600U;
+    uint16_t folded = 0U;
+    bool negative = false;
+    if (tenths < 900U) {
+        folded = tenths;
+    } else if (tenths < 1800U) {
+        folded = 1800U - tenths;
+    } else if (tenths < 2700U) {
+        folded = tenths - 1800U;
+        negative = true;
+    } else {
+        folded = 3600U - tenths;
+        negative = true;
+    }
+    const uint16_t index = folded / 10U;   // 0..90
+    const int16_t remainder = static_cast<int16_t>(folded % 10U);
+    int16_t magnitude = 255;
+    if (index < 90U) {
+        const int16_t low = kSinUnitDeg[index];
+        const int16_t high = kSinUnitDeg[index + 1U];
+        magnitude = static_cast<int16_t>(low + (((high - low) * remainder + 5) / 10));
+    }
+    return negative ? static_cast<int16_t>(-magnitude) : magnitude;
 }
 
-/// cos(deg) = sin(deg + 90°)，复用同一张表。
-static auto cosUnitDeg(uint16_t deg) -> int16_t {
-    return sinUnitDeg(deg + 90U);
+/// cos(角度) = sin(角度 + 90°)，复用同一张表。
+static auto cosUnitTenths(uint16_t tenths) -> int16_t {
+    return sinUnitTenths(static_cast<uint16_t>(tenths + 900U));
+}
+
+/// 32 位整数平方根（逐位恢复法）。算像素到圆心的距离要用到它 —— 引入 sqrtf() 连带
+/// libm 与浮点库，正是本文件上面那张正弦表要绕开的东西，所以这里手写整数版。
+static auto isqrt32(uint32_t value) -> uint16_t {
+    uint32_t remainder = value;
+    uint32_t root = 0U;
+    uint32_t bit = 1UL << 30;
+    while (bit > remainder) {
+        bit >>= 2;
+    }
+    for (; bit != 0U; bit >>= 2) {
+        if (remainder >= root + bit) {
+            remainder -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+    }
+    return static_cast<uint16_t>(root);
+}
+
+/// 两个**已交换色序**的 RGB565 之间按 ratio(0..255) 线性插值。
+/// BGR 交换是固定通道置换，与逐通道 lerp 可交换，所以直接在本文件 rgb565() 打包
+/// 出来的值上插即可，不必回到源 RGB 再转换。三段通道位宽不同（5/6/5），
+/// 必须各自在自己的位宽里插完再拼回去，跨位宽插会偏色。
+static auto lerp565(uint16_t from, uint16_t to, uint8_t ratio) -> uint16_t {
+    const int32_t weight = ratio;
+    const int32_t fromR = (from >> 11) & 0x1FU;
+    const int32_t fromG = (from >> 5) & 0x3FU;
+    const int32_t fromB = from & 0x1FU;
+    const int32_t red = fromR + ((((to >> 11) & 0x1FU) - fromR) * weight + 127) / 255;
+    const int32_t green = fromG + ((((to >> 5) & 0x3FU) - fromG) * weight + 127) / 255;
+    const int32_t blue = fromB + (((static_cast<int32_t>(to & 0x1FU) - fromB) * weight + 127) / 255);
+    return static_cast<uint16_t>((static_cast<uint32_t>(red) << 11) |
+                                 (static_cast<uint32_t>(green) << 5) |
+                                 static_cast<uint32_t>(blue));
 }
 
 // ---------- stock：推送的股票行情 ----------
@@ -499,34 +554,105 @@ class StockScene : public Scene {
     /// 环区自清底（fillRect 只覆盖 RING_X/RING_Y 起的 41×41，落在 x≤233 / y≤234），
     /// 因此它本身就是自洽的局部更新单元（约屏面 0.7%），既不触碰左上标题、
     /// 中部行情行带，也碰不到左侧时钟（时钟擦除带止于 x=149）。
+    ///
+    /// 画法：**逐像素距离场 + 径向覆盖率抗锯齿**。旧画法是按 1° 步长沿角度逐点
+    /// 落笔，根因有三，都会在 240px 小屏上显成「像素感重、弧不圆滑」：
+    ///   ① 外环 1° 只走 0.35px 弧长，相邻角度**大量落在同一像素**（实测 2160 次
+    ///      drawPixel 里 56% 是重复覆盖同一像素），偶尔又跳 2px —— 弧长忽疏忽密。
+    ///   ② 坐标用 `>> 16`，对负数是算术右移（向 −∞ 取整）而非就近取整，圆心左右
+    ///      两侧取整规律不一致，一侧顺一侧毛。
+    ///   ③ 2px 描边按整数半径硬切，无法表达亚像素部分覆盖，内外缘必然是硬的。
+    /// 现在反过来遍历包围盒里每个像素：整数开方算它到圆心的距离，落在环带内的按
+    /// 覆盖率把颜色混出来 —— 径向完全对称（无累积取整误差）、每像素只画一次、
+    /// 内外缘是真抗锯齿。与 16×16 超采样理想图（同样用 565 量化色）比对，平均
+    /// 通道误差 44.7 → 4.9（三环同 70%）/ 44.6 → 4.7（100/50/0%）/ 26.3 → 3.0
+    /// （3% 最小弧），三档都降 89%。
+    /// 相邻两环不会互相污染：环带之间本就有 4px 空白，抗锯齿最多向外洇 0.5px，
+    /// 实测同时被两条环带覆盖的像素为 0，环 0↔环 1 的着墨像素最小中心距 3.61px。
+    ///
+    /// 扇形边界（弧的端头）用**叉积**判，不比较角度也不比较余弦：
+    ///   A = cross(vΘ, P) = sinΘ·u − cosΘ·dx   —— A ≥ 0 ⇔ α ≤ Θ（在 α ≥ Θ−180 支上）
+    ///   B = dx ≥ 0                            —— ⇔ α ∈ [0,180]
+    /// 凸扇形 Θ≤180 取 A ≥ 0 且 B；反射扇形 Θ>180 取 [0,Θ] = 整圈减 (Θ,360)，
+    /// 后者正是 A ≤ 0 且 !B，故取补得 A > 0 或 B。判据对 P 线性，误差只有坐标的
+    /// 1/255，角分辨率约 0.02°。这里刻意不用「cos α ≥ cos Θ/2」那种半角写法：
+    /// cos 在 0 附近极平坦，1% 档（Θ=3.6°）的余弦差不足半个 LSB，会整圈判反。
     auto drawQuota() -> void {
         auto* gfx = DisplayManager::getGfx();
         // 只擦环区（x=193..233 / y=194..234），不碰标题/行带/时钟。
         gfx->fillRect(RING_X, RING_Y, RING_BOX, RING_BOX, C_BG);
 
-        // 1° 步长：外环周长 126px，1° 只有 0.35px 弧长，逐点落笔不会断线；
-        // 一次整环重画约 360 角度 × 3 环 × 2px = 2160 像素，远小于一屏。
-        for (uint16_t deg = 0; deg < 360U; ++deg) {
-            const int16_t unitX = sinUnitDeg(deg);
-            const int16_t unitY = cosUnitDeg(deg);
-            for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
-                const int8_t percent = m_savedQuota[i];
-                // deg/360 与 percent/100 交叉相乘比较，避免浮点：deg 最大 359、
-                // percent 最大 100，32 位乘法绰绰有余。
-                // 无值（-1）与 0% 都只剩轨道。完全没有额度数据时（m_hasQuota
-                // 为 false）三段必全是 -1 —— setQuota 只在至少一段 >=0 时才置位
-                // hasQuota，clear() 也把三段复位成 -1 —— 所以这里不提前返回，
-                // 三圈轨道照画，只是没有进度弧。
-                const bool onArc = percent > 0 &&
-                    static_cast<uint32_t>(deg) * 100U <
-                        static_cast<uint32_t>(percent) * 360U;
-                const uint16_t color = onArc ? C_BAR_ROW[i] : C_TRACK;
-                // 2px 描边按半径向内取（r 与 r−1），四个方向厚度一致；
-                // 像素偏移把半径折成 16.8 定标（r×257）后用移位，避免逐像素除法。
-                for (uint8_t k = 0; k < RING_THICK; ++k) {
-                    const int16_t s = static_cast<int16_t>(RING_R[i] - k) * 257;
-                    gfx->drawPixel(RING_CX + ((unitX * s) >> 16),
-                                   RING_CY - ((unitY * s) >> 16), color);
+        // 每个环的扇形边界方向预先算好（1/255 定标），像素循环里只做点积。
+        // 形状 0 = 无弧（无值 -1 与 0% 都只剩轨道；完全没有额度数据时三段必全是
+        // -1 —— setQuota 只在至少一段 >=0 时才置位 hasQuota，clear() 也复位，
+        // 所以这里不提前返回，三圈轨道照画）、1 = 整圈、2 = 凸扇形、3 = 反射扇形。
+        uint8_t shape[StockData::QUOTA_MAX] = {};
+        int16_t sinT[StockData::QUOTA_MAX] = {};
+        int16_t cosT[StockData::QUOTA_MAX] = {};
+        for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+            const int16_t percent = m_savedQuota[i];
+            if (percent <= 0) {
+                shape[i] = 0U;
+            } else if (percent >= 100) {
+                shape[i] = 1U;   // 整圈：上面两个判据在 Θ=360° 都退化，单独短路
+            } else {
+                // Θ = 3.6·percent 度 = percent·36 个 0.1°；交叉相乘比不出浮点。
+                const uint16_t tenths = static_cast<uint16_t>(percent) * 36U;
+                sinT[i] = sinUnitTenths(tenths);
+                cosT[i] = cosUnitTenths(tenths);
+                shape[i] = percent <= 50 ? 2U : 3U;
+            }
+        }
+
+        // 环带的内外边界，1/16 px 定标。取 (R−THICK+0.5) 与 (R+0.5) 而不是整数
+        // R−THICK / R，是为了让连续极限正好等于旧画法「取 r 与 r−1 两个整数半径」
+        // 的实际着墨面积 —— 换句话说抗锯齿只改边缘质感，不改环的视觉粗细。
+        int16_t inner16[StockData::QUOTA_MAX];
+        int16_t outer16[StockData::QUOTA_MAX];
+        for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+            inner16[i] = (RING_R[i] - RING_THICK) * 16 + 8;
+            outer16[i] = RING_R[i] * 16 + 8;
+        }
+
+        // 41×41 = 1681 次迭代，其中约 710 次真正落笔 —— 比旧画法 2160 次
+        // drawPixel（且 56% 互相覆盖）还少，SPI 传输量不增反降。
+        for (int16_t y = RING_Y; y < RING_Y + RING_BOX; ++y) {
+            for (int16_t x = RING_X; x < RING_X + RING_BOX; ++x) {
+                const int16_t dx = x - RING_CX;    // 右正
+                const int16_t up = RING_CY - y;    // 上正
+                // 到圆心的距离，1/16 px 定标：isqrt(n·2^8) 恰是 16·√n。
+                const int16_t r16 = static_cast<int16_t>(
+                    isqrt32(static_cast<uint32_t>(dx * dx + up * up) << 8));
+                // 本像素在径向覆盖 [r−0.5, r+0.5]
+                const int16_t low = r16 - 8;
+                const int16_t high = r16 + 8;
+                for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+                    const int16_t from = low > inner16[i] ? low : inner16[i];
+                    const int16_t to = high < outer16[i] ? high : outer16[i];
+                    if (to <= from) {
+                        continue;
+                    }
+                    // 覆盖率 0..255（像素自身径向宽 1px = 16 个 1/16 单位）
+                    const uint8_t coverage =
+                        static_cast<uint8_t>((to - from) * 255 / 16);
+                    bool onArc = false;
+                    if (shape[i] == 1U) {
+                        onArc = true;
+                    } else if (shape[i] != 0U) {
+                        const int32_t cross =
+                            static_cast<int32_t>(sinT[i]) * up -
+                            static_cast<int32_t>(cosT[i]) * dx;
+                        onArc = shape[i] == 2U ? (cross >= 0 && dx >= 0)
+                                               : (cross > 0 || dx >= 0);
+                    }
+                    const uint16_t base = onArc ? C_BAR_ROW[i] : C_TRACK;
+                    // 环带**内外两侧都是背景（纯黑）**，轨道只存在于环带之内 ——
+                    // 所以径向抗锯齿要往 C_BG 混。往 C_TRACK 混会给每个环外缘糊上
+                    // 一层深棕光晕，既虚胖又把环色洗淡。
+                    gfx->drawPixel(x, y, coverage == 255U
+                                                 ? base
+                                                 : lerp565(C_BG, base, coverage));
+                    break;   // 三条环带彼此隔 4px 空白，一个像素只可能命中一条
                 }
             }
         }

@@ -103,11 +103,56 @@ f[8] 是**现成的涨跌幅百分比，不要自算**（与 hf_ 相反）：算
 没有 ``s_`` 简版。f[17] 的日期是**斜杠格式** 2026/09/29，且**故意不参与日期投票**
 （见下）。
 
+海外市场指数是**第六种形态**（``b_`` 前缀，如 b_DAX/b_FTSE/b_CAC/b_NKY/b_SPX），
+**至少延迟 15 分钟**（社区文档原文如此）::
+
+    b_DAX  13 字段  [0]名称 [1]现价 [2]涨跌额 [3]涨跌幅% [4]? [5]? [6]日期
+                      [7]时间 [8]? [9]昨收 [10]? [11]? [12]?
+    b_SPX   6 字段  [0]名称 [1]现价 [2]涨跌额 [3]涨跌幅% [4]时间 [5]时间
+
+**b_SPX 只有 6 字段** → 绝不能按字段数判形态（只能按 b_ 前缀）。f[3] 是**现成的
+涨跌幅，直接用不自算**，依据是算术自校验：b_DAX 25374.42+34.22=25408.64=f[9]、
+b_NKY 65219.72+657.90=65877.62=f[9] → f[9]=昨收；且 −34.22/25408.64=−0.13%
+=f[3]、−657.90/65877.62=−1.00%=f[3]。f[4]/f[5] 实测时而是 '9/26/2025'+'2:12 AM'、
+时而是 '2025-09-26'+'14:12:00'、时而全空 → **语义未定，不解析**；f[8]/f[10]/f[11]
+疑似今开/最高/最低但**只是推测未确证 → 不填**。没有 s_ 简版（实测 s_b_DAX 空串）。
+
+美股是**第七种形态**（``gb_`` 前缀，如 gb_bili/gb_ixic/gb_dji/gb_aapl）::
+
+    gb_bili  36 字段  [0]名称 [1]最新价 [2]涨跌幅% [3]日期时间合一 [4]涨跌额
+                      [5]今开 [6]最高 [7]最低 [8]52周高 [9]52周低 [10]成交量
+                      [11]成交量(另一口径) [12]成交额 [24][25]EDT 时间串 [26]昨收 …
+    gb_dji   30 字段  ← 同样不能按字段数判形态
+
+f[2] 是**现成的涨跌幅，直接用不自算**（算术自校验：gb_bili 15.14−0.245=14.895
+=f[26]、gb_aapl 338.40−(−2.67)=341.07=f[26] → f[26]=昨收；0.245/14.895=1.64%=f[2]、
+−2.67/341.07=−0.78%=f[2]）。f[3] 是 '2026-09-29 08:02:08' 这种**日期时间合一**串，
+格式与 A 股不同 + 美股交易日历不同 → **不参与日期投票**。没有 s_ 简版（实测
+s_gb_bili 空串）。
+
+外汇/汇率是**第八种形态**（**两种**子形态，**本轮只识别、绝不推算涨跌幅**）::
+
+    3a 裸代码 11 字段  USDCNY / DINIW / CNYUSD（**没有前缀**）
+    3b fx_ 前缀 18 字段  fx_susdcny / fx_susdjpy
+
+3a **没有前缀**，不能靠前缀分流，只能靠代码形状识别：**整串都是 ASCII 大写字母、
+不含任何数字、长度 5~6**。依据：A股代码必然含数字（sh000300 / bj430047），所以
+这条判据**不会误伤 A 股**。**这条判据必须排在 A 股完整版分支之前** —— 否则 USDCNY
+会掉进完整版分支被当成「昨收 f[2] / 现价 f[3]」算出 (6.7136−6.7055)/6.7055 =
+**+0.12%** 这种**看着挺像样的垃圾**。
+
+识别出来就**跳过**，中文原因写明「外汇/汇率形态的涨跌字段语义未验证，暂不推算」。
+理由：15 秒差分实测里三个形态**只有 DINIW 的 f[1]/f[2]/f[8] 在变**，其余字段全静态
+→ **无法可靠定位哪个是昨收**，fx_ 的 [10][11][12] 语义也定不下来。正因猜错算出来的
+数看着合理，才最容易被误当成解析成功而静默上屏。两种形态的日期也不投票。
+
 **日期投票只认 A 股完整版口径**（``fields[30]`` 的 YYYY-MM-DD），``int_`` / ``hf_``
-/ ``hk*`` 三种非 A 股形态一律把 date 填 ``""``。理由是双重的：① 交易日历不同 ——
-外盘期货在 A 股节假日照常交易、港股也有自己的假期，混进投票会把节假日/非交易日
-误判成开市；② 格式不同 —— 港股的 2026/09/29 和 A 股的 2026-09-29 混进同一个
-``max()`` 会按字符串序比错。所以纯非 A 股列表的 data_date 是 None。
+/ ``hk*`` / ``b_`` / ``gb_`` 五种非 A 股形态一律把 date 填 ``""``（外汇根本不出行）。
+理由是双重的：① 交易日历不同 —— 外盘期货在 A 股节假日照常交易、港股/美股/海外指数
+各有各的假期，混进投票会把节假日/非交易日误判成开市（海外指数还是**延迟 15 分钟**
+的数据，拿它判「今天开没开盘」本身就不成立）；② 格式不同 —— 港股是 2026/09/29、
+美股 gb_ 的 f[3] 是「2026-09-29 08:02:08」日期时间合一串，和 A 股的 2026-09-29
+混进同一个 ``max()`` 会按字符串序比错。所以纯非 A 股列表的 data_date 是 None。
 
 **已知但未支持**（UNSUPPORTED_PREFIXES）：``rt_`` 延时行情 —— 实测 ``rt_hkHSI``
 是 **25 字段**，位置 0..18 与 ``hk*`` 完全一致、尾部多 6 个空字段，但**语义**是
@@ -204,8 +249,10 @@ A_SHARE_PREFIXES = ("sh", "sz", "bj")
 # 不按「看起来像不像 A 股」外推，只有这一条是实测过的。判定一律走 code.lower()。
 SIMPLE_PREFIXES = ("sh", "sz")
 # 无 s_ 简版的形态：int_ 海外指数是 4 字段，hf_ 外盘期货是 15/14 字段，hk* 港股是
-# 19 字段，三者都**没有 A 股那种可投票的行情日期**，不参与日期投票。
-NOSIMPLE_PREFIXES = ("int_", "hf_", "hk")
+# 19 字段，b_ 海外市场指数是 13/6 字段，gb_ 美股是 36/30 字段，fx_ 外汇是 18 字段；
+# 实测 s_int_nikkei / s_hkHSI / s_hf_NQ / s_b_DAX / s_gb_bili 全部是空串。
+# 这些形态**都不参与日期投票**（只有 A 股完整版的 fields[30] 投票）。
+NOSIMPLE_PREFIXES = ("int_", "hf_", "hk", "b_", "gb_", "fx_")
 # 已知存在但本轮**不实现**的形态，命中即给中文原因跳过，绝不放行到别的分支里被误算。
 # rt_* 是新浪的**延时行情**：实测 rt_hkHSI 有 25 字段，位置 0..18 与 hk* 完全一致、
 # 尾部多 6 个空字段，**语义**却不是同一回事（延时）。本轮不做：25 字段能按 hk 的
@@ -215,6 +262,23 @@ UNSUPPORTED_PREFIXES = ("rt",)
 UNSUPPORTED_REASONS = {
     "rt": "rt_ 延时行情形态暂不支持（实测 25 字段，位置同 hk* 但语义是延时行情）",
 }
+# 外汇/汇率形态的代码判据：**整串都是 ASCII 大写字母、不含任何数字、长度 5~6**
+# （实测 USDCNY 6 / DINIW 5 / CNYUSD 6，以及 fx_susdcny / fx_susdjpy）。
+# 依据：A 股代码必然含数字（sh000300 / bj430047），所以「无数字 + 全大写字母」这条
+# 判据**不会误伤 A 股**；反过来外汇代码正是「裸大写字母」或 `fx_` 前缀，两者都不会
+# 匹配 ^(sh|sz|bj)\d{6}$。这条判据必须**排在 A 股完整版分支之前** —— 否则 USDCNY
+# 会掉进完整版分支，被当成「昨收 6.7055 / 现价 6.7136」算出 +0.12% 这种**看着挺
+# 像样的垃圾**（见 _parse_quote 里 FX 分支的注释）。
+FX_PREFIX = "fx_"
+FX_BARE_MIN_LEN = 5
+FX_BARE_MAX_LEN = 6
+# 识别出外汇形态就跳过（**不推算涨跌幅**）的中文原因。硬性决策，理由见
+# _parse_quote：15 秒差分实测里三个形态只有 DINIW 的 f[1]/f[2]/f[8] 在动，其余全
+# 静态，**无法可靠定位哪个是昨收**，[10][11][12] 的语义也定不下来。
+FX_SKIP_REASON_BARE = ("外汇/汇率形态（裸代码 11 字段）的涨跌字段语义未验证，"
+                       "暂不推算")
+FX_SKIP_REASON_FX = ("外汇/汇率形态（fx_ 前缀 18 字段）的涨跌字段语义未验证，"
+                     "暂不推算")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 SINA_REFERER = "https://finance.sina.com.cn"
 MARKET_WINDOWS = ((9 * 3600 + 20 * 60, 15 * 3600 + 30 * 60),)
@@ -1317,13 +1381,30 @@ def round_change(value):
 
 @dataclass(frozen=True)
 class SinaQuote:
-    """新浪一条行情。percent 是设备唯一要的量（涨跌幅 %）。"""
+    """新浪一条行情。percent 是设备唯一要的量（涨跌幅 %）。
+
+    下面 6 个字段是本轮「**只解析、暂时不用**」的补充项，全部带默认值、不参与任何
+    计算，只在 --stock-dry-run 里打印出来（这是这一轮改动的收益：能看见）。
+
+    **填值纪律**：只有**算术自校验过**的才算数（b_ 的 f[9]、gb_ 的 f[26]、hk* 的
+    f[3]、hf_ 的 f[7]），拿不到或存疑的一律留 **""**，**绝不把推测当实测**填进去。
+    判断依据是「现价 −(涨跌幅×昨收) ≈ 涨跌额」这类算术自校验能不能闭合。
+    """
     code: str            # 规范化后的代码（不带 s_ 前缀）
     name: str            # 新浪返回的中文名，只进日志/--stock-dry-run，不上屏
     point: float         # 点位；简版模式下 0 是合法的（开盘前深市指数点位为 0）
     change_amount: float # 涨跌额
     percent: float       # 涨跌幅 %，设备推的就是它
     date: str = ""       # 行情日期，只有完整版行才有
+    # ↓ 以下为「只解析、暂时不用」的补充字段，默认全空（拿不到就留空，不填推测值）
+    open: str = ""       # 今开；gb_ 的 f[5] 语义明确，其余形态存疑/无此字段
+    high: str = ""       # 最高
+    low: str = ""        # 最低
+    prev_close: str = "" # 昨收（**只填算术自校验过的**：b_ f[9] / gb_ f[26] / hk* f[3] / hf_ f[7]）
+    volume: str = ""     # 成交量
+    amount: str = ""     # 成交额
+    quote_time: str = "" # 行情时间（只进 dry-run；b_ f[7] / gb_ f[3]）
+    status: str = ""     # 形态自报的说明文字（如 fx_ f[13]「此行情由新浪财经计算得出」）
 
 
 def _quote_field(fields, index):
@@ -1331,6 +1412,58 @@ def _quote_field(fields, index):
     if index >= len(fields):
         raise ValueError("字段不足")
     return float(fields[index].strip())
+
+
+def _optional_fields(spec):
+    """按 ``{字段名: (fields, 下标)}`` 取「只解析、暂时不用」的补充字段。
+
+    **一律返回原始字符串**（不转 float），因为这些值本轮不参与任何计算，只在
+    --stock-dry-run 里打印给人看。越界、空串、纯空白一律返回 **""** —— 这是刻意的：
+    「没解析出来」和「解析出来是 0」在 dry-run 里必须看得出区别，所以宁可留空，
+    也**不把推测值或占位 0 填进去**（见 SinaQuote 的填值纪律）。
+    """
+    result = {}
+    for key, (fields, index) in spec.items():
+        value = fields[index].strip() if index < len(fields) else ""
+        result[key] = value if value else ""
+    return result
+
+
+def is_fx_symbol(code):
+    """这个代码是不是外汇/汇率形态（3a 裸代码或 3b ``fx_`` 前缀）。
+
+    **3a 裸代码没有前缀**（USDCNY / DINIW / CNYUSD），所以**不能靠前缀分流**，
+    只能靠代码形状：整串都是 ASCII 大写字母、**不含任何数字**、长度 5~6。
+
+    依据与「不会误伤」的理由：A 股代码**必然含数字**（``sh000300`` / ``sz399006``
+    / ``bj430047``），所以「无数字 + 全大写字母」这条判据不可能命中任何 A 股代码；
+    长度 5~6 也覆盖实测的 DINIW(5) / USDCNY(6) / CNYUSD(6)。而 ``fx_`` 前缀那
+    一支（fx_susdcny / fx_susdjpy）用前缀判更直接。
+
+    **这条判据必须在 A 股完整版分支之前生效**，否则 USDCNY 会被当成
+    「昨收 f[2] / 现价 f[3]」算出 +0.12% 这种看着挺像样的垃圾。
+    """
+    code = code or ""
+    if code.lower().startswith(FX_PREFIX):
+        return True
+    return (FX_BARE_MIN_LEN <= len(code) <= FX_BARE_MAX_LEN and
+            code.isascii() and code.isalpha() and code.isupper())
+
+
+def _fx_reason(code):
+    """是外汇形态就返回中文跳过原因；不是返回 ""。
+
+    **本轮硬性决策：识别出外汇形态就跳过，绝不猜一个涨跌幅。** 理由：15 秒差分实测
+    三个形态里只有 DINIW 的 f[1]/f[2]/f[8] 在变，其余字段全静态 —— **无法可靠定位
+    哪个是昨收**，fx_ 的 [10][11][12] 语义也定不下来。若误把 f[2] 当昨收、f[3] 当
+    现价，USDCNY 会算出 (6.7136−6.7055)/6.7055 = **+0.12%** 这种**看着挺像样的
+    垃圾** —— 正因它看着合理，最容易被误当成「解析成功」而静默上屏。
+    """
+    if not is_fx_symbol(code):
+        return ""
+    if code.lower().startswith(FX_PREFIX):
+        return FX_SKIP_REASON_FX
+    return FX_SKIP_REASON_BARE
 
 
 class SinaQuotes:
@@ -1350,6 +1483,15 @@ class SinaQuotes:
       [18]时间。f[8] 与 int_ 的 f[3] 一样是现成百分比，**不要自算**（hf_ 才要）。
       有效性只认 f[0] 非空 + f[8] 可解析，**不拿现价当门槛**（盘前价格 0 合法）。
       f[17] 的斜杠格式日期**不参与**日期投票（见 _parse_quote 的注释）
+    - **海外市场指数**（``b_`` 前缀，b_DAX/b_FTSE/b_CAC/b_NKY/b_SPX，**至少延迟
+      15 分钟**）：13 字段但 b_SPX 只有 6 字段 → 不按字段数判形态。f[3] 是现成
+      涨跌幅直给，**不自算**（同 int_，与 hf_ 相反）
+    - **美股**（``gb_`` 前缀，gb_bili/gb_ixic/gb_dji/gb_aapl）：gb_bili 36 字段而
+      gb_dji 只有 30 字段 → 同样不按字段数判形态。f[2] 是现成涨跌幅直给，**不自算**
+    - **外汇/汇率**（3a 裸代码 USDCNY/DINIW/CNYUSD 11 字段，3b ``fx_`` 前缀
+      fx_susdcny/fx_susdjpy 18 字段）：**识别出来就跳过，绝不推算涨跌幅**（涨跌
+      字段的语义未验证，猜错会得到看着挺像样的垃圾）。3a 没有前缀，靠「整串都是
+      ASCII 大写字母、无数字、长度 5~6」识别（A 股代码必含数字，故不误伤）
     - **已知未支持**（UNSUPPORTED_PREFIXES）：``rt_`` 延时行情（实测 25 字段，
       位置同 hk* 但语义是延时），命中就给中文原因跳过，绝不放行到别的分支
     - **大小写非对称，别统一**（实测 ``SH000300``/``hf_nq``/``hsi`` 都是空串，
@@ -1501,9 +1643,10 @@ class SinaQuotes:
                     full[quote.code.lower()] = quote
                     if quote.date:
                         # **只有 A 股完整版口径的日期会走到这里**（_parse_quote 的
-                        # else 分支）：int_ / hf_ / hk* 三种非 A 股形态一律把 date
-                        # 填成 ""，所以永远不参与投票。理由见各自分支的注释 ——
-                        # 交易日历不同 + 港股是斜杠日期格式，混进 max() 会误判。
+                        # else 分支）：int_ / hf_ / hk* / b_ / gb_ 五种非 A 股形态
+                        # 一律把 date 填成 ""，所以永远不参与投票（外汇根本不出行）。
+                        # 理由见各自分支的注释 —— 交易日历不同 + 日期格式不同，
+                        # 混进 max() 会误判。
                         # YYYY-MM-DD 字典序即时间序，直接取 max。
                         dates.append(quote.date)
             elif low.startswith("s_") or bare in wanted:
@@ -1577,6 +1720,23 @@ class SinaQuotes:
           A 股日期投票**：外盘期货在 A 股节假日照常交易，混进投票会让节假日被
           误判成开市。名称取 f[13]（中文，只进日志/--stock-dry-run）；取不到也
           **不丢行** —— 有效性只认 f[0] 现价与 f[7] 昨收，名字对设备毫无用处。
+        - 海外市场指数（key 带 b_，如 b_DAX/b_FTSE/b_CAC/b_NKY/b_SPX）：**至少延迟
+          15 分钟**（社区文档原文如此）。b_DAX 13 字段但 **b_SPX 只有 6 字段**，
+          所以不按字段数判形态。f[3] 是**现成涨跌幅**，直接用（算术自校验：
+          b_DAX 25374.42+34.22=25408.64=f[9] 即昨收，−34.22/25408.64=−0.13%=f[3]；
+          b_NKY 65219.72+657.90=65877.62=f[9]，−657.90/65877.62=−1.00%=f[3]）。
+          f[4]/f[5] 实测在同一请求里时而是 '9/26/2025'+'2:12 AM'、时而是
+          '2025-09-26'+'14:12:00'、时而全空 → 语义未定，**不解析**；f[8]/f[10]/f[11]
+          疑似今开/最高/最低但**只是推测，未确证 → 不填**。f[6] 有日期但**不投票**。
+        - 美股（key 带 gb_，如 gb_bili/gb_ixic/gb_dji/gb_aapl）：**gb_bili 36 字段
+          而 gb_dji 只有 30 字段**，同样不按字段数判形态。**f[2] 是现成涨跌幅**，
+          直接用（算术自校验：gb_bili 15.14−0.245=14.895=f[26] 即昨收，
+          0.245/14.895=1.64%=f[2]；gb_aapl 338.40−(−2.67)=341.07=f[26]，
+          −2.67/341.07=−0.78%=f[2]）。f[3] 是**日期时间合一**串
+          '2026-09-29 08:02:08'，格式与 A 股不同 + 美股交易日历不同 → **不投票**。
+        - 外汇/汇率（**两种形态**）：3a 是**没有前缀的裸代码**（USDCNY/DINIW/CNYUSD
+          11 字段），3b 是 ``fx_`` 前缀（fx_susdcny/fx_susdjpy 18 字段）。**两者都
+          识别出来就跳过**，绝不推算涨跌幅（理由见 _fx_reason）。
         - 港股（key 带 hk，实测 19 字段，如 hkHSI/hk00700/hk09988/hkHSCEI）：
           [0]英文名(ASCII) [1]中文名 [2]今开 [3]昨收 [4]最高 [5]最低 [6]现价
           [7]涨跌额 **[8]涨跌幅%（直给，不需自算）** [9]买价 [10]卖价 [11]成交量
@@ -1592,18 +1752,28 @@ class SinaQuotes:
           行情（25 字段、位置同 hk*）由 UNSUPPORTED_PREFIXES 在更早一步拦下。
         - **已知未支持**：`rt_` 延时行情（UNSUPPORTED_PREFIXES，见常量处注释）。
         - 完整版（key 不带上述前缀，**唯一参与日期投票的形态**）：fields[2]=昨收、
+          ⚠️ **外汇裸代码（USDCNY 等）本来也会落进这里**，所以外汇判别被放在本函数
+          最开头（_fx_reason），先于所有形态分支 —— 详见 is_fx_symbol 的注释。
           fields[3]=最新价/最新点位，涨跌幅 = (fields[3]−fields[2])/fields[2]
           （个股与指数同一公式）；fields[30]=行情日期、fields[31]=行情时间，
           sh/sz 下位置一致。开盘前 fields[3] 为 0 会算出 −100%，所以这里保留
           昨收/现价 > 0 的守卫。
         """
         fields = (data_str or "").split(",")
-        name = fields[0].strip() if fields else ""
-        if not name:
-            return None, "空行情"
         low = key.lower()
         is_simple = low.startswith("s_")
         code = key[2:] if is_simple else key
+        # **外汇/汇率必须排在 A 股完整版分支之前**（见 _fx_reason 的调用位置与
+        # is_fx_symbol 的判据注释）：USDCNY/DINIW 是**没有前缀的裸代码**，不是按
+        # 前缀分流就能认出来的形态，不在这里拦下就会掉进 else 完整版分支被当成
+        # 「昨收 f[2] / 现价 f[3]」算出 +0.12% 这种看着挺像样的垃圾。
+        fx_reason = _fx_reason(code)
+        if fx_reason:
+            return None, fx_reason
+        name = fields[0].strip() if fields else ""
+        if not name:
+            return None, "空行情"
+        extra = {}                 # 「只解析、暂时不用」的补充字段（见 SinaQuote）
         try:
             if any(low.startswith(prefix) for prefix in UNSUPPORTED_PREFIXES):
                 reason = UNSUPPORTED_REASONS.get(low[:2], "形态暂不支持")
@@ -1622,6 +1792,64 @@ class SinaQuotes:
                 change_amount = _quote_field(fields, 2)
                 percent = _quote_field(fields, 3)
                 date = ""                        # 该形态没有行情日期字段
+            elif low.startswith("b_"):
+                # 海外市场指数（b_DAX / b_FTSE / b_CAC / b_NKY / b_SPX），**至少
+                # 延迟 15 分钟**（社区文档原文如此）。13 字段，但 b_SPX 只有 6 字段
+                # → **绝不按字段数判形态**，只看 b_ 前缀。
+                #   [0]名称 [1]现价/点位 [2]涨跌额 **[3]涨跌幅%（直给）** [4]? [5]?
+                #   [6]日期 [7]时间 [8]? [9]昨收 [10]? [11]? [12]?
+                # 算术自校验（f[9]=昨收 的依据）：b_DAX 25374.42+34.22=25408.64=f[9]；
+                #   b_NKY 65219.72+657.90=65877.62=f[9]。且 -34.22/25408.64=-0.13%
+                #   = f[3]、-657.90/65877.62=-1.00% = f[3] → **f[3] 是现成涨跌幅，
+                #   直接用，绝不自算**（同 int_，与 hf_ 相反）。
+                # f[4]/f[5] 实测在同一请求里时而是 '9/26/2025'+'2:12 AM'、时而是
+                #   '2025-09-26'+'14:12:00'、时而全空 → 语义未定，**不解析**。
+                # f[8]/f[10]/f[11]（疑似今开/最高/最低）只是推测，**不填**。
+                if len(fields) <= 3:
+                    return None, ("b_ 形态字段不足（需要 名称,现价,涨跌额,"
+                                  "涨跌幅%% 四项）")
+                point = _quote_field(fields, 1)
+                change_amount = _quote_field(fields, 2)
+                percent = _quote_field(fields, 3)
+                # f[6] 确实带日期，但**故意不参与 A 股日期投票**（海外市场交易日历
+                # 不同，且数据本身就是延迟 15 分钟的，混进投票会误判节假日）。
+                date = ""
+                extra = _optional_fields({
+                    "prev_close": (fields, 9),    # 算术自校验过
+                    "quote_time": (fields, 7),
+                })
+            elif low.startswith("gb_"):
+                # 美股（gb_bili / gb_ixic / gb_dji / gb_aapl）：**gb_bili 36 字段
+                # 而 gb_dji 只有 30 字段** → 同样不按字段数判形态。
+                #   [0]名称 [1]最新价 **[2]涨跌幅%（直给）** [3]日期与时间**合一**
+                #   [4]涨跌额 [5]今开 [6]最高 [7]最低 [8]52周高 [9]52周低
+                #   [10]成交量 [11]成交量(另一口径) [12]成交额 [24][25]EDT 时间串
+                #   [26]昨收 [28]'1' [29]'2026' [30..35]?
+                # 算术自校验（f[26]=昨收 的依据）：gb_bili 15.14−0.245=14.895=f[26]；
+                #   gb_aapl 338.40−(−2.67)=341.07=f[26]。且 0.245/14.895=1.64%
+                #   = f[2]、−2.67/341.07=−0.78% = f[2] → **f[2] 是现成涨跌幅**。
+                # 注意社区文档表格里那个 1.176 是笔误，样例值 1.76 才对，别照抄。
+                if len(fields) <= 2:
+                    return None, "gb_ 形态字段不足（需要 名称,最新价,涨跌幅% 三项）"
+                point = _quote_field(fields, 1)
+                percent = _quote_field(fields, 2)
+                # f[3] 是 '2026-09-29 08:02:08' 这种**日期时间合一**串，格式与 A 股的
+                # '2026-09-29' 不同；美股交易日历也不同 → 两条理由都不参与投票。
+                date = ""
+                extra = _optional_fields({
+                    "prev_close": (fields, 26),   # 算术自校验过
+                    "open": (fields, 5),
+                    "high": (fields, 6),
+                    "low": (fields, 7),
+                    "quote_time": (fields, 3),    # 日期时间合一，原样带回只进 dry-run
+                    "volume": (fields, 10),
+                    "amount": (fields, 12),
+                })
+                # f[4] 涨跌额只用于 dry-run 显示，缺失不该让整行丢掉。
+                try:
+                    change_amount = _quote_field(fields, 4)
+                except (IndexError, ValueError):
+                    change_amount = 0.0
             elif low.startswith("hf_"):
                 # 外盘期货 15/14 字段：涨跌幅自算，只认 f[0] 现价与 f[7] 昨收。
                 if len(fields) <= 7:
@@ -1639,6 +1867,13 @@ class SinaQuotes:
                 # f[13] 是中文名，取不到也**不因此丢行**（只进日志，不上屏）。
                 if len(fields) > 13 and fields[13].strip():
                     name = fields[13].strip()
+                extra = _optional_fields({
+                    "prev_close": (fields, 7),    # 涨跌幅就是拿它自算的，语义已确证
+                    "open": (fields, 8),
+                    "high": (fields, 4),
+                    "low": (fields, 5),
+                    "quote_time": (fields, 6),
+                })
             elif low.startswith("hk"):
                 # 港股 19 字段：涨跌幅是 f[8] **直给的百分比**，不需自算（与 hf_ 相反）。
                 # 算术自校验 hkHSI：(f[6]−f[3])/f[3] = −0.5487% 与 f[8]=−0.549 吻合。
@@ -1664,6 +1899,15 @@ class SinaQuotes:
                 #    「今天是不是交易日」会误判；② 斜杠格式和 A 股的 '2026-09-29' 混进
                 #    同一个 max() 会按字符串序比错。日期投票只认 A 股完整版口径。
                 date = ""
+                extra = _optional_fields({
+                    "prev_close": (fields, 3),    # 算术自校验过
+                    "open": (fields, 2),
+                    "high": (fields, 4),
+                    "low": (fields, 5),
+                    "volume": (fields, 11),
+                    "amount": (fields, 12),
+                    "quote_time": (fields, 18),
+                })
             else:
                 if len(fields) <= 3:
                     return None, "完整版字段不足（读不到 fields[2]/fields[3]）"
@@ -1677,10 +1921,20 @@ class SinaQuotes:
                 change_amount = _quote_field(fields, 4)
                 percent = (price - previous_close) / previous_close * 100.0
                 date = SinaQuotes._extract_date(data_str)
+                extra = _optional_fields({
+                    "prev_close": (fields, 2),
+                    "open": (fields, 1),
+                    "high": (fields, 6),
+                    "low": (fields, 7),
+                    "volume": (fields, 8),
+                    "amount": (fields, 9),
+                    "quote_time": (fields, 31),
+                })
             if not math.isfinite(percent) or abs(percent) > 100000:
                 return None, "涨跌幅不是有限数或越界"
+            # percent 是唯一进设备 payload 的量；下面这些 extra 只给 --stock-dry-run 看。
             return SinaQuote(code, name, point, change_amount,
-                             round_change(percent), date), ""
+                             round_change(percent), date, **extra), ""
         except (IndexError, TypeError, ValueError, InvalidOperation, OverflowError):
             return None, "字段无法解析"
 
@@ -1883,6 +2137,11 @@ def show_dry_run(endpoint, payload):
     print(json.dumps(payload, ensure_ascii=False))
 
 
+def _dash_if_empty(value):
+    """dry-run 里把「没解析出来」显式画成 --，别让它和 0 混为一谈。"""
+    return value if value else "--"
+
+
 def stock_dry_run(args, symbols, aliases=None, windows=None):
     """真实拉取股票行情并打印 payload，全程不连接设备。
 
@@ -1933,6 +2192,15 @@ def stock_dry_run(args, symbols, aliases=None, windows=None):
             print("  %-9s %-8s 点位=%10.4f 涨跌额=%+9.4f 涨跌幅=%+7.2f%%"
                   % (quote.code, quote.name, quote.point, quote.change_amount,
                      quote.percent))
+            # 「只解析、暂时不用」的补充字段：推给设备的 payload 里没有它们，
+            # 打出来是为了能看见解析到了什么、以及哪些位置**诚实地留了空**
+            # （留空 = 没确证，绝不填推测值）。
+            print("    补充 今开=%s 最高=%s 最低=%s 昨收=%s 成交量=%s 成交额=%s "
+                  "行情时间=%s"
+                  % (_dash_if_empty(quote.open), _dash_if_empty(quote.high),
+                     _dash_if_empty(quote.low), _dash_if_empty(quote.prev_close),
+                     _dash_if_empty(quote.volume), _dash_if_empty(quote.amount),
+                     _dash_if_empty(quote.quote_time)))
         # 推送时真正上屏的行名：配了简称就是简称，否则沿用代码。
         print("    推送行名 %-9s %+7.2f%%  %s"
               % (aliases.get(row["name"], row["name"]), row["change"], tone))
@@ -2892,6 +3160,257 @@ def self_test():
        not SinaQuotes.supports_simple("hkHSI") and
        "list=hkHSI" in SinaQuotes().build_url(["hkHSI"], True) and
        "s_hkHSI" not in SinaQuotes().build_url(["hkHSI"], True))
+
+    # 67~75 新形态：b_ 海外指数 / gb_ 美股 / 外汇汇率。全部离线，用实测字段布局。
+    def b_line(key, fields):
+        return 'var hq_str_%s="%s";' % (key, ",".join(fields))
+
+    def b_quote(name="德国DAX指数", point="25374.4200", change="-34.22",
+                percent="-0.13", previous_close="25408.6400",
+                date_text="2026-09-29", time_text="11:38:25", tail=True):
+        """b_ 13 字段样本（tail=False 造出 b_SPX 的 6 字段形态）。
+
+        实测布局见 _parse_quote 的 docstring。刻意把 point/previous_close 做成可改
+        参数：69 号断言要靠「改了现价与昨收、f[3] 不变」锁死「涨跌幅取 f[3] 而不自
+        算」这条（b_ 的 f[9] 是算术自校验过的昨收：25374.42+34.22=25408.64）。
+        """
+        fields = [name, point, change, percent, "9/26/2025", "2025-09-26",
+                  date_text, time_text, "25443.9800", previous_close,
+                  "25575.6600", "25360.3200", "45936176"]
+        return fields[:6] if not tail else fields
+
+    def gb_quote(name="哔哩哔哩", point="15.1400", percent="1.64",
+                 change="0.2450", previous_close="14.8950",
+                 stamp="2026-09-29 08:02:08", tail=6):
+        """gb_ 36 字段样本（tail=0 造出 gb_dji 的 30 字段形态）。
+
+        实测布局见 _parse_quote 的 docstring。point/previous_close 可改：71 号断言
+        靠「改了现价与昨收、f[2] 不变」锁死「涨跌幅取 f[2] 而不自算」
+        （f[26]=14.8950 是算术自校验过的昨收：15.14−0.245=14.895）。
+        """
+        fields = [name, point, percent, stamp, change, "15.2950", "15.3600",
+                  "15.1250", "36.4000", "14.3900", "5479267", "2774314",
+                  "6313380000", "0.48", "31.540000", "0.00", "0.31", "0.00",
+                  "0.00", "417000000", "0", "15.1800", "0.26", "0.04",
+                  "Sep 28 07:54PM EDT", "Sep 28 04:00PM EDT", previous_close,
+                  "1170558", "1", "2026", "82849244.0000", "15.2000",
+                  "15.1100", "17789585.7046", "15.1400", "14.8950"]
+        return fields[:30 + tail]
+
+    # 67. b_ 13 字段：涨跌幅就是 f[3] 直给，f[9] 解析成 prev_close，日期不投票。
+    quotes, date = client._parse(
+        b_line("b_DAX", b_quote()), ["b_DAX"])
+    ok("b_ 十三字段涨跌幅取 f[3] 直给且补昨收",
+       len(quotes) == 1 and quotes[0].code == "b_DAX" and
+       quotes[0].percent == -0.13 and quotes[0].point == 25374.42 and
+       quotes[0].change_amount == -34.22 and
+       quotes[0].prev_close == "25408.6400" and
+       quotes[0].quote_time == "11:38:25" and date is None)
+
+    # 68. b_ 的 f[8]/f[10]/f[11]（疑似今开/最高/最低）**只是推测 → 必须留空**，
+    #     绝不能把推测值当实测填进 dry-run。
+    ok("b_ 存疑字段诚实地留空（不填推测值）",
+       quotes[0].open == "" and quotes[0].high == "" and
+       quotes[0].low == "" and quotes[0].volume == "")
+
+    # 69. b_ **绝不自算**：把 f[1] 现价与 f[9] 昨收改成会算出 +99% 的组合，f[3] 不动。
+    #     若代码哪天改成 (f[1]−f[9])/f[9]，这里立刻从 -0.13 变成 99.0。
+    b_selfcalc = client._parse(
+        b_line("b_DAX", b_quote(point="30000.0000", previous_close="200.0000")),
+        ["b_DAX"])[0]
+    ok("b_ 涨跌幅只认 f[3] 不自算（改现价昨收结果不变）",
+       len(b_selfcalc) == 1 and b_selfcalc[0].percent == -0.13)
+
+    # 70. b_SPX 只有 6 字段（缺 f[6]~f[12]）：按字段数判形态会漏掉它，仍要出行。
+    quotes, date = client._parse(
+        b_line("b_SPX", b_quote(name="标准普尔500指数", point="7683.69",
+                                change="-59.72", percent="-0.77", tail=False)),
+        ["b_SPX"])
+    ok("b_ 六字段（b_SPX）同样能出行（不按字段数判形态）",
+       len(quotes) == 1 and quotes[0].code == "b_SPX" and
+       quotes[0].percent == -0.77 and date is None)
+
+    # 71. gb_ 36 字段：涨跌幅就是 f[2] 直给，f[26] 解析成 prev_close，日期不投票。
+    quotes, date = client._parse(
+        b_line("gb_bili", gb_quote()), ["gb_bili"])
+    ok("gb_ 三十六字段涨跌幅取 f[2] 直给并补昨收今开最高最低",
+       len(quotes) == 1 and quotes[0].code == "gb_bili" and
+       quotes[0].percent == 1.64 and quotes[0].point == 15.14 and
+       quotes[0].prev_close == "14.8950" and quotes[0].open == "15.2950" and
+       quotes[0].high == "15.3600" and quotes[0].low == "15.1250" and
+       quotes[0].quote_time == "2026-09-29 08:02:08" and date is None)
+
+    # 72. gb_ **绝不自算**：改 f[1] 现价与 f[26] 昨收、f[2] 不动。
+    gb_selfcalc = client._parse(
+        b_line("gb_bili", gb_quote(point="398.0000", previous_close="200.0000")),
+        ["gb_bili"])[0]
+    ok("gb_ 涨跌幅只认 f[2] 不自算（改现价昨收结果不变）",
+       len(gb_selfcalc) == 1 and gb_selfcalc[0].percent == 1.64)
+
+    # 73. gb_dji 只有 30 字段：同样按字段数判形态会漏，仍要出行。
+    quotes, date = client._parse(
+        b_line("gb_dji", gb_quote(name="道琼斯", point="51481.5117",
+                                  percent="-0.67", change="-347.1100",
+                                  previous_close="51828.6211", tail=0)),
+        ["gb_dji"])
+    ok("gb_ 三十字段（gb_dji）同样能出行（不按字段数判形态）",
+       len(quotes) == 1 and quotes[0].code == "gb_dji" and
+       quotes[0].percent == -0.67 and date is None)
+
+    # 74. 外汇/汇率**只识别、绝不推算**：3a 裸代码 11 字段（USDCNY）不出行。
+    #     关键：若漏掉这条判据，USDCNY 会掉进 A 股完整版分支，被当成
+    #     「昨收 f[2] / 现价 f[3]」算出 +0.12% 这种**看着挺像样的垃圾**。
+    fx_bare = ('var hq_str_USDCNY="11:38:01,6.7054,6.7055,6.7136,45,6.7087,'
+               '6.7132,6.7087,6.7094,美元人民币,2026-09-29";')
+    quotes, date = client._parse(fx_bare, ["USDCNY"])
+    _, bare_reason = client._parse_quote("USDCNY", fx_bare[16:-2])
+    ok("外汇裸代码被识别并跳过且不误算成涨跌幅",
+       quotes == [] and date is None and
+       is_fx_symbol("USDCNY") and is_fx_symbol("DINIW") and
+       is_fx_symbol("CNYUSD") and
+       "外汇" in bare_reason and "未验证" in bare_reason and
+       # 绝不能「算出一个数」出来 —— 这正是本轮要防的错
+       not any(isinstance(item, float) for item in quotes))
+
+    # 75. 3b ``fx_`` 前缀 18 字段同样跳过，f[17] 的日期也不投票。
+    fx_prefixed = ('var hq_str_fx_susdjpy="11:41:58,157.310000,157.340000,'
+                   '157.350000,4100,157.400000,157.580000,157.170000,'
+                   '157.310000,美元兑日元即期汇率,-0.030000,-0.040000,'
+                   '0.002605,,163.980000,152.100000,,2026-09-29";')
+    quotes, date = client._parse(fx_prefixed, ["fx_susdjpy"])
+    _, fx_reason_text = client._parse_quote("fx_susdjpy", fx_prefixed[16:-2])
+    ok("外汇 fx_ 前缀形态被识别并跳过且日期不投票",
+       quotes == [] and date is None and is_fx_symbol("fx_susdjpy") and
+       "fx_" in fx_reason_text and "未验证" in fx_reason_text)
+
+    # 76. 外汇判据**不误伤 A 股**：A 股代码必含数字，全大写字母 + 5~6 长度的判据
+    #     对它们一律为假（这条要是破了，sh000300 就会被当外汇丢掉）。
+    ok("外汇代码判据不误伤 A 股代码",
+       not any(is_fx_symbol(code) for code in
+               ("sh000300", "sz399006", "bj430047", "sh600519", "hkHSI",
+                "hf_NQ", "int_nikkei", "b_DAX", "gb_ixic")) and
+       not is_fx_symbol("sh000300") and
+       # 太短/太长/含数字/小写 都不是外汇
+       not is_fx_symbol("USDC") and not is_fx_symbol("USDCNYX") and
+       not is_fx_symbol("usdcny") and
+       # 另一支的 fx_ 前缀无论后面是什么都算外汇形态
+       is_fx_symbol("fx_") and is_fx_symbol("fx_anything"))
+
+    # 77. 混配一次请求：A 股 + b_ + gb_ + 外汇（3a + 3b）→ A 股照常出行、外汇被
+    #     跳过、**行情日期仍只来自 A 股行**。
+    _, mixed_new_date = client._parse("\n".join([
+        full_line("sh000300", "沪深300", 4341.42, 4340.5791, today_text),
+        b_line("b_DAX", b_quote(date_text=stale_text)),
+        b_line("gb_ixic", gb_quote(name="纳斯达克", point="26820.3809",
+                                   percent="-0.92", change="-248.3356",
+                                   previous_close="27068.7165",
+                                   stamp="2026-09-29 05:30:00", tail=6)),
+        fx_bare,
+        fx_prefixed,
+    ]), ["sh000300", "b_DAX", "gb_ixic", "USDCNY", "fx_susdjpy"])
+    ok("A 股与 b_/gb_/外汇混配：外汇跳过且日期只来自 A 股",
+       mixed_new_date == today_text and mixed_new_date != stale_text)
+
+    class _NewMixed(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, "\n".join([
+                simple_line("sh000300", "沪深300,4340.5791,-0.1759,1.23,0,0"),
+                b_line("b_DAX", b_quote()),
+                b_line("gb_ixic", gb_quote(name="纳斯达克", point="26820.3809",
+                                           percent="-0.92", change="-248.3356",
+                                           previous_close="27068.7165")),
+                fx_bare,
+                fx_prefixed,
+                full_line("sh000300", "沪深300", 4341.42, 4340.5791, today_text),
+            ])
+
+    new_mixed = _NewMixed()
+    rows, new_date = new_mixed.fetch(
+        ["sh000300", "b_DAX", "gb_ixic", "USDCNY", "fx_susdjpy"])
+    ok("混配单请求出行 3 行且外汇两行被跳过",
+       len(new_mixed.seen_urls) == 1 and
+       new_mixed.seen_urls[0].split("list=")[1] ==
+       "s_sh000300,sh000300,b_DAX,gb_ixic,USDCNY,fx_susdjpy" and
+       # b_/gb_ 都没有 s_ 简版（实测 s_b_DAX / s_gb_bili 是空串），外汇同理
+       "s_b_DAX" not in new_mixed.seen_urls[0] and
+       "s_gb_ixic" not in new_mixed.seen_urls[0] and
+       rows == [{"name": "sh000300", "change": 1.23},
+                {"name": "b_DAX", "change": -0.13},
+                {"name": "gb_ixic", "change": -0.92}] and
+       new_date == today_text)
+
+    # 78. 纯外汇列表：data_date is None（两种子形态的日期都不投票）。
+    _, only_fx_date = client._parse("\n".join([fx_bare, fx_prefixed]),
+                                    ["USDCNY", "fx_susdjpy"])
+    ok("纯外汇列表行情日期为 None（两种子形态都不投票）",
+       only_fx_date is None)
+
+    # 79. 纯 b_ 列表：单请求、URL 里无 s_b_（实测 s_b_DAX 空串）、出行、无日期。
+    class _BOnly(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, "\n".join([
+                b_line("b_DAX", b_quote()),
+                b_line("b_NKY", b_quote(name="日经225指数", point="65219.7200",
+                                        change="-657.90", percent="-1.00",
+                                        previous_close="65877.6200")),
+            ])
+
+    b_only = _BOnly()
+    rows, b_only_date = b_only.fetch(["b_DAX", "b_NKY"])
+    ok("纯 b_ 列表单请求出行且无 s_ 简版",
+       len(b_only.seen_urls) == 1 and
+       b_only.seen_urls[0].split("list=")[1] == "b_DAX,b_NKY" and
+       "s_b_" not in b_only.seen_urls[0] and
+       rows == [{"name": "b_DAX", "change": -0.13},
+                {"name": "b_NKY", "change": -1.0}] and b_only_date is None)
+
+    # 80. 纯 gb_ 列表：同理（实测 s_gb_bili 空串）。
+    class _GbOnly(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, b_line("gb_ixic", gb_quote(name="纳斯达克",
+                                                   point="26820.3809",
+                                                   percent="-0.92",
+                                                   change="-248.3356",
+                                                   previous_close="27068.7165"))
+
+    gb_only = _GbOnly()
+    rows, gb_only_date = gb_only.fetch(["gb_ixic"])
+    ok("纯 gb_ 列表单请求出行且无 s_ 简版",
+       len(gb_only.seen_urls) == 1 and
+       gb_only.seen_urls[0].split("list=")[1] == "gb_ixic" and
+       "s_gb_" not in gb_only.seen_urls[0] and
+       rows == [{"name": "gb_ixic", "change": -0.92}] and gb_only_date is None)
+
+    # 81. fetch() 对外返回的形状**一个字节都不能变** —— 「只解析、暂时不用」的
+    #     硬约束：新增字段只在 SinaQuote / dry-run 里，绝不流进设备 payload。
+    ok("fetch() 返回形状不变（补充字段不外泄）",
+       list(rows[0].keys()) == ["name", "change"] and
+       set(rows[0].keys()) == {"name", "change"} and
+       # SinaQuote 上的补充字段都是字符串且带默认值（""）
+       client._parse(b_line("b_DAX", b_quote()), ["b_DAX"])[0][0].prev_close
+       == "25408.6400" and
+       all(isinstance(value, str) for value in
+           (SinaQuote.__dataclass_fields__["open"].default,
+            SinaQuote.__dataclass_fields__["prev_close"].default,
+            SinaQuote.__dataclass_fields__["quote_time"].default)) and
+       # 别名替换只认 name/change，补充字段不会影响它
+       apply_aliases(rows, {"gb_ixic": "IXIC"}) ==
+       [{"name": "IXIC", "change": -0.92}])
 
     # 66. A 股/北交所「要转小写」与「支持 s_ 简版」是**两件事**，别合成一个常量。
     #     实测 s_bj430047 恒为空串（北交所没有简版形态），但 BJ430047 仍必须被

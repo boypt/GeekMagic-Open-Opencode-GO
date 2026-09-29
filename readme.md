@@ -28,6 +28,7 @@
 - [Install guide](#installation-guide)
 - [Rescue Boot Mode](#rescue-boot-mode)
 - [API — Notice notifications](#api--notice-notifications)
+    - [OpenCode v2 plugin](#opencode-v2-plugin)
 - [License](#license)
 - [Support](#support)
 
@@ -505,6 +506,41 @@ When idle:
 | `400` | `{"status":"error","message":"Invalid JSON"}` | Body is not valid JSON, or empty |
 | `401` | `{"status":"error","message":"Invalid or missing token"}` | Missing or wrong Bearer token |
 | `409` | `{"status":"error","message":"notice active (Ns remaining), scene switch ignored"}` | `POST /api/v1/scene` while a notice is showing |
+
+### OpenCode v2 plugin
+
+The repository includes a local OpenCode v2 plugin at [`tools/opencode-notice-plugin.ts`](tools/opencode-notice-plugin.ts). It forwards session completion, interruption and failure events, permission requests, and form prompts to the device's temporary notice overlay. Subagent events are ignored to avoid notification spam.
+
+1. Make sure the device is reachable from the computer running OpenCode and have its API Bearer token ready (the `api_token` shown in `data/config.json` or the Web UI).
+2. Add the plugin to the `plugins` array in the project's `opencode.jsonc` at the repository root. If the file already has a `plugins` array, add this entry to it rather than creating a second `plugins` key:
+
+   ```jsonc
+   {
+     "$schema": "https://opencode.ai/config.json",
+     "plugins": [
+       {
+         "package": "./tools/opencode-notice-plugin.ts",
+         "options": {
+           "device": "http://192.168.1.50",
+           "seconds": 5
+         }
+       }
+     ]
+   }
+   ```
+
+   If you use OpenCode from another project, use the absolute path to `opencode-notice-plugin.ts` instead of `./tools/...`.
+3. Set the token in the environment before launching OpenCode. For example, in a POSIX shell:
+
+   ```bash
+   export OPENCODE_NOTICE_TOKEN="<device API token>"
+   opencode
+   ```
+
+   You can also set `OPENCODE_NOTICE_DEVICE` instead of the `device` option. The plugin accepts `OPENCODE_NOTICE_SECONDS` (default `5`), `OPENCODE_NOTICE_TIMEOUT_MS` (default `4000`), and `OPENCODE_NOTICE_ENABLED` (`0` disables it). Plugin options override the corresponding environment variables. Keep the token out of committed config files.
+4. Restart OpenCode after changing its configuration. Run a prompt, or trigger a permission/form request, to verify that the device shows the notice and then returns to its previous scene.
+
+The plugin sanitizes event text to the device's printable-ASCII limit and truncates it to 199 bytes. If device address or token is missing, it logs a warning and stays inactive. A network/API failure is logged but does not stop OpenCode. For event mapping and all supported options, see the header in `tools/opencode-notice-plugin.ts`.
 
 ### Python example
 

@@ -60,10 +60,8 @@
  *     ]
  *   }
  *
- * Dependencies: none beyond `@opencode/plugin` types (global fetch only).
+ * Dependencies: none (uses the v2 plain-object plugin shape and global fetch).
  */
-
-import { Plugin } from "@opencode/plugin"
 
 const LOG_PREFIX = "[notice-plugin]"
 
@@ -227,10 +225,10 @@ function firstLine(text: string, max = 120): string {
   return line.length > max ? line.slice(0, max).trimEnd() : line
 }
 
-export default Plugin.define({
+export default {
   id: "geekmagic-notice",
 
-  async setup(ctx) {
+  async setup(ctx: any) {
     const options = ctx.options as Record<string, unknown> | undefined
     if (!resolveEnabled(options)) {
       log("info", "disabled by options/env, no notices will be sent")
@@ -430,4 +428,4 @@ export default Plugin.define({
       controller.abort()
     }
   },
-})
+}

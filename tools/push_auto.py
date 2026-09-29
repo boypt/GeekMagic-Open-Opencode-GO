@@ -62,6 +62,20 @@ MARKET_OPEN / MARKET_CLOSE）覆盖。两点不变式：
 节假日时全员同日，max 不改变结论。写 ``--symbols`` 时可以带 ``s_`` 前缀，取数层
 会剥掉。
 
+海外指数是**第三种形态**（``int_`` 前缀，如 int_nikkei/int_dji/int_hangseng）::
+
+    int_nikkei    4 字段  ['日经指数','44946.64','-408.35','-0.90']  ← 名称,现价,涨跌额,涨跌幅%
+    s_int_nikkei  1 字段  ['']                                        ← 海外指数没有 s_ 简版
+
+所以它既不套简版也不套 A 股完整版：(f[3]−f[2])/f[2] 在这里会把 -0.91% 算成
++0.02%（那里 fields[2] 是昨收，这里是涨跌额）。它**没有日期字段**，因此不参与
+日期投票 —— 行情日期/节假日兜底只对 A 股代码有效，纯 ``int_`` 列表拿不到行情
+日期。是否给某个代码加 ``s_`` 简版由 SIMPLE_PREFIXES 决定（实测只有 sh_/sz_/bj_
+有简版），列表里全是 ``int_`` 时直接走纯完整版形态，不做「简版 → 回退」两轮
+dance。``int_nikkei`` 有 10 字节，超过设备端 name 的 9 字节上限，所以 SYMBOLS
+的语法上限放宽到 16 字节，但超 9 字节的代码**必须**在 SYMBOL_NAMES 里配简称
+（没配简称才会原样上屏）。
+
 **布局按 key 带不带 s_ 前缀分流，不按字段数。** 完整版的指数和个股是同一套布局
 （沪市 34 字段 / 深市 33 字段，尾部多一个空字段）：``fields[2]``=昨收、
 ``fields[3]``=最新价/最新点位，涨跌幅 = ``(fields[3]−fields[2])/fields[2]``，
@@ -126,6 +140,18 @@ BEIJING_TZ_OFFSET_SEC = 8 * 3600
 DEFAULT_SINA_URL = "https://hq.sinajs.cn/list="
 DEFAULT_SYMBOLS = "sh600519,sz000001,sh000001,sz399001,sh000300"
 MAX_ROWS = 5
+# 设备端行名 name 的上限是 9 字节（1..9 可打印 ASCII，见 POST /api/v1/stock）。
+DEVICE_NAME_MAX = 9
+# 标的代码的语法上限：比设备端 name 宽，因为取数层把代码当 name 推，只有没配简称
+# 时才原样上屏。16 字节覆盖实测的海外指数代码（int_hangseng 12 / int_nikkei 10）。
+MAX_SYMBOL_BYTES = 16
+# 支持 s_ 简版的前缀（注意代码是 sh000300 这种「sh+数字」，没有下划线）。依据是实测：
+# sh/sz/bj 的每个代码请求 s_<code> 都返回 6 字段简版；而 int_nikkei 的 s_int_nikkei
+# 恒为空串（海外指数没有简版形态），hk*/hf_* 同理。不按「看起来像不像 A 股」外推，
+# 只有这一条是实测过的。
+SIMPLE_PREFIXES = ("sh", "sz", "bj")
+# 无 s_ 简版的形态（int_ 海外指数等）：4 字段且**没有日期字段**，不参与日期投票。
+NOSIMPLE_PREFIXES = ("int_", "hk", "hf_")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 SINA_REFERER = "https://finance.sina.com.cn"
 MARKET_WINDOWS = ((9 * 3600 + 20 * 60, 15 * 3600 + 30 * 60),)
@@ -1098,7 +1124,11 @@ def fetch_upstream(url, key, timeout, insecure, retries=2):
 
 
 def parse_symbols(value):
-    """解析标的并验证设备端 ASCII、长度和数量约束。"""
+    """解析标的并验证 ASCII、长度和数量约束。
+
+    长度上限是 MAX_SYMBOL_BYTES(16) 而不是设备端 name 的 9 字节：取数层把代码当
+    name 推给设备，但**只有没配简称时才会原样上屏**（见 require_aliases_for_long_codes）。
+    """
     symbols = []
     for item in str(value or "").split(","):
         symbol = item.strip().lower()
@@ -1106,8 +1136,9 @@ def parse_symbols(value):
             raise ValueError("--symbols 含空的标的项")
         if len(symbol.encode("ascii", "ignore")) != len(symbol):
             raise ValueError("标的 %r 含非 ASCII 字符" % symbol)
-        if not 1 <= len(symbol.encode("ascii")) <= 9:
-            raise ValueError("标的 %r 长度必须为 1..9 字节" % symbol)
+        if not 1 <= len(symbol.encode("ascii")) <= MAX_SYMBOL_BYTES:
+            raise ValueError("标的 %r 长度必须为 1..%d 字节"
+                             % (symbol, MAX_SYMBOL_BYTES))
         if any(ord(ch) < 32 or ord(ch) > 126 for ch in symbol):
             raise ValueError("标的 %r 含不可打印 ASCII" % symbol)
         symbols.append(symbol)
@@ -1148,6 +1179,22 @@ def parse_symbol_names(symbols, raw):
                    % (alias, owner[alias], symbol))
         owner[alias] = symbol
         aliases[symbol] = alias
+    return aliases
+
+
+def require_aliases_for_long_codes(symbols, aliases):
+    """超过设备端 name 上限的代码必须有简称，否则早失败。
+
+    这不是语法问题（1..MAX_SYMBOL_BYTES 字节的语法校验在 parse_symbols 里），而是
+    「上屏名从哪来」：没配简称时行名就是代码本身，int_nikkei(10) 会被设备 400 拒。
+    """
+    for symbol in symbols:
+        if len(symbol.encode("ascii")) > DEVICE_NAME_MAX and symbol not in aliases:
+            raise ValueError(
+                "代码 %s 有 %d 字节，超过设备端 name 的 %d 字节上限"
+                "（SYMBOLS 长度必须为 1..%d 字节；没有简称时才会原样上屏）"
+                % (symbol, len(symbol.encode("ascii")), DEVICE_NAME_MAX,
+                   MAX_SYMBOL_BYTES))
     return aliases
 
 
@@ -1196,16 +1243,32 @@ def _quote_field(fields, index):
 
 
 class SinaQuotes:
-    """新浪行情客户端：s_ 简版为主、完整版为辅，一次请求混用两种代码。
+    """新浪行情客户端：按 key 前缀分三条形态，一次请求混写。
 
-    - 简版（s_<code>）6 字段，只要涨跌幅，正是设备要的
-    - 完整版（<code>）多一个日期字段，节假日/停市兜底判定（行情日期≠今天）靠它
-    - 一个 URL 里混着写（list=s_sh000300,sh000300 实测两行都返回），所以每拍
+    - 简版（``s_<code>``，仅 SIMPLE_PREFIXES 支持）6 字段，只要涨跌幅，正是设备要的
+    - 完整版（``<code>``，A 股裸代码）多一个日期字段，节假日/停市兜底判定靠它
+    - **无简版形态**（``int_`` 海外指数，实测 ``s_int_nikkei`` 恒为空串）只有 4
+      字段：名称,现价,涨跌额,涨跌幅% —— fields[3] 同样是直接给的百分比。**它没有
+      日期字段**，所以不参与日期投票：行情日期/节假日兜底只对 A 股代码有效，纯
+      ``int_`` 列表拿不到 data_date（返回 None）。
+    - 一个 URL 里混着写（``list=s_sh000300,sh000300`` 实测两行都返回），所以每拍
       只发一次请求：**每个标的都同时捎带完整版**，多出来的行只用来投票日期
+    - 「哪些前缀支持简版」按 SIMPLE_PREFIXES 判断，依据是**逐个实测**（见常量处
+      注释），不外推。列表里**没有任何**支持简版的代码时直接走纯完整版形态，
+      不做「简版 → 回退」两轮 dance —— 那种情况下简版必然全废，白跑一倍请求、
+      每拍刷一堆重试噪音。
     - 行情日期取**所有完整版行里最新的那一天**，不是第一个：停牌标的会报陈旧
       日期（实测某标的报 7 天前而其余都是今天），只信一个会把正常交易日误判
       成休市。节假日时所有标的都报上一交易日，max 仍是那天 ≠ 今天，判定不变。
     """
+
+    @staticmethod
+    def supports_simple(code):
+        """该代码有没有 s_ 简版形态。实测只有 sh/sz/bj 的 A 股代码有。"""
+        code = (code or "").lower()
+        if any(code.startswith(prefix) for prefix in NOSIMPLE_PREFIXES):
+            return False
+        return any(code.startswith(prefix) for prefix in SIMPLE_PREFIXES)
 
     def __init__(self, base_url=DEFAULT_SINA_URL, timeout=15.0, insecure=False,
                  retries=2):
@@ -1225,10 +1288,12 @@ class SinaQuotes:
     def build_url(self, codes, simple=True):
         """构造请求 URL。simple=True 是简版为主 + 每个标的捎带完整版，False 是纯完整版。
 
-        两种模式都带全部代码的完整版，区别只在前面那一段 s_ 简版 —— 也就是
+        只有 supports_simple 的代码才加 s_ 前缀：int_ 之类实测 s_ 恒为空串，加了
+        纯浪费。两种模式都带全部代码的完整版，区别只在前面那一段 s_ 简版 —— 也就是
         「简版全废时回退纯完整版」这条退路必须保留：回退请求里绝不能再出现 s_。
         """
-        request = (["s_" + code for code in codes] if simple else []) + list(codes)
+        simple_codes = [code for code in codes if self.supports_simple(code)]
+        request = (["s_" + code for code in simple_codes] if simple else []) + list(codes)
         return make_sina_url(self.base_url, request)
 
     def fetch(self, symbols):
@@ -1240,6 +1305,10 @@ class SinaQuotes:
     def fetch_quotes(self, symbols):
         """同 fetch，但返回带中文名/点位/涨跌额的 SinaQuote，供排障工具打印。"""
         codes = [self.normalize(symbol) for symbol in symbols]
+        # 全员不支持简版（如纯 int_ 列表）时直接走纯完整版形态：那一轮简版必然
+        # 「无有效行情」，走回退只是白跑一倍请求 + 一屏重试噪音。
+        if not any(self.supports_simple(code) for code in codes):
+            return self._require_quotes(*self._fetch_once(codes, self.build_url(codes, False)))
         quotes, data_date = self._fetch_once(codes, self.build_url(codes, True))
         if not quotes:
             # 简版接口行为变了或混用被拒：退回今天这套纯完整版，别让整条链路挂掉。
@@ -1247,6 +1316,10 @@ class SinaQuotes:
             quotes, fallback_date = self._fetch_once(
                 codes, self.build_url(codes, False))
             data_date = data_date or fallback_date
+        return self._require_quotes(quotes, data_date)
+
+    @staticmethod
+    def _require_quotes(quotes, data_date):
         if not quotes:
             raise RuntimeError("Response error: 未解析到有效行情")
         return quotes, data_date
@@ -1353,7 +1426,7 @@ class SinaQuotes:
     def _parse_quote(key, data_str):
         """解析一行 → (SinaQuote, 跳过原因)。
 
-        布局**按 key 是不是带 s_ 前缀分流，不按字段数** —— 完整版的指数和个股是
+        布局**按 key 带什么前缀分流，不按字段数** —— 完整版的指数和个股是
         同一套布局（沪市 34 字段 / 深市 33 字段，尾部多一个空字段），按字段数
         分「个股 vs 指数」会把指数误判成个股，只是下面那个公式对两者都成立，
         才碰巧没出错：
@@ -1362,7 +1435,16 @@ class SinaQuotes:
           fields[3] **直接就是涨跌幅百分比**，不用自己除。开盘前深市指数
           （创业板指/国证2000/深证成指）点位就是 0.00，所以只能拿 fields[3]
           当有效性门槛，点位 0 是合法值。
-        - 完整版（key 不带 s_）：fields[2]=昨收、fields[3]=最新价/最新点位，
+        - 无简版（key 带 int_/hk/hf_ 等海外前缀）**4 字段**：名称,现价,涨跌额,
+          涨跌幅%。实测 ``int_nikkei`` 4 字段（44946.64,-408.35,-0.90）而
+          ``s_int_nikkei`` 返回空串 —— 这类标的没有 s_ 简版形态，涨跌幅同样是
+          fields[3] 直接给的（恒生是 3 位小数 -0.600，交给 round_change 归一到
+          2 位）。**不要**对它套 A 股完整版的 (f[3]−f[2])/f[2] 公式：那里
+          fields[2] 是昨收，这里是涨跌额，套上去会算出 +0.02% 这种看着像样的
+          垃圾。有效性只认 fields[3] 是有限数（名称非空已在入口判过），
+          因为它没有 fields[30] 的行情日期 —— 不参与日期投票，节假日兜底只
+          对 A 股代码有效。
+        - 完整版（key 不带上述前缀）：fields[2]=昨收、fields[3]=最新价/最新点位，
           涨跌幅 = (fields[3]−fields[2])/fields[2]（个股与指数同一公式）；
           fields[30]=行情日期、fields[31]=行情时间，sh/sz 下位置一致。开盘前
           fields[3] 为 0 会算出 −100%，所以这里保留昨收/现价 > 0 的守卫。
@@ -1378,6 +1460,15 @@ class SinaQuotes:
                 change_amount = _quote_field(fields, 2)
                 percent = _quote_field(fields, 3)   # 简版涨跌幅已是百分比
                 date = ""
+            elif any(key.startswith(prefix) for prefix in NOSIMPLE_PREFIXES):
+                # 无简版形态（int_ 海外指数等）：4 字段，涨跌幅同为 fields[3] 直给。
+                if len(fields) <= 3:
+                    return None, ("无简版形态字段不足（需要 名称,现价,涨跌额,"
+                                  "涨跌幅%% 四项）")
+                point = _quote_field(fields, 1)
+                change_amount = _quote_field(fields, 2)
+                percent = _quote_field(fields, 3)
+                date = ""                        # 该形态没有行情日期字段
             else:
                 if len(fields) <= 3:
                     return None, "完整版字段不足（读不到 fields[2]/fields[3]）"
@@ -1555,6 +1646,11 @@ def validate_args(args):
         return device_base, [], {}, MARKET_WINDOWS, str(ex)
     try:
         aliases = parse_symbol_names(symbols, args.symbol_names)
+    except ValueError as ex:
+        return device_base, symbols, {}, MARKET_WINDOWS, str(ex)
+    try:
+        # 交叉校验必须排在上面两步之后：不知道有哪些代码、哪些简称就没法判。
+        require_aliases_for_long_codes(symbols, aliases)
     except ValueError as ex:
         return device_base, symbols, {}, MARKET_WINDOWS, str(ex)
     try:
@@ -1740,7 +1836,8 @@ def self_test():
                       market_open="09:20", market_close="15:30",
                       sleep_keepalive=600, loop=False, dry_run=False,
                       check=False, demo=True, self_test=False,
-                      no_quota_bars=False, verbose=False)
+                      no_quota_bars=False, verbose=False,
+                      symbol_names="", stock_dry_run=False)
         values.update(changes)
         return argparse.Namespace(**values)
     
@@ -1783,6 +1880,14 @@ def self_test():
             raise AssertionError(name)
         results.append(name)
         print("[PASS] %02d %s" % (len(results), name))
+
+    def _raised(fn):
+        """跑 fn 并返回它的 ValueError 文本；没抛则返回 ""。"""
+        try:
+            fn()
+        except ValueError as ex:
+            return str(ex)
+        return ""
     
     def bj_epoch(hour, minute=0, second=0, day=1):
         """北京时间 → epoch（beijing_time_at 的逆运算，不依赖本机 TZ）。"""
@@ -2255,6 +2360,88 @@ def self_test():
        set(request) == set(["s_" + code for code in five] + list(five)) and
        all(request.count(code) == 1 and request.count("s_" + code) == 1
            for code in five))
+
+    # 42~46 海外指数（int_ 前缀）：4 字段、无简版、无日期。
+    def int_line(key, data):
+        return 'var hq_str_%s="%s";' % (key, data)
+
+    # 42. int_ 4 字段：涨跌幅就是 fields[3]，3 位小数归一到 2 位（恒生 -0.600）。
+    quotes, date = client._parse("\n".join([
+        int_line("int_nikkei", "日经指数,44946.64,-408.35,-0.90"),
+        int_line("int_hangseng", "恒生指数,24736.95,-148.42,-0.600"),
+    ]), ["int_nikkei", "int_hangseng"])
+    ok("int_ 四字段涨跌幅直给且 3 位小数归一",
+       [q.code for q in quotes] == ["int_nikkei", "int_hangseng"] and
+       quotes[0].percent == -0.9 and quotes[0].point == 44946.64 and
+       quotes[0].change_amount == -408.35 and quotes[1].percent == -0.6 and
+       date is None)
+
+    # 43. int_ 不贡献日期：只有 int_ 行时 data_date 是 None（节假日兜底只对 A 股有效）。
+    _, date = client._parse(
+        int_line("int_nikkei", "日经指数,44946.64,-408.35,-0.90"), ["int_nikkei"])
+    ok("int_ 行不贡献行情日期", date is None)
+
+    # 44. 纯 int_ 列表：URL 里没有 s_int_，且**只请求一轮**（不回退）。
+    class _IntOnly(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, "\n".join([
+                int_line("int_nikkei", "日经指数,44946.64,-408.35,-0.90"),
+                int_line("int_dji", "道琼斯,41200.00,-150.00,-0.36"),
+            ])
+
+    int_only = _IntOnly()
+    rows, date = int_only.fetch(["int_nikkei", "int_dji"])
+    ok("纯 int_ 列表不发简版且只请求一轮",
+       len(int_only.seen_urls) == 1 and "s_int_" not in int_only.seen_urls[0] and
+       int_only.seen_urls[0].split("list=")[1] == "int_nikkei,int_dji" and
+       rows == [{"name": "int_nikkei", "change": -0.9},
+                {"name": "int_dji", "change": -0.36}] and date is None)
+
+    # 45. 混合列表（2 A 股 + 1 int_）：单请求混用、行序等于请求序、A 股取简版值。
+    class _Mixed(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, "\n".join([
+                simple_line("sh000300", "沪深300,4340.5791,-0.1759,1.23,0,0"),
+                int_line("int_nikkei", "日经指数,44946.64,-408.35,-0.90"),
+                simple_line("sz399006", "创业板指,0.00,0.000,0.00,0,0"),
+                full_line("sh000300", "沪深300", 4341.42, 4340.5791),
+            ])
+
+    mixed = _Mixed()
+    rows, date = mixed.fetch(["sh000300", "int_nikkei", "sz399006"])
+    ok("A 股与 int_ 混用单请求且行序不乱",
+       len(mixed.seen_urls) == 1 and
+       mixed.seen_urls[0].split("list=")[1] ==
+       "s_sh000300,s_sz399006,sh000300,int_nikkei,sz399006" and
+       rows == [{"name": "sh000300", "change": 1.23},
+                {"name": "int_nikkei", "change": -0.9},
+                {"name": "sz399006", "change": 0.0}] and date == "2026-09-29")
+
+    # 46. 代码长度：>9 字节必须有简称（交叉校验在 validate_args 层，不联网）。
+    long_args = args_for(symbols="int_nikkei", symbol_names="NIKKEI",
+                         device="x", device_token="y")
+    _base, long_symbols, long_aliases, _w, long_error = validate_args(long_args)
+    ok("10 字节代码配了简称即通过", long_error == "" and
+       long_symbols == ["int_nikkei"] and long_aliases == {"int_nikkei": "NIKKEI"})
+    _base, _s, _a, _w, missing_error = validate_args(
+        args_for(symbols="int_nikkei", symbol_names="", device="x",
+                 device_token="y"))
+    ok("10 字节代码无简称报错并说明因果",
+       "int_nikkei" in missing_error and "9 字节上限" in missing_error and
+       "1..16 字节" in missing_error and "简称" in missing_error)
+    # 17 字节仍然超出语法上限（长度校验本身没被放宽）。
+    ok("超过 16 字节的代码仍被语法校验拦下",
+       "1..16 字节" in str(_raised(lambda: parse_symbols("int_abcdefghijklmnopq"))))
 
     print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     

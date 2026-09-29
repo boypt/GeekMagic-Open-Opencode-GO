@@ -89,11 +89,31 @@ hf_NQ 30507.430 / 昨收 30566.250 → −0.19%。f[12] 的日期**故意不参�
 （日期投票之外都用它）：hf_NQ / hf_ES / hf_YM / hf_CL / hf_HSI / hf_CHA50CFD
 都是 15 字段，hf_XAU 是 14。
 
-**港股 ``hk*``（hk00700 等）本轮显式不支持**：实测 19 字段，f[0]=英文名
-f[1]=中文名 f[17]=日期（**斜杠格式** 2026/09/29，与 A 股不同）f[18]=时间 ——
-字段数、名称位置、日期格式都和上面四种都不同，套任何一种都会误算。所以它在
-形态分流的**最前面**被拦下，给出「hk_ 形态暂不支持」的跳过原因，绝不放行到
-int_ 的 4 字段分支。以后要接就新加一条形态分支。
+港股是**第五种形态**（``hk`` 前缀，如 hkHSI/hk00700/hk09988/hkHSCEI）::
+
+    hkHSI  19 字段 [0]英文名 [1]中文名 [2]今开 [3]昨收 [4]最高 [5]最低 [6]现价
+                     [7]涨跌额 [8]涨跌幅% [9]买价 [10]卖价 [11]成交量 [12]成交额
+                     [15]52周高 [16]52周低 [17]日期(斜杠) [18]时间
+
+f[8] 是**现成的涨跌幅百分比，不要自算**（与 hf_ 相反）：算术自校验 hkHSI 的
+(f[6]−f[3])/f[3] = −0.5487%，与 f[8]=−0.549 吻合。有效性只认 f[0] 非空 + f[8]
+可解析，**不拿现价 f[6] 当门槛** —— 同「开盘前深市指数点位 0 是合法值」那条原则，
+盘前/停牌时价格可能是 0 而涨跌幅字段仍是有效值。名称取 f[1] 中文名（只进日志，
+不上屏；f[0] 是 ASCII 英文名，以后想让英文名直接上屏可用它），取不到也**不丢行**。
+没有 ``s_`` 简版。f[17] 的日期是**斜杠格式** 2026/09/29，且**故意不参与日期投票**
+（见下）。
+
+**日期投票只认 A 股完整版口径**（``fields[30]`` 的 YYYY-MM-DD），``int_`` / ``hf_``
+/ ``hk*`` 三种非 A 股形态一律把 date 填 ``""``。理由是双重的：① 交易日历不同 ——
+外盘期货在 A 股节假日照常交易、港股也有自己的假期，混进投票会把节假日/非交易日
+误判成开市；② 格式不同 —— 港股的 2026/09/29 和 A 股的 2026-09-29 混进同一个
+``max()`` 会按字符串序比错。所以纯非 A 股列表的 data_date 是 None。
+
+**已知但未支持**（UNSUPPORTED_PREFIXES）：``rt_`` 延时行情 —— 实测 ``rt_hkHSI``
+是 **25 字段**，位置 0..18 与 ``hk*`` 完全一致、尾部多 6 个空字段，但**语义**是
+延时行情而不是实时。它会在形态分流的**最前面**被前缀名单拦下，给出「rt_ 延时行情
+形态暂不支持」的跳过原因：按字段数判形态挡不住它（25 字段照样能读出 f[8]），放行
+就会静默拿延时价当实时价上屏。
 
 **代码大小写是非对称的，别「顺手统一成一种」** —— 实测::
 
@@ -179,16 +199,17 @@ MAX_SYMBOL_BYTES = 16
 # 恒为空串（海外指数没有简版形态），hk*/hf_* 同理。不按「看起来像不像 A 股」外推，
 # 只有这一条是实测过的。判定一律走 code.lower()（见 normalize_symbol）。
 SIMPLE_PREFIXES = ("sh", "sz", "bj")
-# 无 s_ 简版的形态：int_ 海外指数是 4 字段，hf_ 外盘期货是 15/14 字段，两者都**没有
-# A 股那种可投票的行情日期**，不参与日期投票。
-NOSIMPLE_PREFIXES = ("int_", "hf_")
+# 无 s_ 简版的形态：int_ 海外指数是 4 字段，hf_ 外盘期货是 15/14 字段，hk* 港股是
+# 19 字段，三者都**没有 A 股那种可投票的行情日期**，不参与日期投票。
+NOSIMPLE_PREFIXES = ("int_", "hf_", "hk")
 # 已知存在但本轮**不实现**的形态，命中即给中文原因跳过，绝不放行到别的分支里被误算。
-# hk*（港股）实测 19 字段：f[0]=英文名 f[1]=中文名 f[17]=日期 **斜杠格式** 2026/09/29
-# f[18]=时间 —— 字段数、名称位置、日期格式都和 s_ 简版 / A 股完整版 / int_ / hf_ 四种
-# 都不一样，套任何一种都会算出看着像样的垃圾。要接的话在这里换成一个新分支。
-UNSUPPORTED_PREFIXES = ("hk",)
+# rt_* 是新浪的**延时行情**：实测 rt_hkHSI 有 25 字段，位置 0..18 与 hk* 完全一致、
+# 尾部多 6 个空字段，**语义**却不是同一回事（延时）。本轮不做：25 字段能按 hk 的
+# 下标读出 f[8]，所以绝不能靠「字段数」把它挡在门外，只能靠这里的**前缀名单**在形态
+# 分流最前面拦下 —— 放行就会静默地拿延时价当实时价上屏。
+UNSUPPORTED_PREFIXES = ("rt",)
 UNSUPPORTED_REASONS = {
-    "hk": "hk_ 形态暂不支持（港股 19 字段、日期是斜杠格式，与其余四种形态都不同）",
+    "rt": "rt_ 延时行情形态暂不支持（实测 25 字段，位置同 hk* 但语义是延时行情）",
 }
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 SINA_REFERER = "https://finance.sina.com.cn"
@@ -1309,28 +1330,35 @@ def _quote_field(fields, index):
 
 
 class SinaQuotes:
-    """新浪行情客户端：按 key 前缀分四条形态，一次请求混写。
+    """新浪行情客户端：按 key 前缀分**五种形态**，一次请求混写。
 
     - 简版（``s_<code>``，仅 SIMPLE_PREFIXES 支持）6 字段，只要涨跌幅，正是设备要的
-    - 完整版（``<code>``，A 股裸代码）多一个日期字段，节假日/停市兜底判定靠它
+    - 完整版（``<code>``，A 股裸代码）多一个日期字段，节假日/停市兜底判定靠它 ——
+      **五种形态里只有它参与日期投票**
     - **海外指数**（``int_`` 前缀，实测 ``s_int_nikkei`` 恒为空串，即无简版形态）
       只有 4 字段：名称,现价,涨跌额,涨跌幅% —— fields[3] 同样是直接给的百分比
     - **外盘期货**（``hf_`` 前缀，如 ``hf_NQ``/``hf_ES``/``hf_XAU``）15 字段
       （``hf_XAU`` 实测 14，尾部少一个）：[0]现价 [7]昨收 [12]日期 [13]中文名。
       **没有现成涨跌幅**，自己算 (f[0]−f[7])/f[7]*100；f[12] 的日期**不参与**
-      A 股日期投票（外盘在 A 股节假日照常交易，混进投票会把节假日误判成开市）
-    - **港股 ``hk*`` 本轮显式不支持**（实测 19 字段、日期是斜杠格式，与上面四种都
-      不同），命中就给中文原因跳过，绝不放行到 int_ 的 4 字段分支被误算
-    - **大小写非对称，别统一**（实测 ``SH000300``/``hf_nq`` 都是空串，只有
-      ``sh000300``/``hf_NQ`` 有数据）：A 股代码转小写，其余形态原样保大小写 ——
-      见 normalize_symbol。判定/归并用小写副本，**请求 URL 用保大小写的代码**。
+      日期投票（外盘在 A 股节假日照常交易，混进投票会把节假日误判成开市）
+    - **港股**（``hk*`` 前缀，如 ``hkHSI``/``hk00700``/``hk09988``）19 字段：
+      [0]英文名 [1]中文名 [6]现价 [7]涨跌额 **[8]涨跌幅% 直给** [17]日期(斜杠)
+      [18]时间。f[8] 与 int_ 的 f[3] 一样是现成百分比，**不要自算**（hf_ 才要）。
+      有效性只认 f[0] 非空 + f[8] 可解析，**不拿现价当门槛**（盘前价格 0 合法）。
+      f[17] 的斜杠格式日期**不参与**日期投票（见 _parse_quote 的注释）
+    - **已知未支持**（UNSUPPORTED_PREFIXES）：``rt_`` 延时行情（实测 25 字段，
+      位置同 hk* 但语义是延时），命中就给中文原因跳过，绝不放行到别的分支
+    - **大小写非对称，别统一**（实测 ``SH000300``/``hf_nq``/``hsi`` 都是空串，
+      只有 ``sh000300``/``hf_NQ``/``hkHSI`` 有数据）：A 股代码转小写，其余形态
+      原样保大小写 —— 见 normalize_symbol。判定/归并用小写副本，**请求 URL 用
+      保大小写的代码**。
     - 一个 URL 里混着写（``list=s_sh000300,sh000300`` 实测两行都返回），所以每拍
       只发一次请求：**每个标的都同时捎带完整版**，多出来的行只用来投票日期
     - 「哪些前缀支持简版」按 SIMPLE_PREFIXES 判断，依据是**逐个实测**（见常量处
       注释），不外推。列表里**没有任何**支持简版的代码时直接走纯完整版形态，
       不做「简版 → 回退」两轮 dance —— 那种情况下简版必然全废，白跑一倍请求、
       每拍刷一堆重试噪音。
-    - 行情日期取**所有完整版行里最新的那一天**，不是第一个：停牌标的会报陈旧
+    - 行情日期取**所有 A 股完整版行里最新的那一天**，不是第一个：停牌标的会报陈旧
       日期（实测某标的报 7 天前而其余都是今天），只信一个会把正常交易日误判
       成休市。节假日时所有标的都报上一交易日，max 仍是那天 ≠ 今天，判定不变。
     """
@@ -1468,6 +1496,10 @@ class SinaQuotes:
                 else:
                     full[quote.code.lower()] = quote
                     if quote.date:
+                        # **只有 A 股完整版口径的日期会走到这里**（_parse_quote 的
+                        # else 分支）：int_ / hf_ / hk* 三种非 A 股形态一律把 date
+                        # 填成 ""，所以永远不参与投票。理由见各自分支的注释 ——
+                        # 交易日历不同 + 港股是斜杠日期格式，混进 max() 会误判。
                         # YYYY-MM-DD 字典序即时间序，直接取 max。
                         dates.append(quote.date)
             elif low.startswith("s_") or bare in wanted:
@@ -1541,13 +1573,25 @@ class SinaQuotes:
           A 股日期投票**：外盘期货在 A 股节假日照常交易，混进投票会让节假日被
           误判成开市。名称取 f[13]（中文，只进日志/--stock-dry-run）；取不到也
           **不丢行** —— 有效性只认 f[0] 现价与 f[7] 昨收，名字对设备毫无用处。
-        - 港股（key 带 hk）**本轮显式不支持**：实测 19 字段且日期是斜杠格式
-          （f[17]='2026/09/29'），与上面四种都不同。必须在这里拦下，绝不能让它
-          落进 int_ 的 4 字段分支把别的数字当涨跌幅。
-        - 完整版（key 不带上述前缀）：fields[2]=昨收、fields[3]=最新价/最新点位，
-          涨跌幅 = (fields[3]−fields[2])/fields[2]（个股与指数同一公式）；
-          fields[30]=行情日期、fields[31]=行情时间，sh/sz 下位置一致。开盘前
-          fields[3] 为 0 会算出 −100%，所以这里保留昨收/现价 > 0 的守卫。
+        - 港股（key 带 hk，实测 19 字段，如 hkHSI/hk00700/hk09988/hkHSCEI）：
+          [0]英文名(ASCII) [1]中文名 [2]今开 [3]昨收 [4]最高 [5]最低 [6]现价
+          [7]涨跌额 **[8]涨跌幅%（直给，不需自算）** [9]买价 [10]卖价 [11]成交量
+          [12]成交额 [13]? [14]? [15]52周最高 [16]52周最低 [17]日期 f[18]时间。
+          算术自校验：(f[6]−f[3])/f[3] = (24507.299−24642.510)/24642.510 = −0.5487%
+          与 f[8]=−0.549 吻合，所以 f[8] 就是现成百分比（**与 hf_ 相反**：hf_ 必须
+          自算，hk* 绝不能自算）。有效性只认 f[0] 非空 + f[8] 可解析，**不拿现价
+          f[6] 当门槛**（盘前/停牌价格可能是 0，同「开盘前深市指数点位 0 是合法值」）。
+          名称取 f[1] 中文名（只进日志/--stock-dry-run；f[0] 是 ASCII 英文名，以想
+          直接上屏可用它），取不到也**不丢行**。f[17] 的日期是**斜杠格式**
+          '2026/09/29' 且**故意不参与日期投票**（交易日历不同 + 格式不同）。
+          注意这里**不按字段数判形态**：只要能读到 f[8] 就按 hk 解析，`rt_` 延时
+          行情（25 字段、位置同 hk*）由 UNSUPPORTED_PREFIXES 在更早一步拦下。
+        - **已知未支持**：`rt_` 延时行情（UNSUPPORTED_PREFIXES，见常量处注释）。
+        - 完整版（key 不带上述前缀，**唯一参与日期投票的形态**）：fields[2]=昨收、
+          fields[3]=最新价/最新点位，涨跌幅 = (fields[3]−fields[2])/fields[2]
+          （个股与指数同一公式）；fields[30]=行情日期、fields[31]=行情时间，
+          sh/sz 下位置一致。开盘前 fields[3] 为 0 会算出 −100%，所以这里保留
+          昨收/现价 > 0 的守卫。
         """
         fields = (data_str or "").split(",")
         name = fields[0].strip() if fields else ""
@@ -1591,6 +1635,31 @@ class SinaQuotes:
                 # f[13] 是中文名，取不到也**不因此丢行**（只进日志，不上屏）。
                 if len(fields) > 13 and fields[13].strip():
                     name = fields[13].strip()
+            elif low.startswith("hk"):
+                # 港股 19 字段：涨跌幅是 f[8] **直给的百分比**，不需自算（与 hf_ 相反）。
+                # 算术自校验 hkHSI：(f[6]−f[3])/f[3] = −0.5487% 与 f[8]=−0.549 吻合。
+                # 有效性只认 f[0] 英文名（身份标识）非空 + f[8] 能解析成有限数；**不要**
+                # 拿现价 f[6] 当门槛 —— 与「开盘前深市指数点位 0 是合法值」同一条原则，
+                # 盘前/停牌时价格可能是 0 而涨跌幅字段仍是有效值。
+                if len(fields) <= 8:
+                    return None, "hk_ 形态字段不足（需要 英文名,涨跌幅% 两项）"
+                percent = _quote_field(fields, 8)
+                # f[0] 已是英文名（进 name 变量，f[1] 中文名取到才覆盖，只进日志不上屏）。
+                # 以后若想让英文名直接上屏，取 f[0] 即可 —— 它是 ASCII（设备端要求）。
+                if len(fields) > 1 and fields[1].strip():
+                    name = fields[1].strip()
+                # f[6] 现价 / f[7] 涨跌额只做日志用（--stock-dry-run 打印），取不到记 0。
+                try:
+                    point = _quote_field(fields, 6)
+                    change_amount = _quote_field(fields, 7)
+                except (IndexError, ValueError):
+                    point = 0.0
+                    change_amount = 0.0
+                # f[17] 的日期（'2026/09/29' 斜杠格式）**故意填 "" 不参与日期投票**，
+                # 两条理由：① 港股与 A 股交易日历不同（各有各的假期），拿港股日期参与
+                #    「今天是不是交易日」会误判；② 斜杠格式和 A 股的 '2026-09-29' 混进
+                #    同一个 max() 会按字符串序比错。日期投票只认 A 股完整版口径。
+                date = ""
             else:
                 if len(fields) <= 3:
                     return None, "完整版字段不足（读不到 fields[2]/fields[3]）"
@@ -2659,33 +2728,35 @@ def self_test():
        rows == [{"name": "hf_NQ", "change": -0.19},
                 {"name": "hf_ES", "change": -0.24}] and date is None)
 
-    # 54. hk* 显式不支持：给中文原因、不产出行、**不能**被当 4 字段算出涨跌幅。
-    #     真实 hk00700 是 19 字段，套 int_ 的 f[3] 会把 403.000 当成 403%。
-    hk_raw = ('var hq_str_hk00700="TENCENT,腾讯控股,402.000,400.000,403.000,'
-              '399.000,401.500,12345678,888888.000,1.250,0.30,0.00,0.00,'
-              '2026/09/29,16:08:00";')
-    quotes, date = client._parse(hk_raw, ["hk00700"])
-    _, hk_reason = client._parse_quote("hk00700", hk_raw[15:-2])
-    ok("hk_ 形态显式不支持且不误算",
+    # 54. rt_ 延时行情显式不支持：给中文原因、不产出行、**不能**被当 hk* 算出涨跌幅。
+    #     真实 rt_hkHSI 是 25 字段（位置 0..18 同 hk*，尾部多 6 个空字段），能读出
+    #     f[8]=−0.549，所以只能靠前缀名单拦，放行就是静默拿延时价当实时价上屏。
+    rt_raw = ('var hq_str_rt_hkHSI="HSI,恒生指数,24648.640,24642.510,24648.640,'
+              '24479.610,24507.299,-135.211,-0.549,0.00000,0.00000,53762078,'
+              '3320140923,0.000,0.000,28056.100,22518.000,2026/09/29,10:23,'
+              ',,,,,,";')
+    quotes, date = client._parse(rt_raw, ["rt_hkHSI"])
+    _, rt_reason = client._parse_quote("rt_hkHSI", rt_raw[16:-2])
+    ok("rt_ 延时行情暂不支持且不误算",
        quotes == [] and date is None and
-       "hk_ 形态暂不支持" in hk_reason and
+       "rt_ 延时行情形态暂不支持" in rt_reason and
        # 关键语义：既不产出行，也绝不会「算出一个数」出来
        not any(isinstance(item, float) for item in quotes))
 
-    class _HkOnly(SinaQuotes):
+    class _RtOnly(SinaQuotes):
         def __init__(self):
             super().__init__(retries=0)
             self.seen_urls = []
 
         def _transport(self, url):
             self.seen_urls.append(url)
-            return 200, hk_raw
+            return 200, rt_raw
 
-    hk_only = _HkOnly()
-    hk_error, hk_log = _fetch_failure(hk_only, ["hk00700"])
-    ok("hk_ 请求整拍失败并说明原因",
-       len(hk_only.seen_urls) == 1 and "未解析到有效行情" in hk_error and
-       "hk00700" in hk_log and "hk_ 形态暂不支持" in hk_log)
+    rt_only = _RtOnly()
+    rt_error, rt_log = _fetch_failure(rt_only, ["rt_hkHSI"])
+    ok("rt_ 请求整拍失败并说明原因",
+       len(rt_only.seen_urls) == 1 and "未解析到有效行情" in rt_error and
+       "rt_hkHSI" in rt_log and "rt_ 延时行情形态暂不支持" in rt_log)
 
     # 55. 用户把外盘代码写全小写（hf_nq）：新浪返回空串 → 整拍失败，且日志里能看到
     #     是哪个代码。这正是「外盘必须保大小写」这条规则的代价。
@@ -2722,6 +2793,101 @@ def self_test():
        ["sh000300", "hf_NQ", "int_nikkei"] and
        validate_args(args_for(symbols="SH000300", symbol_names="CSI300",
                               device="x", device_token="y"))[1] == ["sh000300"])
+
+    # 58~64 港股 hk*（第五种形态，19 字段）。全部离线，用实测的字段布局。
+    def hk_line(key, fields):
+        return 'var hq_str_%s="%s";' % (key, ",".join(fields))
+
+    def hk_quote(percent, open_="24648.640", previous_close="24642.510",
+                 high="24648.640", low="24479.610", price="24507.299",
+                 change="-135.211", date_text="2026/09/29", time_text="10:23",
+                 name="恒生指数", en="HSI"):
+        """hk* 19 字段样本。实测布局见 _parse_quote 的 docstring。
+
+        刻意把 price/previous_close 做成可改参数：59 号断言要靠「改了现价与昨收、
+        f[8] 不变」锁死「涨跌幅取 f[8] 而不是自算」这条。
+        """
+        return [en, name, open_, previous_close, high, low, price, change,
+                percent, "0.00000", "0.00000", "53762078", "3320140923",
+                "0.000", "0.000", "28056.100", "22518.000", date_text, time_text]
+
+    # 58. hk* 19 字段：涨跌幅就是 f[8] 直给（-0.549 归一到 -0.55），名称取 f[1]。
+    quotes, date = client._parse(
+        hk_line("hkHSI", hk_quote("-0.549")), ["hkHSI"])
+    ok("hk_ 十九字段涨跌幅取 f[8] 直给并归一",
+       len(quotes) == 1 and quotes[0].code == "hkHSI" and
+       quotes[0].percent == -0.55 and quotes[0].name == "恒生指数" and
+       quotes[0].point == 24507.299 and quotes[0].change_amount == -135.211 and
+       date is None)
+
+    # 59. **绝不自算**：把 f[6] 现价与 f[3] 昨收改成会算出 +99% 的组合，f[8] 不动。
+    #     若代码哪天改成 (f[6]−f[3])/f[3]，这里立刻从 -0.55 变成 99.0。
+    quotes = client._parse(
+        hk_line("hkHSI", hk_quote("-0.549", previous_close="200.000",
+                                 price="398.000", change="198.000")),
+        ["hkHSI"])[0]
+    ok("hk_ 涨跌幅只认 f[8] 不自算（改现价昨收结果不变）",
+       len(quotes) == 1 and quotes[0].percent == -0.55)
+
+    # 60. hk* 的 f[17] 不参与日期投票：只有 hk* 行时 data_date 是 None。
+    _, date = client._parse(
+        hk_line("hkHSI", hk_quote("-0.549", date_text="2026/09/29")), ["hkHSI"])
+    ok("hk_ 行不贡献行情日期（斜杠格式不投票）", date is None)
+
+    # 61. 混合投票隔离：A 股完整版（有日期）+ int_ + hf_ + hk*（后三者都带各自格式的
+    #     日期字段）→ data_date **只**等于 A 股那行的日期。
+    _, date = client._parse("\n".join([
+        full_line("sh000300", "沪深300", 4341.42, 4340.5791, today_text),
+        int_line("int_nikkei", "日经指数,44946.64,-408.35,-0.90"),
+        hf_line("hf_NQ", hf_quote(30507.430, 30566.250, date_text=stale_text)),
+        hk_line("hkHSI", hk_quote("-0.549", date_text="2026/09/29")),
+    ]), ["sh000300", "int_nikkei", "hf_NQ", "hkHSI"])
+    ok("日期投票只取 A 股行（int_/hf_/hk_ 都被隔离）",
+       date == today_text and date != stale_text)
+
+    # 62. 纯 hk* 列表：单请求、URL 里无 s_（实测 s_hkHSI 恒为空串）、出行。
+    class _HkRows(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            return 200, "\n".join([
+                hk_line("hkHSI", hk_quote("-0.549")),
+                hk_line("hk00700", hk_quote("1.250", en="TENCENT", name="腾讯控股",
+                                            price="401.500",
+                                            previous_close="400.000",
+                                            change="12345678")),
+            ])
+
+    hk_rows = _HkRows()
+    rows, date = hk_rows.fetch(["hkHSI", "hk00700"])
+    ok("纯 hk_ 列表单请求出行且无 s_ 简版",
+       len(hk_rows.seen_urls) == 1 and
+       hk_rows.seen_urls[0].split("list=")[1] == "hkHSI,hk00700" and
+       "s_" not in hk_rows.seen_urls[0] and
+       rows == [{"name": "hkHSI", "change": -0.55},
+                {"name": "hk00700", "change": 1.25}] and date is None)
+
+    # 63. 盘前/停牌价格 0 仍出行：**不拿现价 f[6] 当有效性门槛**（同「开盘前深市指数
+    #     点位 0 是合法值」），只认 f[0] 非空 + f[8] 可解析。
+    pre_market = client._parse(
+        hk_line("hk00700", hk_quote("0.000", en="TENCENT", name="腾讯控股",
+                                    price="0.000", previous_close="400.000",
+                                    change="0.000")),
+        ["hk00700"])[0]
+    ok("hk_ 盘前现价 0 仍出行",
+       len(pre_market) == 1 and pre_market[0].percent == 0.0)
+
+    # 64. 大小写：hkHSI 归一后**保大小写**（实测 hsi / hk_hsi 都是空串），且不加
+    #     s_ 简版前缀 —— 这正是 normalize_symbol 那条非对称规则的另一半。
+    ok("hk_ 保大小写且不加 s_ 简版",
+       normalize_symbol("hkHSI") == "hkHSI" and
+       parse_symbols("hkHSI,hk00700") == ["hkHSI", "hk00700"] and
+       not SinaQuotes.supports_simple("hkHSI") and
+       "list=hkHSI" in SinaQuotes().build_url(["hkHSI"], True) and
+       "s_hkHSI" not in SinaQuotes().build_url(["hkHSI"], True))
 
     print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     

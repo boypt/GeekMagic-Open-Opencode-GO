@@ -56,8 +56,10 @@ MARKET_OPEN / MARKET_CLOSE）覆盖。两点不变式：
 ``名称,点位,涨跌额,涨跌幅%,成交量,成交额``，**fields[3] 直接就是涨跌幅百分比**，
 不用自己除，正好是设备唯一要的量；而完整版多一个 ``fields[30]`` 的行情日期，是
 节假日/停市的兜底判定（日期≠今天）唯一的来源。两者可以混写在同一个 list= 里（实测
-``s_sh000300,sh000300`` 两行都返回），所以每拍只发一次请求：全部标的走简版，
-再捎带第一个标的的完整版拿日期。写 ``--symbols`` 时可以带 ``s_`` 前缀，取数层
+``s_sh000300,sh000300`` 两行都返回），所以每拍只发一次请求：每个标的既走简版、
+也捎带完整版（多出来的完整版行只贡献日期、不再出行）。日期取所有完整版行里**最新
+的一天**而不是第一个 —— 停牌标的会报陈旧日期，只信一个会把正常交易日误判成休市；
+节假日时全员同日，max 不改变结论。写 ``--symbols`` 时可以带 ``s_`` 前缀，取数层
 会剥掉。
 
 **布局按 key 带不带 s_ 前缀分流，不按字段数。** 完整版的指数和个股是同一套布局
@@ -1199,7 +1201,10 @@ class SinaQuotes:
     - 简版（s_<code>）6 字段，只要涨跌幅，正是设备要的
     - 完整版（<code>）多一个日期字段，节假日/停市兜底判定（行情日期≠今天）靠它
     - 一个 URL 里混着写（list=s_sh000300,sh000300 实测两行都返回），所以每拍
-      只发一次请求：全部标的走简版 + 第一个标的再带一次完整版拿日期
+      只发一次请求：**每个标的都同时捎带完整版**，多出来的行只用来投票日期
+    - 行情日期取**所有完整版行里最新的那一天**，不是第一个：停牌标的会报陈旧
+      日期（实测某标的报 7 天前而其余都是今天），只信一个会把正常交易日误判
+      成休市。节假日时所有标的都报上一交易日，max 仍是那天 ≠ 今天，判定不变。
     """
 
     def __init__(self, base_url=DEFAULT_SINA_URL, timeout=15.0, insecure=False,
@@ -1218,8 +1223,12 @@ class SinaQuotes:
         return code[2:] if code.startswith("s_") else code
 
     def build_url(self, codes, simple=True):
-        """构造请求 URL。simple=True 是简版为主 + 完整版探针，False 是纯完整版。"""
-        request = (["s_" + code for code in codes] if simple else []) + list(codes[:1])
+        """构造请求 URL。simple=True 是简版为主 + 每个标的捎带完整版，False 是纯完整版。
+
+        两种模式都带全部代码的完整版，区别只在前面那一段 s_ 简版 —— 也就是
+        「简版全废时回退纯完整版」这条退路必须保留：回退请求里绝不能再出现 s_。
+        """
+        request = (["s_" + code for code in codes] if simple else []) + list(codes)
         return make_sina_url(self.base_url, request)
 
     def fetch(self, symbols):
@@ -1281,8 +1290,16 @@ class SinaQuotes:
         """逐行解析 → (按请求序排好的 SinaQuote 列表, 行情日期)。
 
         行序必须等于请求序：被丢弃的行不能让后面的行上移，否则屏上顺序会跳。
+
+        行情日期是**多标的投票，取最新的一天**：每个标的都独立上报自己的完整版
+        日期，最新的那个才是「当前市场交易日」的最佳估计。三种情形都成立：
+
+        - 单个标的停牌 → 它报陈旧日期（实测 7 天前），被更晚的日期盖掉，不会
+          把正常交易日误判成休市；
+        - 节假日 → 没有任何标的会报今天，max 仍是上一交易日，≠ 今天 → 正确休市；
+        - 因此 max 不会掩盖真正的休市。
         """
-        simple, full, reasons, data_date = {}, {}, {}, None
+        simple, full, reasons, dates = {}, {}, {}, []
         for line in (raw or "").splitlines():
             parts = self._split_line(line)
             if parts is None:
@@ -1294,11 +1311,13 @@ class SinaQuotes:
                     simple[quote.code] = quote
                 else:
                     full[quote.code] = quote
-                    if data_date is None and quote.date:
-                        data_date = quote.date
+                    if quote.date:
+                        # YYYY-MM-DD 字典序即时间序，直接取 max。
+                        dates.append(quote.date)
             elif key.startswith("s_") or key in codes:
-                # 完整版探针行与简版行重复，失败原因归到同一个代码上。
+                # 完整版行与简版行重复，失败原因归到同一个代码上。
                 reasons[key[2:] if key.startswith("s_") else key] = reason
+        data_date = max(dates) if dates else None
         quotes = []
         for code in codes:
             # 同一代码两种行都在响应里时以简版为准（涨跌幅已是百分比），
@@ -2176,12 +2195,12 @@ def self_test():
        [q.code for q in quotes] == ["sh000300"] and
        quotes[0].percent == -0.07)
 
-    # 37. URL 拼接：一次请求里同时含 s_ 简版与结尾的完整版探针。
+    # 37. URL 拼接：一次请求里每个代码都以 s_ 简版 + 裸完整版两种形式出现。
     client = SinaQuotes()
     url = client.build_url(["sh000300", "sz399006"], True)
     plain = client.build_url(["sh000300", "sz399006"], False)
-    ok("混用 URL 同时含简版与完整版探针",
-       "list=s_sh000300,s_sz399006,sh000300" in url and
+    ok("混用 URL 每个代码都有简版与完整版",
+       "list=s_sh000300,s_sz399006,sh000300,sz399006" in url and
        "s_" not in plain.split("list=")[1])
 
     # 38. 简版全废 → 自动回退纯完整版仍能出行（离线：只桩掉传输层）。
@@ -2203,6 +2222,39 @@ def self_test():
        date == "2026-09-29" and len(fallback.seen_urls) == 2 and
        "s_sh000300" in fallback.seen_urls[0] and
        "s_" not in fallback.seen_urls[1])
+
+    # 39~41 日期投票：所有完整版行里取最新的一天。日期一律由 bj_stamp 造出，
+    # 不写死「今天」—— 1970-01-01 是周四，day=5 是周一（工作日，窗口内）。
+    today_text = beijing_date(bj_stamp(10, day=5))
+    stale_text = beijing_date(bj_stamp(10, day=1))     # 停牌/陈旧标的报的那天
+    stale_pair = beijing_date(bj_stamp(10, day=2))     # 全员共同上报的那天
+
+    # 39. 陈旧日期被更新的日期盖掉：sh000300 报 4 天前（停牌），sh000905 报今天。
+    _, date = client._parse("\n".join([
+        full_line("sh000300", "沪深300", 4341.42, 4340.58, stale_text),
+        full_line("sh000905", "中证500", 6120.0, 6115.0, today_text),
+    ]), ["sh000300", "sh000905"])
+    ok("陈旧行情日期被更新的日期盖掉", date == today_text and date != stale_text)
+
+    # 40. 全员陈旧 = 节假日：都报同一天 → 就是那一天，且 is_market_open 判休市。
+    _, date = client._parse("\n".join([
+        full_line("sh000300", "沪深300", 4341.42, 4340.58, stale_pair),
+        full_line("sh000905", "中证500", 6120.0, 6115.0, stale_pair),
+    ]), ["sh000300", "sh000905"])
+    ok("全员陈旧日期即上一交易日且判休市",
+       date == stale_pair and
+       is_market_open(bj_stamp(10, day=5)) and
+       not is_market_open(bj_stamp(10, day=5), data_date=date) and
+       is_market_open(bj_stamp(10, day=5), data_date=today_text))
+
+    # 41. 混用 URL 的形状：5 个代码各自同时出现 s_<code> 与裸 <code>，无多余重复。
+    five = ["sh000300", "sh000905", "sz399303", "sz399006", "sh000688"]
+    request = client.build_url(five, True).split("list=")[1].split(",")
+    ok("混用 URL 每个代码两种形式且无重复",
+       len(request) == 2 * len(five) and
+       set(request) == set(["s_" + code for code in five] + list(five)) and
+       all(request.count(code) == 1 and request.count("s_" + code) == 1
+           for code in five))
 
     print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     

@@ -389,15 +389,31 @@ class StockScene : public Scene {
     static constexpr uint16_t C_DOWN = rgb565(0x00, 0xFF, 0x00);
     /// 平盘 0.00%：中性白，比灰蓝醒目，也不与涨跌色混淆
     static constexpr uint16_t C_NEUTRAL = rgb565(0xFF, 0xFF, 0xFF);
-    // 额度环：颜色**按行固定**，不再随百分比变 —— 三个环各占一个身份色，
-    // 数值完全由弧长表达，色相只用来分辨「哪一个环是 5H / WK. / MO.」。
-    // 三个色都取自暖橙家族并按明暗度递减（橙红最亮 → 橙棕最沉），既有层次
-    // 又不与股票场景的涨跌红绿/中性白混淆。
+    // 额度环：颜色**按行固定**，不随百分比变 —— 三个环各占一个身份色，数值完全
+    // 由弧长表达，色相只负责分辨「哪一个环是 5H / WK. / MO.」。所以这里不能套
+    // 额度页那套「越多越绿/越少越红」的严重度分档（会与 stock 的涨跌红绿打架，
+    // 也会被误读成告警），而是取三个**平级**的身份色。
+    //
+    // 上一版三色（#FFC53D / #FF7A2F / #B85C2E）在小屏上糊成一团，根因是两处：
+    //   ① 5H→WK 明度只差 2.7 点（62.0 vs 59.2），色相差 20° 却被同族暖色吃掉；
+    //   ② WK→MO 色相只差 1.7°（21.6° vs 20.0°），几乎同色，只靠明度硬撑，
+    //      而 2px 细弧 + 20% 背光又把这点明度差压掉了 —— 于是中圈与内圈糊成一片。
+    // 现改为**色相与明度同向单调递减**的三级阶梯（奶金 → 琥珀 → 陶红）：
+    //   5H #FFF2B4  H=51.7°  L=84.7   最亮的浅奶金
+    //   WK #FCA654  H=29.3°  L=65.9   中间调琥珀
+    //   MO #D4523C  H= 8.7°  L=53.3   最沉的陶红
+    // 三个色相角各差 20° 以上（52→29→9），明度各降 12 点以上，20% 背光下相邻
+    // 两环的实显亮度比仍有 1.80 / 2.37，肉眼一眼可分。
+    // 引入浅奶金作为第四种「色相」是为了把外环抬到足够亮 —— 这是暖调内部的
+    // 明度扩展，不引入任何冷色，整体仍是橙红黄棕。
+    // MO 比上一版更亮（L 45.5→53.3、对轨道对比 1.58→1.64），不会退回「看着
+    // 像空了半圈」的老问题；且刻意避开纯红（对涨红 #FF0000 的 ΔE=41，明显
+    // 偏棕的陶土色而非正红），也不含绿，不会与行情涨跌红绿混淆。
     // 源值仍是真 RGB，由本文件的 rgb565() 做 BGR 交换（与全项目同一口径）。
-    static constexpr uint16_t C_TRACK = rgb565(0x28, 0x32, 0x49);
-    static constexpr uint16_t C_BAR_5H = rgb565(0xFF, 0x6B, 0x35);  // 橙红（最亮）
-    static constexpr uint16_t C_BAR_WK = rgb565(0xF2, 0xA6, 0x3C);  // 橙黄
-    static constexpr uint16_t C_BAR_MO = rgb565(0xA9, 0x66, 0x3A);  // 橙棕（最沉）
+    static constexpr uint16_t C_TRACK = rgb565(0x40, 0x28, 0x1A);  // 轨道：深棕（同额度页 C_BORDER）
+    static constexpr uint16_t C_BAR_5H = rgb565(0xFF, 0xF2, 0xB4);  // 浅奶金（最亮）
+    static constexpr uint16_t C_BAR_WK = rgb565(0xFC, 0xA6, 0x54);  // 琥珀（居中）
+    static constexpr uint16_t C_BAR_MO = rgb565(0xD4, 0x52, 0x3C);  // 陶红（最沉但仍清晰）
     /// 行序 0/1/2 = 5H / WK. / MO.，与额度页三行同序
     static constexpr uint16_t C_BAR_ROW[StockData::QUOTA_MAX] = {
         C_BAR_5H, C_BAR_WK, C_BAR_MO};

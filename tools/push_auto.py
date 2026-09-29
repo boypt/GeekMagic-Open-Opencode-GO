@@ -70,9 +70,9 @@ MARKET_OPEN / MARKET_CLOSE）覆盖。两点不变式：
 所以它既不套简版也不套 A 股完整版：(f[3]−f[2])/f[2] 在这里会把 -0.91% 算成
 +0.02%（那里 fields[2] 是昨收，这里是涨跌额）。它**没有日期字段**，因此不参与
 日期投票 —— 行情日期/节假日兜底只对 A 股代码有效，纯 ``int_`` 列表拿不到行情
-日期。是否给某个代码加 ``s_`` 简版由 SIMPLE_PREFIXES 决定（实测只有 sh_/sz_/bj_
-有简版），列表里全是 ``int_`` 时直接走纯完整版形态，不做「简版 → 回退」两轮
-dance。``int_nikkei`` 有 10 字节，超过设备端 name 的 9 字节上限，所以 SYMBOLS
+日期。是否给某个代码加 ``s_`` 简版由 SIMPLE_PREFIXES 决定（实测只有 sh/sz 有简版，
+**bj 没有** —— ``s_bj430047`` 恒为空串，详见 tools/sina-prefixes.md），列表里全是
+``int_`` 时直接走纯完整版形态，不做「简版 → 回退」两轮 dance。``int_nikkei`` 有 10 字节，超过设备端 name 的 9 字节上限，所以 SYMBOLS
 的语法上限放宽到 16 字节，但超 9 字节的代码**必须**在 SYMBOL_NAMES 里配简称
 （没配简称才会原样上屏）。
 
@@ -194,11 +194,15 @@ DEVICE_NAME_MAX = 9
 # 标的代码的语法上限：比设备端 name 宽，因为取数层把代码当 name 推，只有没配简称
 # 时才原样上屏。16 字节覆盖实测的海外指数代码（int_hangseng 12 / int_nikkei 10）。
 MAX_SYMBOL_BYTES = 16
-# 支持 s_ 简版的前缀（注意代码是 sh000300 这种「sh+数字」，没有下划线）。依据是实测：
-# sh/sz/bj 的每个代码请求 s_<code> 都返回 6 字段简版；而 int_nikkei 的 s_int_nikkei
-# 恒为空串（海外指数没有简版形态），hk*/hf_* 同理。不按「看起来像不像 A 股」外推，
-# 只有这一条是实测过的。判定一律走 code.lower()（见 normalize_symbol）。
-SIMPLE_PREFIXES = ("sh", "sz", "bj")
+# A 股/北交所代码前缀（注意代码是 sh000300 这种「sh+数字」，没有下划线）。**只用于
+# 「这类代码要转小写」这一条判断**（新浪大小写敏感，见 normalize_symbol 的实测对照）。
+# 别拿它当「支持简版」的名单用 —— bj 没有 s_ 简版。
+A_SHARE_PREFIXES = ("sh", "sz", "bj")
+# 支持 s_ 简版的前缀。依据是实测：sh/sz 的代码请求 s_<code> 都返回 6 字段简版
+# （sh600519 个股、sh510300 ETF 都试过），**bj 不行** —— s_bj430047 恒为空串。
+# int_nikkei 的 s_int_nikkei 恒为空串（海外指数没有简版形态），hk*/hf_* 同理。
+# 不按「看起来像不像 A 股」外推，只有这一条是实测过的。判定一律走 code.lower()。
+SIMPLE_PREFIXES = ("sh", "sz")
 # 无 s_ 简版的形态：int_ 海外指数是 4 字段，hf_ 外盘期货是 15/14 字段，hk* 港股是
 # 19 字段，三者都**没有 A 股那种可投票的行情日期**，不参与日期投票。
 NOSIMPLE_PREFIXES = ("int_", "hf_", "hk")
@@ -1202,7 +1206,7 @@ def normalize_symbol(symbol):
     if code[:2].lower() == "s_":
         code = code[2:]
     parts = (code[:2].lower(), code[2:])
-    if parts[0] in SIMPLE_PREFIXES and len(parts[1]) == 6 and parts[1].isdigit():
+    if parts[0] in A_SHARE_PREFIXES and len(parts[1]) == 6 and parts[1].isdigit():
         return code.lower()
     return code
 
@@ -1365,7 +1369,7 @@ class SinaQuotes:
 
     @staticmethod
     def supports_simple(code):
-        """该代码有没有 s_ 简版形态。实测只有 sh/sz/bj 的 A 股代码有。
+        """该代码有没有 s_ 简版形态。实测只有 sh/sz 有（bj 没有：s_bj430047 空串）。
 
         判定一律对小写副本做（用户可能写 SH000300），但 **build_url 发出去的代码是
         保大小写的原样** —— 这是 normalize_symbol 那条非对称规则的另一半。
@@ -2888,6 +2892,19 @@ def self_test():
        not SinaQuotes.supports_simple("hkHSI") and
        "list=hkHSI" in SinaQuotes().build_url(["hkHSI"], True) and
        "s_hkHSI" not in SinaQuotes().build_url(["hkHSI"], True))
+
+    # 66. A 股/北交所「要转小写」与「支持 s_ 简版」是**两件事**，别合成一个常量。
+    #     实测 s_bj430047 恒为空串（北交所没有简版形态），但 BJ430047 仍必须被
+    #     归一成 bj430047 —— 新浪大小写敏感，不小写就静默取不到数据。
+    bj_url = SinaQuotes().build_url(["bj430047"], True)
+    ok("bj 不加 s_ 简版但仍按 A 股规则转小写",
+       "s_bj430047" not in bj_url and "list=bj430047" in bj_url and
+       not SinaQuotes.supports_simple("bj430047") and
+       normalize_symbol("BJ430047") == "bj430047" and
+       normalize_symbol("Sh000300") == "sh000300" and
+       # sh/sz 仍然有简版，别把这次修正过头
+       SinaQuotes.supports_simple("sh000300") and
+       "s_sh000300" in SinaQuotes().build_url(["sh000300"], True))
 
     print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     

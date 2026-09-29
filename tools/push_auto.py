@@ -52,6 +52,26 @@ MARKET_OPEN / MARKET_CLOSE）覆盖。两点不变式：
 留空项表示那只沿用代码。简称受设备端同名限制（1..9 字节可打印 ASCII），校验与
 --symbols 一致；替换只发生在排版层，取数层拿到的永远是原代码。
 
+取数层是 SinaQuotes（见下），用新浪的 s_ 简版接口：简版一行只有 6 个字段
+``名称,点位,涨跌额,涨跌幅%,成交量,成交额``，**fields[3] 直接就是涨跌幅百分比**，
+不用自己除，正好是设备唯一要的量；而完整版多一个 ``fields[30]`` 的行情日期，是
+节假日/停市的兜底判定（日期≠今天）唯一的来源。两者可以混写在同一个 list= 里（实测
+``s_sh000300,sh000300`` 两行都返回），所以每拍只发一次请求：全部标的走简版，
+再捎带第一个标的的完整版拿日期。写 ``--symbols`` 时可以带 ``s_`` 前缀，取数层
+会剥掉。
+
+**布局按 key 带不带 s_ 前缀分流，不按字段数。** 完整版的指数和个股是同一套布局
+（沪市 34 字段 / 深市 33 字段，尾部多一个空字段）：``fields[2]``=昨收、
+``fields[3]``=最新价/最新点位，涨跌幅 = ``(fields[3]−fields[2])/fields[2]``，
+**这个公式对个股和指数都成立**；``fields[30]``=行情日期、``fields[31]``=行情时间，
+sh/sz 下位置一致。所以「字段少的是指数」只在 s_ 简版下成立 —— 拿它去判完整版会把
+指数误判成个股，只是因为公式对两者都成立才碰巧没出错。
+
+坑：**开盘前深市指数（创业板指 sz399006、国证2000 sz399303、深证成指 sz399001）
+的简版点位是 0.00**，同时沪市 sh000300 却有真实点位。旧代码拿「点位 > 0」当有效性
+门槛，开盘前会把这些行整行丢掉。所以简版只认 fields[3] 那个百分比，点位为 0 是合法
+值；完整版才保留昨收/现价 > 0 的守卫（否则开盘前会算出 −100% 的假跌）。
+
 额度那条**不带 rows**：设备只更新屏顶三条额度条，不动行情行、不接管屏幕，
 所以 5 分钟一刷的额度不会打断 15s 一刷的行情。progress 顺序固定为滚动/周/月
 三段，元素是 0..100 的剩余百分比或 null（无窗口）；上游取数失败时这一拍什么
@@ -1155,108 +1175,229 @@ def round_change(value):
     return 0.0 if result == 0 else result
 
 
-def parse_quote_data(code, data_str):
-    """按字段数解析个股/指数；不按 sh/sz 前缀猜测。"""
-    fields = (data_str or "").split(",")
-    if not fields or not fields[0].strip():
-        return None
-    display_name = fields[0].strip()
-    try:
-        if len(fields) >= 10:
-            previous_close = float(fields[2].strip())  # 个股 data[2]
-            current_price = float(fields[3].strip())    # 个股 data[3]
-            if (not math.isfinite(previous_close) or
-                    not math.isfinite(current_price) or previous_close <= 0 or
-                    current_price <= 0):
-                return None
-            change = (current_price - previous_close) / previous_close * 100.0
-        else:
-            point = float(fields[1].strip())
-            change = float(fields[3].strip())           # 指数 data[3] 已是百分比
-            if not math.isfinite(point) or point <= 0:
-                return None
-        if not math.isfinite(change) or abs(change) > 100000:
+@dataclass(frozen=True)
+class SinaQuote:
+    """新浪一条行情。percent 是设备唯一要的量（涨跌幅 %）。"""
+    code: str            # 规范化后的代码（不带 s_ 前缀）
+    name: str            # 新浪返回的中文名，只进日志/--stock-dry-run，不上屏
+    point: float         # 点位；简版模式下 0 是合法的（开盘前深市指数点位为 0）
+    change_amount: float # 涨跌额
+    percent: float       # 涨跌幅 %，设备推的就是它
+    date: str = ""       # 行情日期，只有完整版行才有
+
+
+def _quote_field(fields, index):
+    """取第 index 个字段的浮点值；越界或非法一律抛，由调用方统一转成跳过原因。"""
+    if index >= len(fields):
+        raise ValueError("字段不足")
+    return float(fields[index].strip())
+
+
+class SinaQuotes:
+    """新浪行情客户端：s_ 简版为主、完整版为辅，一次请求混用两种代码。
+
+    - 简版（s_<code>）6 字段，只要涨跌幅，正是设备要的
+    - 完整版（<code>）多一个日期字段，节假日/停市兜底判定（行情日期≠今天）靠它
+    - 一个 URL 里混着写（list=s_sh000300,sh000300 实测两行都返回），所以每拍
+      只发一次请求：全部标的走简版 + 第一个标的再带一次完整版拿日期
+    """
+
+    def __init__(self, base_url=DEFAULT_SINA_URL, timeout=15.0, insecure=False,
+                 retries=2):
+        self.base_url = base_url
+        self.timeout = timeout
+        self.insecure = insecure
+        self.retries = retries
+        self.headers = {"User-Agent": USER_AGENT, "Referer": SINA_REFERER}
+        self.urls = []          # 实际发过的 URL，--stock-dry-run 打印用
+
+    @staticmethod
+    def normalize(symbol):
+        """剥掉文档里常见的 s_ 前缀，返回裸代码。"""
+        code = (symbol or "").strip().lower()
+        return code[2:] if code.startswith("s_") else code
+
+    def build_url(self, codes, simple=True):
+        """构造请求 URL。simple=True 是简版为主 + 完整版探针，False 是纯完整版。"""
+        request = (["s_" + code for code in codes] if simple else []) + list(codes[:1])
+        return make_sina_url(self.base_url, request)
+
+    def fetch(self, symbols):
+        """对外主入口 → (rows, data_date)。rows 是 [{"name": code, "change": percent}]。"""
+        quotes, data_date = self.fetch_quotes(symbols)
+        return ([{"name": quote.code, "change": quote.percent} for quote in quotes],
+                data_date)
+
+    def fetch_quotes(self, symbols):
+        """同 fetch，但返回带中文名/点位/涨跌额的 SinaQuote，供排障工具打印。"""
+        codes = [self.normalize(symbol) for symbol in symbols]
+        quotes, data_date = self._fetch_once(codes, self.build_url(codes, True))
+        if not quotes:
+            # 简版接口行为变了或混用被拒：退回今天这套纯完整版，别让整条链路挂掉。
+            eprint("简版无有效行情，回退完整版")
+            quotes, fallback_date = self._fetch_once(
+                codes, self.build_url(codes, False))
+            data_date = data_date or fallback_date
+        if not quotes:
+            raise RuntimeError("Response error: 未解析到有效行情")
+        return quotes, data_date
+
+    def _fetch_once(self, codes, url):
+        """一次 URL 带原有重试语义；返回 ([], None) 表示 200 但没解析出有效行。"""
+        self.urls.append(url)
+        last_error = None
+        for attempt in range(1, self.retries + 2):
+            try:
+                code, raw = self._transport(url)
+            except Exception as ex:
+                last_error = "Network error: %s" % ex
+                eprint("新浪请求失败 (attempt %d): %s" % (attempt, last_error))
+                time.sleep(1)
+                continue
+            if code == 200:
+                quotes, data_date = self._parse(raw, codes)
+                if quotes:
+                    return quotes, data_date
+                last_error = "Response error: 未解析到有效行情"
+                eprint("新浪响应没有可用行情 (attempt %d)" % attempt)
+                time.sleep(1)
+                continue
+            last_error = "HTTP %d: %s" % (code, (raw or "")[:200])
+            eprint("新浪 HTTP %d (attempt %d)" % (code, attempt))
+            if code == 403:
+                break
+            time.sleep(1)
+        if last_error and not last_error.startswith("Response error"):
+            raise RuntimeError(last_error)
+        return [], None
+
+    def _transport(self, url):
+        """必须带 Referer、*/* Accept 并按 gb18030 解码。"""
+        return http_request(url, headers=self.headers, timeout=self.timeout,
+                            insecure=self.insecure, encoding="gb18030",
+                            accept="*/*")
+
+    def _parse(self, raw, codes):
+        """逐行解析 → (按请求序排好的 SinaQuote 列表, 行情日期)。
+
+        行序必须等于请求序：被丢弃的行不能让后面的行上移，否则屏上顺序会跳。
+        """
+        simple, full, reasons, data_date = {}, {}, {}, None
+        for line in (raw or "").splitlines():
+            parts = self._split_line(line)
+            if parts is None:
+                continue
+            key, data_str = parts
+            quote, reason = self._parse_quote(key, data_str)
+            if quote is not None:
+                if key.startswith("s_"):
+                    simple[quote.code] = quote
+                else:
+                    full[quote.code] = quote
+                    if data_date is None and quote.date:
+                        data_date = quote.date
+            elif key.startswith("s_") or key in codes:
+                # 完整版探针行与简版行重复，失败原因归到同一个代码上。
+                reasons[key[2:] if key.startswith("s_") else key] = reason
+        quotes = []
+        for code in codes:
+            # 同一代码两种行都在响应里时以简版为准（涨跌幅已是百分比），
+            # 完整版只贡献 date —— 每个代码只能出一行。
+            quote = simple.get(code) or full.get(code)
+            if quote is None:
+                eprint("跳过 %s：%s" % (code, reasons.get(code, "空行情或价格无效")))
+                continue
+            quotes.append(quote)
+            if len(quotes) >= MAX_ROWS:
+                break
+        return quotes, data_date
+
+    @staticmethod
+    def _split_line(line):
+        """`var hq_str_<key>="<data>";` → (key, data)；不合法返回 None。"""
+        line = (line or "").strip()
+        prefix = "var hq_str_"
+        if not line.startswith(prefix) or '"' not in line:
             return None
-        return display_name, round_change(change)
-    except (IndexError, TypeError, ValueError, InvalidOperation, OverflowError):
-        return None
+        body = line[len(prefix):]
+        if "=" not in body or not body.endswith(";"):
+            return None
+        key, quoted = body.split("=", 1)
+        if len(quoted) < 2 or not quoted.startswith('"') or not quoted.endswith('";'):
+            return None
+        key = key.strip().lower()
+        if not key:
+            return None
+        return key, quoted[1:-2]
 
+    @staticmethod
+    def _parse_quote(key, data_str):
+        """解析一行 → (SinaQuote, 跳过原因)。
 
-def extract_data_date(data_str):
-    fields = (data_str or "").split(",")
-    if len(fields) <= 30:
-        return None
-    value = fields[30].strip()
-    if (len(value) != 10 or value[4] != "-" or value[7] != "-" or
-            any(ch not in "0123456789" for ch in value[:4] + value[5:7] + value[8:])):
-        return None
-    return value
+        布局**按 key 是不是带 s_ 前缀分流，不按字段数** —— 完整版的指数和个股是
+        同一套布局（沪市 34 字段 / 深市 33 字段，尾部多一个空字段），按字段数
+        分「个股 vs 指数」会把指数误判成个股，只是下面那个公式对两者都成立，
+        才碰巧没出错：
 
+        - 简版（key 带 s_）6 字段：名称,点位,涨跌额,涨跌幅%,成交量(手),成交额(万)。
+          fields[3] **直接就是涨跌幅百分比**，不用自己除。开盘前深市指数
+          （创业板指/国证2000/深证成指）点位就是 0.00，所以只能拿 fields[3]
+          当有效性门槛，点位 0 是合法值。
+        - 完整版（key 不带 s_）：fields[2]=昨收、fields[3]=最新价/最新点位，
+          涨跌幅 = (fields[3]−fields[2])/fields[2]（个股与指数同一公式）；
+          fields[30]=行情日期、fields[31]=行情时间，sh/sz 下位置一致。开盘前
+          fields[3] 为 0 会算出 −100%，所以这里保留昨收/现价 > 0 的守卫。
+        """
+        fields = (data_str or "").split(",")
+        name = fields[0].strip() if fields else ""
+        if not name:
+            return None, "空行情"
+        code = key[2:] if key.startswith("s_") else key
+        try:
+            if key.startswith("s_"):
+                point = _quote_field(fields, 1)
+                change_amount = _quote_field(fields, 2)
+                percent = _quote_field(fields, 3)   # 简版涨跌幅已是百分比
+                date = ""
+            else:
+                if len(fields) <= 3:
+                    return None, "完整版字段不足（读不到 fields[2]/fields[3]）"
+                previous_close = _quote_field(fields, 2)
+                price = _quote_field(fields, 3)
+                if (not math.isfinite(previous_close) or
+                        not math.isfinite(price) or previous_close <= 0 or
+                        price <= 0):
+                    return None, "昨收或现价无效"
+                point = price
+                change_amount = _quote_field(fields, 4)
+                percent = (price - previous_close) / previous_close * 100.0
+                date = SinaQuotes._extract_date(data_str)
+            if not math.isfinite(percent) or abs(percent) > 100000:
+                return None, "涨跌幅不是有限数或越界"
+            return SinaQuote(code, name, point, change_amount,
+                             round_change(percent), date), ""
+        except (IndexError, TypeError, ValueError, InvalidOperation, OverflowError):
+            return None, "字段无法解析"
 
-def parse_quote_line_parts(line):
-    line = (line or "").strip()
-    prefix = "var hq_str_"
-    if not line.startswith(prefix) or '"' not in line:
-        return None
-    body = line[len(prefix):]
-    if "=" not in body or not body.endswith(";"):
-        return None
-    code, quoted = body.split("=", 1)
-    if len(quoted) < 2 or not quoted.startswith('"') or not quoted.endswith('";'):
-        return None
-    data_str = quoted[1:-2]
-    code = code.strip().lower()
-    if not code:
-        return None
-    parsed = parse_quote_data(code, data_str)
-    return code, parsed[0] if parsed else "", parsed[1] if parsed else None, \
-        extract_data_date(data_str)
+    @staticmethod
+    def _extract_date(data_str):
+        """完整版 fields[30] 的行情日期（YYYY-MM-DD），sh/sz 下位置一致。
+
+        fields[31] 是行情时间。字段不存在或不合法返回 ""。
+        """
+        fields = (data_str or "").split(",")
+        if len(fields) <= 30:
+            return ""
+        value = fields[30].strip()
+        if (len(value) != 10 or value[4] != "-" or value[7] != "-" or
+                any(ch not in "0123456789" for ch in value[:4] + value[5:7] + value[8:])):
+            return ""
+        return value
 
 
 def fetch_quotes(sina_url, symbols, timeout, insecure, retries=2):
-    """请求新浪；必须使用 Referer、*/* Accept 和 gb18030 解码。"""
-    url = make_sina_url(sina_url, symbols)
-    headers = {"User-Agent": USER_AGENT, "Referer": SINA_REFERER}
-    wanted = set(symbols)
-    last_error = None
-    for attempt in range(1, retries + 2):
-        try:
-            code, raw = http_request(url, headers=headers, timeout=timeout,
-                                     insecure=insecure, encoding="gb18030",
-                                     accept="*/*")
-        except Exception as ex:
-            last_error = "Network error: %s" % ex
-            eprint("新浪请求失败 (attempt %d): %s" % (attempt, last_error))
-            time.sleep(1)
-            continue
-        if code == 200:
-            rows, data_date, seen = [], None, set()
-            for line in (raw or "").splitlines():
-                parsed = parse_quote_line_parts(line)
-                if parsed is None:
-                    continue
-                code_name, display_name, change, quote_date = parsed
-                if code_name not in wanted or code_name in seen:
-                    continue
-                seen.add(code_name)
-                if data_date is None and quote_date:
-                    data_date = quote_date
-                if not display_name or change is None:
-                    eprint("跳过 %s：空行情或价格无效" % code_name)
-                    continue
-                rows.append({"name": code_name, "change": change})
-            if rows:
-                return rows, data_date
-            last_error = "Response error: 未解析到有效行情"
-            eprint("新浪响应没有可用行情 (attempt %d)" % attempt)
-            time.sleep(1)
-            continue
-        last_error = "HTTP %d: %s" % (code, (raw or "")[:200])
-        eprint("新浪 HTTP %d (attempt %d)" % (code, attempt))
-        if code == 403:
-            break
-        time.sleep(1)
-    raise RuntimeError(last_error or "新浪行情请求失败")
+    """薄封装：取数逻辑都在 SinaQuotes 里，这里只保调用点签名与返回形状不变。"""
+    return SinaQuotes(sina_url, timeout, insecure, retries).fetch(symbols)
 
 
 def push_device(endpoint, token, payload, timeout, retries=2):
@@ -1440,17 +1581,23 @@ def stock_dry_run(args, symbols, aliases=None, windows=None):
     """
     aliases = aliases or {}
     windows = windows or parse_market_windows(args.market_open, args.market_close)
+    quotes = None
     if args.demo:
         rows = [{"name": symbol, "change": round_change(random.uniform(-5.0, 5.0))}
                 for symbol in symbols]
         data_date = None
     else:
+        client = SinaQuotes(args.sina_url, args.timeout, args.insecure)
         try:
-            rows, data_date = fetch_quotes(args.sina_url, symbols,
-                                           args.timeout, args.insecure)
+            quotes, data_date = client.fetch_quotes(symbols)
         except Exception as ex:
+            for url in client.urls:
+                eprint("已请求 %s" % url)
             eprint("行情失败: %s" % ex)
             return 1
+        for url in client.urls:
+            print("请求 URL %s" % url)
+        rows = [{"name": quote.code, "change": quote.percent} for quote in quotes]
 
     now_bj = time.gmtime(time.time() + 8 * 3600)
     weekday = "周一至周五" if now_bj.tm_wday <= 4 else "周末"
@@ -1464,16 +1611,22 @@ def stock_dry_run(args, symbols, aliases=None, windows=None):
         print("简称映射 %s" % ", ".join(
             "%s→%s" % (symbol, aliases.get(symbol, "(沿用代码)"))
             for symbol in symbols))
-    rows = apply_aliases(rows, aliases)
-    for row in rows:
+    for index, row in enumerate(rows):
         if row["change"] > 0:
             tone = "涨 → 屏上正红"
         elif row["change"] < 0:
             tone = "跌 → 屏上正绿"
         else:
             tone = "平 → 屏上中性白"
-        print("  %-10s %+7.2f%%  %s" % (row["name"], row["change"], tone))
-    show_dry_run("/api/v1/stock", {"rows": rows})
+        if quotes is not None:
+            quote = quotes[index]
+            print("  %-9s %-8s 点位=%10.4f 涨跌额=%+9.4f 涨跌幅=%+7.2f%%"
+                  % (quote.code, quote.name, quote.point, quote.change_amount,
+                     quote.percent))
+        # 推送时真正上屏的行名：配了简称就是简称，否则沿用代码。
+        print("    推送行名 %-9s %+7.2f%%  %s"
+              % (aliases.get(row["name"], row["name"]), row["change"], tone))
+    show_dry_run("/api/v1/stock", {"rows": apply_aliases(rows, aliases)})
     return 0
 
 
@@ -1959,7 +2112,99 @@ def self_test():
     ok("--demo 仍遵守开市窗口", outside_ok and s.state == State.AWAKE_OPEN and
        len(row_bodies(backend)) == 1)
 
-    print("SELF-TEST PASS: %d/30" % len(results))
+    # 31. 简版行解析：涨跌幅已是百分比（-0.00 归一到 0.0），中文名与点位照取。
+    client = SinaQuotes()
+    quotes, _ = client._parse(
+        'var hq_str_s_sh000300="沪深300,4340.5791,-0.1759,-0.00,0,0";',
+        ["sh000300"])
+    ok("简版 6 字段解析涨跌幅",
+       len(quotes) == 1 and quotes[0].code == "sh000300" and
+       quotes[0].name == "沪深300" and
+       abs(quotes[0].point - 4340.5791) < 1e-6 and quotes[0].percent == 0.0)
+
+    # 32. 回归守卫：开盘前深市指数点位为 0，简版下**不能**被当成无效行丢掉。
+    quotes, _ = client._parse(
+        'var hq_str_s_sz399006="创业板指,0.00,0.000,0.00,0,0";', ["sz399006"])
+    ok("开盘前深市指数点位为 0 仍出行",
+       len(quotes) == 1 and quotes[0].point == 0.0 and quotes[0].percent == 0.0)
+
+    # 33. 无效代码返回空串：跳过、不产生行，也不抛。
+    quotes, date = client._parse('var hq_str_s_sh999999="";', ["sh999999"])
+    ok("无效代码空串被跳过", quotes == [] and date is None)
+
+    # 完整版响应行（沪市 34 字段）按位置拼出来，免得手数逗号数错 fields[30]。
+    def full_quote(name, previous_close, price, date_text="2026-09-29"):
+        fields = [name, str(price), str(previous_close), str(price)]
+        fields += ["4350", "4330", "4339", "4350", "570123", "5312"]   # 4..9
+        fields += ["0"] * 20                                            # 10..29
+        fields += [date_text, "15:00:00", "00", ""]                     # 30..33
+        assert len(fields) == 34, len(fields)
+        return fields
+
+    def full_line(key, *args, **kwargs):
+        return 'var hq_str_%s="%s";' % (key, ",".join(full_quote(*args, **kwargs)))
+
+    def simple_line(key, data):
+        return 'var hq_str_s_%s="%s";' % (key, data)
+
+    # 34. 混用响应：3 简版 + 1 完整版同一段文本 → 3 行、按请求序、日期取自完整版。
+    order = ["sz399006", "sh000300", "sz399303"]
+    quotes, date = client._parse("\n".join([
+        simple_line("sz399006", "创业板指,0.00,0.000,0.00,0,0"),
+        simple_line("sh000300", "沪深300,4340.5791,-0.1759,-0.00,0,0"),
+        simple_line("sz399303", "国证2000,0.00,0.000,0.00,0,0"),
+        full_line("sh000300", "沪深300", 4341.42, 4340.5791),
+    ]), order)
+    ok("混用响应按请求序出行并取完整版日期",
+       [q.code for q in quotes] == order and date == "2026-09-29")
+
+    # 35. 同一代码简版与完整版共存 → 只出一行，且以简版的百分比为准。
+    quotes, date = client._parse("\n".join([
+        simple_line("sh000300", "沪深300,4340.5791,-0.1759,1.23,0,0"),
+        full_line("sh000300", "沪深300", 4341.42, 4340.5791),
+    ]), ["sh000300"])
+    ok("简版与完整版同代码只出一行",
+       len(quotes) == 1 and quotes[0].percent == 1.23 and date == "2026-09-29")
+
+    # 36. 完整版仍按 (现价−昨收)/昨收 算；开盘前现价为 0 的完整版行必须丢弃
+    #     （否则会算出 −100% 的假跌）。
+    quotes, _ = client._parse("\n".join([
+        full_line("sz399006", "创业板指", 2050.0, 0.0),   # 开盘前：现价 0
+        full_line("sh000300", "沪深300", 4341.42, 4338.5),  # -0.0672 → -0.07
+    ]), ["sz399006", "sh000300"])
+    ok("完整版按昨收算涨跌幅且现价 0 丢弃",
+       [q.code for q in quotes] == ["sh000300"] and
+       quotes[0].percent == -0.07)
+
+    # 37. URL 拼接：一次请求里同时含 s_ 简版与结尾的完整版探针。
+    client = SinaQuotes()
+    url = client.build_url(["sh000300", "sz399006"], True)
+    plain = client.build_url(["sh000300", "sz399006"], False)
+    ok("混用 URL 同时含简版与完整版探针",
+       "list=s_sh000300,s_sz399006,sh000300" in url and
+       "s_" not in plain.split("list=")[1])
+
+    # 38. 简版全废 → 自动回退纯完整版仍能出行（离线：只桩掉传输层）。
+    class _Fallback(SinaQuotes):
+        def __init__(self):
+            super().__init__(retries=0)
+            self.seen_urls = []
+
+        def _transport(self, url):
+            self.seen_urls.append(url)
+            if "s_" in url:
+                return 200, simple_line("sh000300", "")   # 简版这轮全废
+            return 200, full_line("sh000300", "沪深300", 4341.42, 4338.5)
+
+    fallback = _Fallback()
+    rows, date = fallback.fetch(["sh000300"])
+    ok("简版无有效行情回退完整版",
+       rows == [{"name": "sh000300", "change": -0.07}] and
+       date == "2026-09-29" and len(fallback.seen_urls) == 2 and
+       "s_sh000300" in fallback.seen_urls[0] and
+       "s_" not in fallback.seen_urls[1])
+
+    print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     
 
 def check_device_sync(args, device_base):

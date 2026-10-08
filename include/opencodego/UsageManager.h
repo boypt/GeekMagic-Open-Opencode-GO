@@ -3,12 +3,21 @@
 
 // Balance 主界面绘制管理器（推送模式）：上位机经 POST /api/v1/balance
 // 推送三行额度文本 + 可选状态行，本模块只负责渲染，不再做任何出站拉取。
+// 页面布局：logo + 横线（顶）→ 三重同心额度环放大版（居中，圆心 120,120，
+// 外/中/内 = 5H/WK./MO.，弧长=百分比）→ 圆环上角两块迷你标签（左 UPD/
+// 更新时刻两行、右 RST/5H·1W·1M 重置原始串四行，FONT_MINI 4px 字模，
+// 行带在环擦底框之外、各自独立差量）→ HH:MM:SS 像素时钟（底部居中）。
+// 旧「下半部分左右分栏 + 三段进度条 + 状态行」布局已删：labels 仍存于
+// 推送缓冲供 GET /balance 回读不上屏（环身份靠位置/颜色）；status/resets
+// 即左上 UPD / 右上 RST 的显示串 —— 文案转换（时间 HH:MM、5H·1W·1M 前缀、
+// 无值占位）全在上位机 tools/push_auto.py 预格式化，设备零语义原样上屏。
 // 仿 DashboardManager 的 begin()/update() 静态模式：
 //   begin()  标记启动（首帧绘制仍由 enterScene / 首次联网就绪触发）；
-//   update() 每秒 tick 时钟（分钟变化差量更新 HH/MM 字形 / 秒变化只摆动分隔线），
-//            推送到达时走「局部更新」（逐行比对屏上快照，只重画变化行，
-//            内容全同则零绘制），并消费 DisplayManager::requestFullRedraw()
-//            整屏重绘（仅供显示设置变更 rotation / 面板 profile 使用）。
+//   update() 每秒 tick 底部时钟（分钟变化重写 HH:MM: 字段 / 秒变化只擦写
+//            SS 字段），推送到达时走「局部更新」（比对屏上额度环/标签
+//            快照，只重画变化的环块与标签行，内容全同则零绘制），并消费
+//            DisplayManager::requestFullRedraw() 整屏重绘（仅供显示设置
+//            变更 rotation / 面板 profile 使用）。
 // 局部重绘策略与旧工程一致，无整屏重刷（整屏重绘/入场/首绘除外）。
 // 存储为静态定长 char 缓冲（零 String 常驻、零 >4KB 分配，见坑 #9）。
 
@@ -61,12 +70,13 @@ class UsageManager {
 
    private:
     static void drawBody();
-    static void drawUpdateRow();
-    static void drawQuotaRow(int y, uint8_t index);
-    // 推送局部刷新：只重画与屏上快照不一致的行，内容全同则零绘制（返回是否碰屏）
+    // 三重同心额度环（放大版）：自清底（只覆盖环框），收尾同步屏上快照
+    static void drawQuotaRings();
+    // 圆环上角迷你标签（UPD/RST 两块）：逐行擦各自行带，收尾同步值行快照
+    static void drawMiniLabels();
+    // 推送局部刷新：只重画与屏上快照不一致的环块/标签值行，内容全同则零绘制（返回是否碰屏）
     static bool redrawChangedQuota();
-    static void drawClock();
-    static void drawDateLine();
-    static void drawSeparator();
+    // 底部居中像素时钟（HH:MM:SS，分段擦除只擦自己条带）
+    static void drawClock(bool minuteChanged, bool fullRedraw);
     static void tickUi();
 };

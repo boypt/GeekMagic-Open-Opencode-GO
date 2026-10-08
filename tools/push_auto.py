@@ -1215,23 +1215,32 @@ def build_payload(usage):
                 dt = dt.replace(tzinfo=timezone.utc)
             seconds = int(dt.timestamp() - time.time())
             if seconds <= 0:
-                return "Rnow"
+                return "now"
             days, rest = divmod(seconds, 86400)
             hours, rest = divmod(rest, 3600)
             minutes = rest // 60
             if days:
-                return "R%dd%dh" % (days, hours)
+                return "%dd%dh" % (days, hours)
             if hours:
-                return "R%dh%02dm" % (hours, minutes)
-            return "R%dm" % max(minutes, 1)
+                return "%dh%02dm" % (hours, minutes)
+            return "%dm" % max(minutes, 1)
         except Exception:
             return None
 
     now = beijing_time_now()
-    status = "UPDATE %02d:%02d" % (now.tm_hour, now.tm_min)
+    # 标签显示串在上位机预格式化（设备端零语义照单上屏，不做时间/重置解析）：
+    #   status = UPD 行显示串（"HH:MM" 更新时刻 → 设备圆环左上角）
+    #   resets = RST 三行完整显示串（"5H: "/"1W: "/"1M: " 前缀 + 重置串，
+    #            无值 "--" → 设备圆环右上角）
+    def display_line(prefix, win):
+        value = reset(win)
+        return "%s%s" % (prefix, value if value else "--")
+
+    status = "%02d:%02d" % (now.tm_hour, now.tm_min)
     return (["5H", "WK.", "MO."], [progress(rolling), progress(weekly),
                                   progress(monthly)],
-            [reset(rolling), reset(weekly), reset(monthly)],
+            [display_line("5H: ", rolling), display_line("1W: ", weekly),
+             display_line("1M: ", monthly)],
             status[:MAX_STATUS_LEN])
 
 
@@ -2306,7 +2315,8 @@ def run_balance(args, device_base):
         return 1, False
     if demo_balance:
         labels, progress, resets, status = build_payload(build_demo_usage())
-        status = "DEMO " + status.replace("UPDATE ", "")
+        # UPD 显示串（status）标注 DEMO，屏幕左上角显示 "DEMO HH:MM"
+        status = "DEMO " + status
         usage_ok = True
     elif args.dry_run:
         # dry-run 的定义是完全不联网，用固定样例走格式化路径。
@@ -2418,7 +2428,7 @@ def self_test():
                 self.balance_failures -= 1
                 return Result(False, error="fake upstream")
             return Result(True, (["5H", "WK.", "MO."], [50, 40, 30],
-                                 ["R1h", "R2d", "R3d"], "TEST"))
+                                 ["1h", "2d", "3d"], "TEST"))
     
         def post_device(self, ctx, path, body):
             self.calls.append("post" + path)

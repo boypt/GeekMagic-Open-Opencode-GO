@@ -72,72 +72,96 @@ static constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
                                               (static_cast<uint16_t>(g & 0xFC) << 3) | (b >> 3));
     return static_cast<uint16_t>(((v & 0x001FU) << 11) | (v & 0x07E0U) | ((v & 0xF800U) >> 11));
 }
-// 暖色主题：琥珀 → 橙 → 红 的单色温递进，底色压成极深暖棕，
-// 营造「余温 / 炭火」氛围；不用纯黑是为了让暖光有依附的暗场，
-// 同时比纯黑略高一档的底色让进度条空轨道不显得突兀。
-// 文字类（C_SUB/C_LABEL/C_WHITE）刻意保持高明度，240x240 上 6x10
-// 小字在暖色系里最容易被暗棕吞掉，所以不用「低亮度暖棕」当文字。
+// 暖色主题：底色压成极深暖棕，营造「余温 / 炭火」氛围；文字类（C_SUB/C_LABEL/
+// C_WHITE）刻意保持高明度，暖色系里小字最容易被暗棕吞掉。
 static constexpr uint16_t C_BG     = rgb565(0x12, 0x0A, 0x06);  // 极深暖棕（炭底）
-static constexpr uint16_t C_BORDER = rgb565(0x40, 0x28, 0x1A);  // 空轨道 / 分隔竖线：深棕
+static constexpr uint16_t C_BORDER = rgb565(0x40, 0x28, 0x1A);  // logo 下横线：深棕
 static constexpr uint16_t C_SUB    = rgb565(0xB0, 0x8A, 0x6A);  // 次级文字：暖灰褐
-static constexpr uint16_t C_LABEL  = rgb565(0xC9, 0xA2, 0x77);  // 行标签：暖沙色
-static constexpr uint16_t C_ACCENT = rgb565(0xFF, 0x6B, 0x35);  // 装饰短线：橙红
-static constexpr uint16_t C_WHITE  = rgb565(0xFF, 0xF2, 0xE3);  // 七段数字/百分比：暖白
-// 进度条三档（暖色下重新映射：>=50 充裕=琥珀金，>=20 偏低=橙，<20 告急=红）。
-// 色相 45°→22°→6° 单向递减 + 低档最饱和最亮，是暖色系里唯一能一眼
-// 分级且「越低越刺眼」的排法；C_RED 同时用于 `--` 负号与失败提示，
-// 保持高对比纯红才不会看不清。
-static constexpr uint16_t C_OK     = rgb565(0xFF, 0xC5, 0x3D);  // 充裕（琥珀金）
-static constexpr uint16_t C_MID    = rgb565(0xFF, 0x7A, 0x2F);  // 偏低（橙）
-static constexpr uint16_t C_RED    = rgb565(0xFF, 0x3B, 0x30);  // 告急（红）
+static constexpr uint16_t C_LABEL  = rgb565(0xC9, 0xA2, 0x77);  // 引导文字：暖沙色
+static constexpr uint16_t C_WHITE  = rgb565(0xFF, 0xF2, 0xE3);  // 时钟数字：暖白
+static constexpr uint16_t C_RED    = rgb565(0xFF, 0x3B, 0x30);  // 失败提示：高对比纯红
 
-// ---- 字体（U8g2_for_Adafruit_GFX，替代旧 TFT_eSPI FreeSans/内置字体）----
-// - 时钟大数字不用字体：自绘七段数码管（见下方 drawSegDigit），恢复旧工程
-//   TFT_eSPI Font 7（七段数码管 48px）观感，并省出约 10KB flash；
-// - 百分比     u8g2_font_helvB12_tf：Helvetica Bold 12pt，接近旧 FreeSans12pt7b；
-// - 标签       u8g2_font_helvR10_tf：Helvetica Regular 10pt，接近旧 FreeSans9pt7b；
-// - 小字       u8g2_font_6x10_tf：6px 字宽同旧内置 Font 1（6x8），略高 2px。
-static const uint8_t* const FONT_PCT = u8g2_font_helvB12_tf;
+// 额度三重同心环（颜色复制自 StockScene 的身份配色，仅放大几何）：
+// 颜色**按行固定**、不随百分比变 —— 三个环各占一个身份色，数值完全由弧长
+// 表达，色相只负责分辨「哪一个环是 5H / WK. / MO.」。Apple Watch 活动环的
+// 身份配色（粉 / 绿 / 青），每环配一条**同色相压暗的独立轨道**。
+// 源值仍是真 RGB，由 rgb565() 做 BGR 交换（与全项目同一口径）。
+static constexpr uint16_t C_ARC_5H = rgb565(0xFA, 0x11, 0x4F);  // 外环 5H：Apple Move 粉
+static constexpr uint16_t C_ARC_WK = rgb565(0x92, 0xE8, 0x2A);  // 中环 WK.：Apple Exercise 绿
+static constexpr uint16_t C_ARC_MO = rgb565(0x00, 0xE5, 0xFF);  // 内环 MO.：Apple Stand 青
+static constexpr uint16_t C_TRACK_5H = rgb565(0x4A, 0x0E, 0x22);  // 外环轨道：暗栗（同环压暗）
+static constexpr uint16_t C_TRACK_WK = rgb565(0x24, 0x38, 0x0A);  // 中环轨道：暗绿（同环压暗）
+static constexpr uint16_t C_TRACK_MO = rgb565(0x06, 0x3B, 0x42);  // 内环轨道：暗青（同环压暗）
+// 行序 0/1/2 = 5H / WK. / MO.，与推送三段同序
+static constexpr uint16_t C_ARC_ROW[UsageManager::kBalanceLines] = {
+    C_ARC_5H, C_ARC_WK, C_ARC_MO};
+static constexpr uint16_t C_TRACK_ROW[UsageManager::kBalanceLines] = {
+    C_TRACK_5H, C_TRACK_WK, C_TRACK_MO};
+
+// ---- 字体（U8g2_for_Adafruit_GFX）----
+// U8g2 文字：balance 主页面只有圆环上角标签用 FONT_MINI（见下），boot 页
+// 提示语与 clock 页日期行用 Helvetica Regular 10pt（u8g2_font_helvR10_tf）；
+// 环 + 像素时钟都是 gfx 直绘，不走字模。
 static const uint8_t* const FONT_LABEL = u8g2_font_helvR10_tf;
-static const uint8_t* const FONT_MINI = u8g2_font_6x10_tf;
 
-// ---- 布局常量（与旧工程 main.cpp 完全一致）----
-// 新布局（240x240）：下半部分左右分栏，左时钟（日期 + HH/MM）、右额度
-//   ┌─ logo(居中) ──────────────────────┐ y=1
-//   ├─ 横线 y=40 ───────────────────────┤
-//   │ 日期 MM-DD WKD │ 状态行 UPDATE 22:00 │ y=44
-//   │  HH  (46px)    │ 5H    组 y=64     │
-//   │  ───────       │ WEEK  组 y=126    │
-//   │  MM  (46px)    │ MONTH 组 y=188    │
-//   └─ 错误条 y=226..240 ────────────────┘
-static constexpr int QUOTA_X0 = 124;  // 内容左边界
-static constexpr int QUOTA_X1 = 232;  // 右对齐基准
-// 额度区采用「组高 + 组间距」排布：组内三要素紧凑，组间留白。
-static constexpr int GROUP_TOP = 64;   // 状态行结束后留 6px
-static constexpr int GROUP_H = 46;     // 文字 / 轨道 / 重置文字的组高
-static constexpr int GROUP_GAP = 16;   // 组间留白，明显大于组内 2~4px
-static constexpr int ROW_BLOCK_BOTTOM = GROUP_TOP + GROUP_H * 3 + GROUP_GAP * 2;
-static constexpr int STATUS_Y = 44;   // 右栏顶部状态行顶部 y
-static constexpr int STATUS_H = 14;   // 状态行高度（slim）
+// ---- 布局常量（balance 主页面：logo + 居中巨型同心额度环 + 上角迷你标签 + 底部像素时钟）----
+//   ┌─ logo(居中, y=1..32) ─ 横线 y=40 ────────────┐
+//   │ UPD   ┃      三重同心额度环（放大版）     ┃ RST   │ 擦底框 x/y 44..196
+//   │ HH:MM ┃      外 5H / 中 WK. / 内 MO.     ┃ 5H: … │ 圆心 (120,120)
+//   │       ┃                                 ┃ 1W: … │ 标签行带：左 x0..43
+//   │       ┃                                 ┃ 1M: … │           右 x197..239
+//   └─ HH:MM:SS (textSize 3, y=204) ───────────┘ 擦除带 y=202..229
+//
+// 环几何 = stock 场景右下角圆环的放大版，推导关系不变：
+//   THICK=16、CAP_R=THICK/2=8、MID_R=R−CAP_R；
+//   径向带 外 [60,76] / 中 [36,52] / 内 [12,28]，环间空档 8px、中心 ⌀24px 空洞；
+//   弧两端半径 8px 的圆头帽正好填满所在环带的 16px 横截面、不外溢到邻环。
+static constexpr int RING_CX = 120;
+static constexpr int RING_CY = 120;
+static constexpr int RING_R[UsageManager::kBalanceLines] = {76, 52, 28};  // 各环外缘
+static constexpr int RING_THICK = 16;                       // 每环 16px 描边（向内取）
+static constexpr int RING_CAP_R = RING_THICK / 2;           // 圆头帽半径 = 8px
+static constexpr int RING_MID_R[UsageManager::kBalanceLines] = {
+    RING_R[0] - RING_CAP_R, RING_R[1] - RING_CAP_R, RING_R[2] - RING_CAP_R};
+// 擦底方框 = (外径+1)² = 153²，以圆心居中对称（x/y 44..196）。
+// 与相邻元素两个方向都错开：logo 横线 y=40（下沿空 3px）、时钟擦除带
+// y≥202（上沿空 5px）→ 时钟整条擦除绝不与环框相交。
+static constexpr int RING_BOX = 153;
+static constexpr int RING_X = RING_CX - RING_R[0];  // 44
+static constexpr int RING_Y = RING_CY - RING_R[0];  // 44
 
-static constexpr int CLOCK_X = 0;
-static constexpr int CLOCK_Y = 44;   // 时钟盒 44..203
-static constexpr int CLOCK_W = 120;
-static constexpr int CLOCK_H = 160;
+// 底部居中像素时钟：textSize 3 每字 18px，"00:00:00" 共 144px，x=48..191。
+// 分段擦除只在自己条带内（整条 x=46..193 / y=202..229），不整行横扫。
+static constexpr int CLOCK_X = 48;   // (240-144)/2 居中
+static constexpr int CLOCK_Y = 204;
+static constexpr int CLOCK_W = 144;  // == textWidthPx("00:00:00", 3)
 
-static constexpr int SEP_Y = 134;
-static constexpr int SEP_W = 56;
-static constexpr int SEP_SWING = 10;
-static constexpr int SEP_STRIP_X = 18;
-static constexpr int SEP_STRIP_Y = 131;
-static constexpr int SEP_STRIP_W = 84;
-static constexpr int SEP_STRIP_H = 6;
-
-static constexpr int CLOCK_CX = 60;  // 左栏水平中心
-static constexpr int HH_Y = 70;      // HH 大字顶部（占 y 70..116）
-static constexpr int MM_Y = 150;     // MM 大字顶部（占 y 150..196）
-static constexpr int DATE_X = 4;     // 日期行紧贴左沿
-static constexpr int DATE_Y = 50;
+// ---- 圆环上角迷你标签（左 UPD 两行 / 右 RST 四行）----
+// 字体 FONT_MINI = u8g2_font_4x6_tf：4px 定宽、字高 6px（ascent_A=5，字形实占
+// y_top..y_top+5），是本固件最小的全 ASCII 字模。选它而不选 gfx 内建字体
+// textSize 1（6px/字）是几何决定：右块示例行 `5H: HH:MM` 共 9 字符，4px 字宽
+// 36px 放得进 43px 右边距，6px 字宽要 54px 放不下。
+// 位置贴环框上角：左块文字右对齐 x=43（紧贴环框左缘 RING_X=44）、右块文字
+// 左对齐 x=197（紧贴环框右缘 RING_X+RING_BOX），两块首行字形顶 == 环框顶缘
+// RING_Y=44 → 块角正好咬住环擦底框的上角。行距 8px == 行带高 8px，相邻行带
+// 无缝拼接；每行只清自己那条行带（绝不横扫整行），且行带 x/y 全程在环擦底框
+// （x/y 44..196）与底部时钟擦除带（x46..193/y202..229）之外。
+static const uint8_t* const FONT_MINI = u8g2_font_4x6_tf;
+static constexpr int MINI_PITCH = 8;   // 行距 == 行带高：相邻行带无缝拼接不重叠
+static constexpr int MINI_BAND_H = 8;  // 字形 6px（y_top..y_top+5）+ 上下各 1px 余量
+// 渲染行容量 22：行带最多显示 10~11 字符（含 '~'），上游串再长也先截存
+// 再按带宽收缩，快照只存实际显示内容
+static constexpr size_t kMiniLineCap = 22;
+// 左块 UPD：标题行 + 更新时刻值行（右对齐，行带 x=0..43 恒在环框外）
+static constexpr int UPD_BAND_X = 0;
+static constexpr int UPD_BAND_W = RING_X;             // 44 → 行带 x 0..43
+static constexpr int UPD_TEXT_RIGHT = RING_X - 1;     // 43：文字右缘贴环框左上角
+static constexpr int UPD_Y = RING_Y;                  // 44：首行顶 == 环框顶缘
+// 右块 RST：标题行 + 5H/1W/1M 三行重置值（左对齐，行带 x=197..239 恒在环框外）
+static constexpr int RST_BAND_X = RING_X + RING_BOX;  // 197
+static constexpr int RST_BAND_W = 240 - RST_BAND_X;   // 43 → 行带 x 197..239
+static constexpr int RST_TEXT_X = RST_BAND_X;         // 197：文字左缘贴环框右上角
+static constexpr int RST_Y = RING_Y;                  // 44：与左块同高对齐
 
 // ---- 运行状态 ----
 static bool ever_started = false;
@@ -145,13 +169,39 @@ static bool ever_started = false;
 // 上次绘制的本地分钟（hour*60+min）/ 秒；-1 = 尚未绘制
 static int lastClockMinute = -1;
 static int lastClockSecond = -1;
-// 已绘制的 HH/MM 串与年积日（tickUi 差量更新基准）
-static String sClockHH;
-static String sClockMM;
-static int sClockYday = -1;
 
 // 主页面是否已绘制：只有绘制过后才允许时钟 tick / 局部重绘（boot 页除外）
 static bool mainPageDrawn = false;
+
+// ---------- 屏上额度快照（推送局部更新基准）----------
+// 旧布局的行快照（标签/重置/进度三维度 134B）随三段进度条一起删掉：屏上数据
+// 主体是三个百分比（环弧长），快照也只存三个 int（-1 = 空槽）→ 12B 静态、零堆。
+static int s_shownQuota[UsageManager::kBalanceLines] = {-1, -1, -1};
+// 圆环上角标签的屏上快照（渲染后串，快照 == 屏上像素）：UPD 值行 +
+// RST 三行显示行。标题行 UPD/RST 是常量文案，只有整屏/入场才画，无需快照。
+static char s_shownUpd[kMiniLineCap] = {0};
+static char s_shownReset[UsageManager::kBalanceLines][kMiniLineCap] = {{0}};
+// 快照是否可信（整屏绘制或局部重画后才为 true；退场/未画过主页面时为 false）
+static bool s_shownValid = false;
+// 推送到达待刷新标志：只走局部更新，不与显示设置变更的整屏重绘共用一个信号
+static bool s_pushRefreshPending = false;
+
+// 当前应上屏的第 index 槽位百分比（-1 = 无值空槽，只留轨道）。
+// setRowProgress 已钳到 0..100/-1，pushBalance 也会清掉本次行数外的旧值，
+// 所以直接读推送缓冲即可，无需再做显示回落（labels 不上屏；status/resets
+// 在右上/左上标签块原样展示，见 buildMiniValueLine）。
+static int ringPercent(uint8_t index) {
+    return index < UsageManager::kBalanceLines ? s_rowProgress[index] : -1;
+}
+
+// 绘制后同步快照（drawQuotaRings 收尾调用），保证「快照 == 屏上像素」，
+// 整屏与局部两条路径共用同一套记录逻辑。
+static void captureQuotaShown() {
+    for (uint8_t i = 0; i < UsageManager::kBalanceLines; i++) {
+        s_shownQuota[i] = ringPercent(i);
+    }
+    s_shownValid = true;
+}
 
 // ---------- 本地时间工具 ----------
 static bool timeSynced() { return time(nullptr) > TIME_MIN_VALID; }
@@ -164,54 +214,33 @@ static struct tm localTmNow() {
     return tmv;
 }
 
-// t 为"本地时刻"（UTC epoch + 时区偏移）
-static String formatLocalTime(time_t t, const char* fmt) {
-    struct tm tmv;
-    gmtime_r(&t, &tmv);
-    char buf[32];
-    strftime(buf, sizeof(buf), fmt, &tmv);
-    return String(buf);
+static int currentLocalMinute() {
+    if (!timeSynced()) return -1;
+    struct tm tmv = localTmNow();
+    return tmv.tm_hour * 60 + tmv.tm_min;
 }
 
-// ---------- 定长缓冲绘制工具（零堆：直接走 const char*，不经过 String）----------
-// 调用前须 u8g2().setFont(...)；测宽与绘制用同一字体。
-// 参数 y 为字形顶部（同旧 TFT_eSPI TL_DATUM），内部按当前字体 ascent 折算基线
-static int textWidthC(const char* s) {
-    return static_cast<int>(u8g2().getUTF8Width(s));
-}
-
-static void drawTextC(int x, int y, const char* s, uint16_t color) {
-    u8g2().setForegroundColor(color);
-    u8g2().drawUTF8(static_cast<int16_t>(x),
-                    static_cast<int16_t>(y + u8g2().getFontAscent()), s);
-}
-
-// UTF-8 安全截断：按显示宽度把 buf 就地截到 maxPx 内（不得溢出侵入相邻元素）。
-// 从尾部逐字符删除（跳过 10xxxxxx 后续字节），调用方保证 buf 以 NUL 结尾。
-static void truncateToFit(char* buf, int maxPx) {
-    while (buf[0] != '\0' && textWidthC(buf) > maxPx) {
-        size_t len = strlen(buf);
-        if (len == 0) break;
-        size_t cut = len - 1;
-        // 跳过 UTF-8 后续字节，找到字符起始字节
-        while (cut > 0 && (static_cast<uint8_t>(buf[cut]) & 0xC0) == 0x80) {
-            cut--;
-        }
-        buf[cut] = '\0';
-    }
+static int currentLocalSecond() {
+    if (!timeSynced()) return -1;
+    return localTmNow().tm_sec;
 }
 
 // ---------- 界面工具 ----------
 // 调用前须 u8g2().setFont(...)；测宽与绘制用同一字体。
 // 参数 y 为字形顶部（同旧 TFT_eSPI TL_DATUM），内部按当前字体 ascent 折算基线
-static void drawText(int x, int y, const String& s, uint16_t color) {
+static void drawText(int x, int y, const char* s, uint16_t color) {
     u8g2().setForegroundColor(color);
     u8g2().drawUTF8(static_cast<int16_t>(x),
-                    static_cast<int16_t>(y + u8g2().getFontAscent()), s.c_str());
+                    static_cast<int16_t>(y + u8g2().getFontAscent()), s);
 }
 
-static int textWidth(const String& s) {
-    return static_cast<int>(u8g2().getUTF8Width(s.c_str()));
+static int textWidth(const char* s) {
+    return static_cast<int>(u8g2().getUTF8Width(s));
+}
+
+// Arduino_GFX 的内建 6px 字体没有测量 API，按其实际字宽做像素测量（同 Scenes.cpp）。
+static int textWidthPx(const char* text, int textSize) {
+    return text == nullptr ? 0 : static_cast<int>(strlen(text)) * 6 * textSize;
 }
 
 // logo 位图恢复 16bpp 原始位图（23 色保真），按 TFT_eSPI pushImage 字节序
@@ -255,6 +284,7 @@ static void drawLogo(int x, int y) {
 // 渲染：每行把连续置位段合并为 drawFastHLine（等价旧固件 textsize=1 的
 // fillRect 行内 run 绘制），只画字不填底；颜色 C_WHITE。
 // 表存 flash，读取走 pgm_read_dword（IROM 32-bit 访问约束，见 IromAccess.h）。
+// 现仅 clock 场景页使用（balance 主页面的时钟已改 textSize 3 像素时钟）。
 
 #include "opencodego/SegFont7.h"
 
@@ -266,7 +296,7 @@ static void drawSegDigit(int x, int y, char ch, uint16_t color) {
     } else if (ch == '-') {
         idx = SEG7_DASH;
     } else if (ch == ':') {
-        idx = SEG7_COLON;  // ':' 仅 12px 宽（备用；时钟项目中缝线已表达分隔）
+        idx = SEG7_COLON;
     } else {
         return;
     }
@@ -290,352 +320,416 @@ static void drawSegDigit(int x, int y, char ch, uint16_t color) {
     }
 }
 
-// 七段大字：每字符宽 32（':' 宽 12），按真实字宽以 cx 居中
-//（无冒号串与旧版逐像素一致；含冒号串修正旧版 total=len*32 的偏心）
-static void drawSegText(int cx, int topY, const String& s, uint16_t color) {
-    int total = 0;
-    for (unsigned i = 0; i < s.length(); i++) {
-        total += (s[i] == ':') ? 12 : 32;
-    }
-    int x = cx - total / 2;
-    for (unsigned i = 0; i < s.length(); i++) {
-        drawSegDigit(x, topY, s[i], color);
-        x += (s[i] == ':') ? 12 : 32;
-    }
-}
-
-// ---------- 行/状态行的「有效显示内容」（局部更新比对的唯一口径）----------
-// 绘制与比对共用这两个函数 → 显示回退规则（空标签回落 5H/WK./MO.、空重置值
-// 显示 --、无进度按 -1 空槽处理）天然一致，不会出现「画了 A 却按 B 判变化」。
-// 截断不进快照：截断由同一份输入确定性地算出，存截断前文本即可。
-// 输出缓冲全部由调用方提供（栈上或静态），零堆分配。
-static void quotaRowDisplayText(uint8_t index, char* labelOut, size_t labelCap,
-                                char* resetOut, size_t resetCap, int* progressOut) {
-    const bool inPayload = index < s_rowCount;
-    const int progress = inPayload ? UsageManager::rowProgress(index) : -1;
-    const char* label = inPayload ? UsageManager::rowLabel(index) : "";
-    if (label[0] == '\0') {
-        label = (index == 0) ? "5H" : (index == 1 ? "WK." : "MO.");
-    }
-    const char* reset = inPayload ? UsageManager::rowReset(index) : "";
-    if (reset[0] == '\0') {
-        reset = "--";
-    }
-    strlcpy(labelOut, label, labelCap);
-    strlcpy(resetOut, reset, resetCap);
-    *progressOut = progress;
-}
-
-// 状态行有效文本（与推送时刻耦合：同内容的新推送会得到新的 "UPD HH:MM"）
-static void statusDisplayText(char* out, size_t cap) {
-    if (!s_hasPush) {
-        strlcpy(out, "WAITING", cap);
-    } else if (s_hasStatus && s_status[0] != '\0') {
-        strlcpy(out, s_status, cap);
-    } else if (s_pushEpoch > 0) {
-        const String t = "UPD " + formatLocalTime(s_pushEpoch + TZ_OFFSET_SEC, "%H:%M");
-        strlcpy(out, t.c_str(), cap);
-    } else {
-        strlcpy(out, "UPD --:--", cap);
-    }
-}
-
-// ---------- 屏上内容快照（推送局部更新基准）----------
-// 只存「当前屏上真正画出来的内容」，定长静态缓冲、零堆：
-//   3 × (标签 8 + 重置 16 + 进度 4) = 84B，状态行 48B，两个标志 2B → 共 134B。
-// 容量直接沿用推送缓冲的既有上限（kRowLabelCap / kRowResetCap / kStatusCap），
-// 逐行重建故无需额外 NUL 余量之外的冗余。
-struct QuotaRowShown {
-    char label[UsageManager::kRowLabelCap];
-    char reset[UsageManager::kRowResetCap];
-    int progress;
+// ---------- 额度环的数学工具（复制自 Scenes.cpp 的 StockScene::drawQuota 同款）----------
+// 1/255 定标的正弦表（0..90°，四分之一波）。画圆弧要取圆周坐标，为了不把 libm 的
+// sinf/cosf（连带浮点库和一堆代码）带进固件，这里用 91 字节查表 + 象限映射，误差
+// ≤ 0.5/255 ≈ 0.04px，240×240 屏上完全看不出来。91 字节常驻静态区（.rodata），
+// 不参与堆分配。
+static const uint8_t kSinUnitDeg[91] = {
+      0,   4,   9,  13,  18,  22,  27,  31,  35,  40,  44,  49,  53,  57,  62,
+     66,  70,  75,  79,  83,  87,  91,  96, 100, 104, 108, 112, 116, 120, 124,
+    127, 131, 135, 139, 143, 146, 150, 153, 157, 160, 164, 167, 171, 174, 177,
+    180, 183, 186, 190, 192, 195, 198, 201, 204, 206, 209, 211, 214, 216, 219,
+    221, 223, 225, 227, 229, 231, 233, 235, 236, 238, 240, 241, 243, 244, 245,
+    246, 247, 248, 249, 250, 251, 252, 253, 253, 254, 254, 254, 255, 255, 255,
+    255,
 };
-static QuotaRowShown s_shownRows[UsageManager::kBalanceLines];
-static char s_shownStatus[UsageManager::kStatusCap];
-// 快照是否可信（整屏绘制或局部重画后才为 true；退场/未画过主页面时为 false）
-static bool s_shownValid = false;
-// 推送到达待刷新标志：只走局部更新，不与显示设置变更的整屏重绘共用一个信号
-static bool s_pushRefreshPending = false;
 
-// 绘制后同步快照：drawQuotaRow / drawUpdateRow 各自收尾调用，
-// 保证「快照 == 屏上像素」，整屏与局部两条路径共用同一套记录逻辑。
-static void captureRowShown(uint8_t index) {
-    quotaRowDisplayText(index, s_shownRows[index].label, sizeof(s_shownRows[index].label),
-                        s_shownRows[index].reset, sizeof(s_shownRows[index].reset),
-                        &s_shownRows[index].progress);
-    s_shownValid = true;
-}
-
-// 第 index 行额度组的顶部 y（整屏与局部刷新共用，避免两处布局公式漂移）
-static int quotaRowY(uint8_t index) { return GROUP_TOP + (GROUP_H + GROUP_GAP) * index; }
-
-static void captureStatusShown() {
-    statusDisplayText(s_shownStatus, sizeof(s_shownStatus));
-    s_shownValid = true;
-}
-
-// ---------- 右栏额度行（三段式）----------
-// labels/resets/progress 均由 API 写入定长缓冲；设备只按位置排版，不解析字符串。
-// 空标签才回落到旧版固定标签，这是无标签数据时的显示兜底，不是语义解析。
-// 行带自清底 → 本身即一个自洽的局部更新单元（局部刷新直接复用）。
-void UsageManager::drawQuotaRow(int y, uint8_t index) {
-    auto* gfx = DisplayManager::getGfx();
-    gfx->fillRect(122, y, 112, GROUP_H, C_BG);
-
-    char label[UsageManager::kRowLabelCap];
-    char resetRaw[UsageManager::kRowResetCap];
-    int progress = -1;
-    quotaRowDisplayText(index, label, sizeof(label), resetRaw, sizeof(resetRaw), &progress);
-    const int contentX = 126;
-    const int contentX1 = 230;
-    const int contentW = contentX1 - contentX;
-
-    // 上方：左侧标签，右侧精确百分比；两者按同一基线绘制，不按各自顶边对齐。
-    // drawTextC 的 y 是字形顶部并会加当前字体 ascent，这里先反算顶部位置。
-    char labelFit[UsageManager::kRowLabelCap];
-    strlcpy(labelFit, label, sizeof(labelFit));
-    u8g2().setFont(FONT_LABEL);
-    truncateToFit(labelFit, contentW);
-
-    char pct[12];
-    const bool hasProgress = progress >= 0;
-    if (hasProgress) {
-        snprintf(pct, sizeof(pct), "%u%%", static_cast<unsigned>(progress));
+// sin(角度) 的 1/255 定标值（-255..255）。tenths = 角度×10，即 0.1° 分辨率，
+// 在 kSinUnitDeg 上线性插值。取 0.1° 而不是整度，是因为额度环的扇形边界正好是
+// 3.6·percent 度（如 70% → 252.0°、17% → 61.2°），整度会把边界量化掉 0.5°，
+// 在 r=76 处就是 0.66px 的错位；0.1° 只剩 0.07px。
+static int16_t sinUnitTenths(uint16_t tenths) {
+    tenths %= 3600U;
+    uint16_t folded = 0U;
+    bool negative = false;
+    if (tenths < 900U) {
+        folded = tenths;
+    } else if (tenths < 1800U) {
+        folded = 1800U - tenths;
+    } else if (tenths < 2700U) {
+        folded = tenths - 1800U;
+        negative = true;
     } else {
-        strlcpy(pct, "--", sizeof(pct));
+        folded = 3600U - tenths;
+        negative = true;
     }
-    const int labelAscent = u8g2().getFontAscent();
-    u8g2().setFont(FONT_PCT);
-    truncateToFit(pct, contentW);
-    const int pctAscent = u8g2().getFontAscent();
-
-    const int textBaseline = y + 12;
-    u8g2().setFont(FONT_LABEL);
-    drawTextC(contentX, textBaseline - labelAscent, labelFit, C_LABEL);
-    u8g2().setFont(FONT_PCT);
-    drawTextC(contentX1 - textWidthC(pct), textBaseline - pctAscent, pct,
-              hasProgress ? C_WHITE : C_RED);
-
-    // 中间：轨道紧跟文字，组内保持紧凑。
-    const int trackX = 126;
-    const int trackW = 104;
-    const int trackY = y + 16;
-    const int trackH = 12;
-    gfx->fillRect(trackX, trackY, trackW, trackH, C_BORDER);
-    if (hasProgress && progress > 0) {
-        const int fillW = (trackW * progress + 50) / 100;
-        const uint16_t fillColor = progress >= 50 ? C_OK : (progress >= 20 ? C_MID : C_RED);
-        gfx->fillRect(trackX, trackY, fillW, trackH, fillColor);
+    const uint16_t index = folded / 10U;   // 0..90
+    const int16_t remainder = static_cast<int16_t>(folded % 10U);
+    int16_t magnitude = 255;
+    if (index < 90U) {
+        const int16_t low = kSinUnitDeg[index];
+        const int16_t high = kSinUnitDeg[index + 1U];
+        magnitude = static_cast<int16_t>(low + (((high - low) * remainder + 5) / 10));
     }
-
-    // 下方：重置值由 API 提供（缺失时 quotaRowDisplayText 已回落为 "--"）。
-    u8g2().setFont(FONT_MINI);
-    char resetFit[UsageManager::kRowResetCap];
-    strlcpy(resetFit, resetRaw, sizeof(resetFit));
-    truncateToFit(resetFit, contentW);
-    drawTextC(contentX1 - textWidthC(resetFit), y + 31, resetFit, C_SUB);
-
-    captureRowShown(index);  // 画完即同步屏上快照（整屏/局部两条路径共用）
+    return negative ? static_cast<int16_t>(-magnitude) : magnitude;
 }
 
-// ---------- 左栏时钟区 ----------
-static int currentLocalMinute() {
-    if (!timeSynced()) return -1;
-    struct tm tmv = localTmNow();
-    return tmv.tm_hour * 60 + tmv.tm_min;
+// cos(角度) = sin(角度 + 90°)，复用同一张表。
+static int16_t cosUnitTenths(uint16_t tenths) {
+    return sinUnitTenths(static_cast<uint16_t>(tenths + 900U));
 }
 
-static int currentLocalSecond() {
-    if (!timeSynced()) return -1;
-    return localTmNow().tm_sec;
+// 32 位整数平方根（逐位恢复法）。算像素到圆心的距离要用到它 —— 引入 sqrtf() 连带
+// libm 与浮点库，正是上面那张正弦表要绕开的东西，所以这里手写整数版。
+static uint16_t isqrt32(uint32_t value) {
+    uint32_t remainder = value;
+    uint32_t root = 0U;
+    uint32_t bit = 1UL << 30;
+    while (bit > remainder) {
+        bit >>= 2;
+    }
+    for (; bit != 0U; bit >>= 2) {
+        if (remainder >= root + bit) {
+            remainder -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+    }
+    return static_cast<uint16_t>(root);
 }
 
-// 秒摆动：按当前秒做 4 步循环 左-中-右-中（sec&3），偏移 ±SEP_SWING
-static int sepOffsetForSecond(int sec) {
-    static const int kOffsets[4] = {-SEP_SWING, 0, SEP_SWING, 0};
-    return kOffsets[sec & 3];
+// 两个**已交换色序**的 RGB565 之间按 ratio(0..255) 线性插值。
+// BGR 交换是固定通道置换，与逐通道 lerp 可交换，所以直接在本文件 rgb565() 打包
+// 出来的值上插即可，不必回到源 RGB 再转换。三段通道位宽不同（5/6/5），
+// 必须各自在自己的位宽里插完再拼回去，跨位宽插会偏色。
+static uint16_t lerp565(uint16_t from, uint16_t to, uint8_t ratio) {
+    const int32_t weight = ratio;
+    const int32_t fromR = (from >> 11) & 0x1FU;
+    const int32_t fromG = (from >> 5) & 0x3FU;
+    const int32_t fromB = from & 0x1FU;
+    const int32_t red = fromR + ((((to >> 11) & 0x1FU) - fromR) * weight + 127) / 255;
+    const int32_t green = fromG + ((((to >> 5) & 0x3FU) - fromG) * weight + 127) / 255;
+    const int32_t blue = fromB + (((static_cast<int32_t>(to & 0x1FU) - fromB) * weight + 127) / 255);
+    return static_cast<uint16_t>((static_cast<uint32_t>(red) << 11) |
+                                 (static_cast<uint32_t>(green) << 5) |
+                                 static_cast<uint32_t>(blue));
 }
 
-// 短分隔线：已同步时按当前秒左右摆动，未同步时静态居中
-void UsageManager::drawSeparator() {
+// 圆头帽在单像素上的覆盖率（0..255）。dStart/dEnd 为像素中心到起点帽心 / 终点帽心
+// 的 1/16 px 距离。帽半径 RING_CAP_R(8)px = RING_CAP_R·16 单位，外缘再留 0.5px
+// （8 单位）渐隐，与环带边缘同一口径；两端帽取覆盖率较大者（1~3% 时两帽重叠，
+// 取 max 防止重复混色）。渐隐带恒 1px（16 单位），与 stock 场景同口径。
+static uint8_t capCoverage(int16_t dStart, int16_t dEnd) {
+    const int16_t dist = dStart < dEnd ? dStart : dEnd;
+    int32_t edge = RING_CAP_R * 16 + 8 - dist;
+    if (edge <= 0) {
+        return 0U;
+    }
+    if (edge > 16) {
+        edge = 16;              // 1px 宽的边缘过渡，内部恒为满覆盖
+    }
+    return static_cast<uint8_t>(edge * 255 / 16);
+}
+
+// ---------- 三重同心额度环（居中放大版）----------
+// 外/中/内 = 5H / WK. / MO.，无任何文字；弧长 = 百分比（唯一的数据通道，
+// 50% 半圈、100% 整圈），环色 = 行身份，不随数值变。从 12 点起顺时针扫：
+// x = cx + r·sin(deg)，y = cy − r·cos(deg)。轨道恒画满整圈（无值 -1 / 0%
+// 只留轨道，没有任何数据时也是三圈空轨道）。
+// 环区自清底（fillRect 只覆盖居中 153×153 框），本身就是自洽的局部更新单元，
+// 不碰 logo/横线/底部时钟（时钟擦除带 y≥202，与环框 y≤196 错开）。
+//
+// 画法：**逐像素距离场 + 径向覆盖率抗锯齿**（复制自 StockScene::drawQuota，
+// 仅放大几何常量）。不要改回按角度逐点落笔 —— 旧画法有三处根因：
+//   ① 相邻角度大量落在同一像素互相覆盖、偶尔跳 2px；
+//   ② 坐标 `>>16` 对负数是向 −∞ 取整，圆心左右两侧取整规律不一致；
+//   ③ 整数半径硬切无法表达亚像素覆盖，内外缘必然生硬。
+// 遍历包围盒每个像素：整数开方算到圆心距离，落在环带内的按覆盖率混色 ——
+// 径向完全对称、每像素只画一次、内外缘真抗锯齿。包围盒 153²=23k 像素随外径
+// 平方增长，属可接受的一次性开销（推送 5min 一次 / 入场一次）。
+// 相邻两环不会互相污染：环带之间有 8px 空白，抗锯齿最多向外洇 0.5px；帽盘
+// 半径取描边一半（8px）、圆心在中径上，恰好等于本环 16px 的横截面，也不会
+// 伸进邻环或空档。三带互不重叠，一个像素至多命中一条环带。
+//
+// 圆头帽（Apple 活动环的标志性端头）：仅 0 < percent < 100 时画。在弧的起、
+// 终两个端点各放一个半径 8px 的圆盘，圆心落在环带中径、位于端角上；圆盘会向
+// 扇形角外鼓出，把生硬的平切口变成圆头。帽盘的着墨判定**独立于**环带的径向
+// 区间（端角外的像素不在扇形内，却仍在帽内），两者覆盖率取 max 合并，于是每
+// 像素至多混色一次；1~3% 时起终两帽重叠，取 max 同样避免重复混色。
+//
+// 扇形边界（弧的端头）用**叉积**判，不比较角度也不比较余弦：
+//   A = cross(vΘ, P) = sinΘ·u − cosΘ·dx   —— A ≥ 0 ⇔ α ≤ Θ（在 α ≥ Θ−180 支上）
+//   B = dx ≥ 0                            —— ⇔ α ∈ [0,180]
+// 凸扇形 Θ≤180 取 A ≥ 0 且 B；反射扇形 Θ>180 取补得 A > 0 或 B。判据对 P
+// 线性，误差只有坐标的 1/255。别用「cos α ≥ cos Θ/2」半角写法：cos 在 0 附近
+// 极平坦，1% 档（Θ=3.6°）的余弦差不足半个 LSB，会整圈判反。
+void UsageManager::drawQuotaRings() {
     auto* gfx = DisplayManager::getGfx();
-    int x = CLOCK_CX - SEP_W / 2;
-    if (timeSynced()) x += sepOffsetForSecond(currentLocalSecond());
-    gfx->drawFastHLine(static_cast<int16_t>(x), SEP_Y, SEP_W, C_ACCENT);
+    // 只擦环区（居中 153×153 框 x/y 44..196），不碰 logo/横线/底部时钟。
+    gfx->fillRect(RING_X, RING_Y, RING_BOX, RING_BOX, C_BG);
+
+    // 每个环的扇形边界方向预先算好（1/255 定标），像素循环里只做点积。
+    // 形状 0 = 无弧（无值 -1 与 0% 都只剩轨道）、1 = 整圈、2 = 凸扇形、
+    // 3 = 反射扇形。没有额度数据时三段必全是 -1 → 三圈轨道照画，不提前返回。
+    uint8_t shape[kBalanceLines] = {};
+    int16_t sinT[kBalanceLines] = {};
+    int16_t cosT[kBalanceLines] = {};
+    // 圆头帽的圆心（仅形状 2/3 有效）：起点在角度 0、终点在角度 Θ，均落在
+    // 环带中径上。帽心以 1/16 px 定点存储，像素循环里不再做除法：
+    //   起点 (dx, up) = (0, midR)
+    //   终点 (dx, up) = (midR·sinΘ/255, midR·cosΘ/255)
+    int16_t capStartUp16[kBalanceLines] = {};
+    int16_t capEndDx16[kBalanceLines] = {};
+    int16_t capEndUp16[kBalanceLines] = {};
+    for (uint8_t i = 0; i < kBalanceLines; ++i) {
+        const int percent = ringPercent(i);
+        if (percent <= 0) {
+            shape[i] = 0U;
+        } else if (percent >= 100) {
+            shape[i] = 1U;   // 整圈：上面两个判据在 Θ=360° 都退化，单独短路
+        } else {
+            // Θ = 3.6·percent 度 = percent·36 个 0.1°；交叉相乘比不出浮点。
+            const uint16_t tenths = static_cast<uint16_t>(percent) * 36U;
+            sinT[i] = sinUnitTenths(tenths);
+            cosT[i] = cosUnitTenths(tenths);
+            shape[i] = percent <= 50 ? 2U : 3U;
+            const int32_t mid16 = static_cast<int32_t>(RING_MID_R[i]) * 16;
+            capStartUp16[i] = static_cast<int16_t>(mid16);
+            const int32_t ex = mid16 * sinT[i];
+            const int32_t ey = mid16 * cosT[i];
+            capEndDx16[i] = static_cast<int16_t>(
+                ex >= 0 ? (ex + 127) / 255 : -((-ex + 127) / 255));
+            capEndUp16[i] = static_cast<int16_t>(
+                ey >= 0 ? (ey + 127) / 255 : -((-ey + 127) / 255));
+        }
+    }
+
+    // 环带的内外边界，1/16 px 定标。取 (R−THICK+0.5) 与 (R+0.5) 而不是整数
+    // R−THICK / R，是为了让连续极限正好等于旧画法「取 r 与 r−1 两个整数半径」
+    // 的实际着墨面积 —— 换句话说抗锯齿只改边缘质感，不改环的视觉粗细。
+    int16_t inner16[kBalanceLines];
+    int16_t outer16[kBalanceLines];
+    for (uint8_t i = 0; i < kBalanceLines; ++i) {
+        inner16[i] = (RING_R[i] - RING_THICK) * 16 + 8;
+        outer16[i] = RING_R[i] * 16 + 8;
+    }
+
+    // 153×153 = 23409 次迭代（包围盒随外径平方增长，可接受）。
+    for (int16_t y = RING_Y; y < RING_Y + RING_BOX; ++y) {
+        for (int16_t x = RING_X; x < RING_X + RING_BOX; ++x) {
+            const int16_t dx = x - RING_CX;    // 右正
+            const int16_t up = RING_CY - y;    // 上正
+            // 到圆心的距离，1/16 px 定标：isqrt(n·2^8) 恰是 16·√n。
+            const int16_t r16 = static_cast<int16_t>(
+                isqrt32(static_cast<uint32_t>(dx * dx + up * up) << 8));
+            // 本像素在径向覆盖 [r−0.5, r+0.5]
+            const int16_t low = r16 - 8;
+            const int16_t high = r16 + 8;
+            for (uint8_t i = 0; i < kBalanceLines; ++i) {
+                // 环带覆盖率 0..255（像素自身径向宽 1px = 16 个 1/16 单位）
+                const int16_t from = low > inner16[i] ? low : inner16[i];
+                const int16_t to = high < outer16[i] ? high : outer16[i];
+                const uint8_t bandCov =
+                    to > from ? static_cast<uint8_t>((to - from) * 255 / 16) : 0U;
+                // 扇形归属：形状 1 恒在弧上；形状 2/3 用叉积判端点方向。
+                bool sector = false;
+                if (shape[i] == 1U) {
+                    sector = true;
+                } else if (shape[i] != 0U) {
+                    const int32_t cross =
+                        static_cast<int32_t>(sinT[i]) * up -
+                        static_cast<int32_t>(cosT[i]) * dx;
+                    sector = shape[i] == 2U ? (cross >= 0 && dx >= 0)
+                                            : (cross > 0 || dx >= 0);
+                }
+                // 圆头帽独立于环带径向区间判定（帽盘可在端角外，仍属本环）；
+                // 帽盘正好等于本环 16px 横截面，故不会命中邻环的带/空档。
+                uint8_t capCov = 0U;
+                if (shape[i] == 2U || shape[i] == 3U) {
+                    const int32_t sdx = static_cast<int32_t>(dx) * 16;
+                    const int32_t sup =
+                        static_cast<int32_t>(up) * 16 - capStartUp16[i];
+                    const int16_t sdist = static_cast<int16_t>(
+                        isqrt32(static_cast<uint32_t>(sdx * sdx + sup * sup)));
+                    const int32_t edx =
+                        static_cast<int32_t>(dx) * 16 - capEndDx16[i];
+                    const int32_t eup =
+                        static_cast<int32_t>(up) * 16 - capEndUp16[i];
+                    const int16_t edist = static_cast<int16_t>(
+                        isqrt32(static_cast<uint32_t>(edx * edx + eup * eup)));
+                    capCov = capCoverage(sdist, edist);
+                }
+                // 环带内像素**恒着墨**（在扇形内是弧色，否则是轨道色），所以
+                // 基准覆盖率就是 bandCov；帽盘可在扇形外单独补墨，取 max。
+                uint8_t total = bandCov;
+                if (capCov > total) {
+                    total = capCov;   // 帽与带取 max：每像素至多混色一次
+                }
+                if (total == 0U) {
+                    continue;   // 本环在此像素无着墨，试下一条环带
+                }
+                const bool onArc = sector || capCov != 0U;
+                const uint16_t base = onArc ? C_ARC_ROW[i] : C_TRACK_ROW[i];
+                // 环带**内外两侧都是页面底色（C_BG 暖棕）**，轨道只存在于环带
+                // 之内 —— 所以径向抗锯齿要往 C_BG 混。往轨道色混会给每个环外缘
+                // 糊上一层同色光晕，既虚胖又把环色洗淡。lerp565 输入是已交换
+                // 色序的值，勿二次交换。
+                gfx->drawPixel(x, y, total == 255U
+                                             ? base
+                                             : lerp565(C_BG, base, total));
+                break;   // 三条环带彼此隔 8px 空白，一个像素只可能命中一条
+            }
+        }
+    }
+
+    captureQuotaShown();  // 画完即同步屏上快照（整屏/局部两条路径共用）
 }
 
-// 左栏顶部日期星期：MM-DD WKD（未同步占位 "-- --"）
-void UsageManager::drawDateLine() {
-    String s;
-    if (timeSynced()) {
-        static const char* const kWeekday[7] = {"SUN", "MON", "TUE", "WED",
-                                                "THU", "FRI", "SAT"};
-        struct tm tmv = localTmNow();
-        s = formatLocalTime(time(nullptr) + TZ_OFFSET_SEC, "%m-%d");
-        s += ' ';
-        s += kWeekday[tmv.tm_wday];  // tm_wday: 0=Sun .. 6=Sat
-    } else {
-        s = "-- --";
-    }
-    u8g2().setFont(FONT_MINI);
-    drawText(DATE_X, DATE_Y, s, C_SUB);
-}
-
-// 前置声明：实现见下方纯时钟页段
-static void drawSegRuns(int x, int y, uint32_t bits, uint16_t color);
-static void redrawSegGlyphDiff(int x, int y, char oldCh, char newCh, uint16_t color);
-
-// 串级差量更新：按 32/12 走宽逐字形比对，仅翻转差异字形的差异段
-static void redrawSegTextDiff(int cx, int topY, const String& oldS, const String& newS, uint16_t color) {
-    int total = 0;
-    for (unsigned i = 0; i < newS.length(); i++) {
-        total += (newS[i] == ':') ? 12 : 32;
-    }
-
-    int x = cx - total / 2;
-
-    for (unsigned i = 0; i < newS.length(); i++) {
-        const char oldCh = (i < oldS.length()) ? oldS[i] : '\0';
-        redrawSegGlyphDiff(x, topY, oldCh, newS[i], color);
-        x += (newS[i] == ':') ? 12 : 32;
-    }
-}
-
-// 时间串生成（drawClock / tickUi 共用）
-static void clockStrings(String& hh, String& mm) {
-    hh = "--";
-    mm = "--";
-
-    if (currentLocalMinute() >= 0) {
+// ---------- 底部居中像素时钟（HH:MM:SS，textSize 3）----------
+// 复用 stock 场景 drawClock 的分段擦除模式：分钟字段变化才擦写 HH:MM:，
+// 平时每秒只擦写 SS 两个字符（36px）；整条擦除只在入场/整屏重绘时做，
+// 且只擦自己条带（x=46..193 / y=202..229，与环框 y≤196 不相交）。
+// 未同步时显示 "--:--:--" 占位（ASCII only），同步后由 tickUi 差量接管。
+void UsageManager::drawClock(bool minuteChanged, bool fullRedraw) {
+    auto* gfx = DisplayManager::getGfx();
+    char minuteText[8];
+    char secondText[3];
+    const bool synced = timeSynced();
+    if (synced) {
         const struct tm tmv = localTmNow();
-        char buf[4];
-        snprintf(buf, sizeof(buf), "%02d", tmv.tm_hour);
-        hh = buf;
-        snprintf(buf, sizeof(buf), "%02d", tmv.tm_min);
-        mm = buf;
+        strftime(minuteText, sizeof(minuteText), "%H:%M:", &tmv);
+        strftime(secondText, sizeof(secondText), "%S", &tmv);
+    } else {
+        strlcpy(minuteText, "--:--:", sizeof(minuteText));
+        strlcpy(secondText, "--", sizeof(secondText));
     }
-}
 
-// 左栏时钟：日期在顶、HH 大字在中上、MM 大字在下，中间一条摆动分隔线
-void UsageManager::drawClock() {
-    drawDateLine();  // 日期只在零点变化，由分钟/整盒重绘天然覆盖
+    gfx->setTextSize(3);
+    gfx->setTextColor(C_WHITE);
+    // 整条时钟恒为 CLOCK_W 宽（字形宽度固定，数字位数不变），水平居中。
+    const int16_t minuteWidth = textWidthPx("00:00:", 3);
+    const int16_t secondX = CLOCK_X + minuteWidth;
+    const int16_t secondWidth = textWidthPx("00", 3);
+    if (fullRedraw) {
+        // 只擦时钟自己那一条（x=46..193 / y=202..229），绝不能 fillRect(0,…,
+        // 240,…) 横扫 —— 圆环擦底框占 x/y 44..196，整行擦除会把三层同心环抹掉。
+        // 左右各留 2px 余量，保证字号下沿与首尾字形都不残留。
+        gfx->fillRect(CLOCK_X - 2, CLOCK_Y - 2, CLOCK_W + 4, 28, C_BG);
+    }
+    if (fullRedraw || minuteChanged) {
+        // 分钟跳变时整条擦除不会执行，必须先擦掉本区域再画，否则新旧分钟
+        // 数字直接叠在一起（14:37 → 14:38 会看到 7 与 8 重影）。
+        if (!fullRedraw) {
+            gfx->fillRect(CLOCK_X, CLOCK_Y - 2, minuteWidth, 28, C_BG);
+        }
+        gfx->setCursor(CLOCK_X, CLOCK_Y);
+        gfx->print(minuteText);
+    }
+    // 仅擦写秒字段，避免每秒把整条时钟重新推送到 SPI。
+    // 高度与全量路径一致，避免字号下沿残留上一秒字形。
+    gfx->fillRect(secondX, CLOCK_Y - 2, secondWidth, 28, C_BG);
+    gfx->setCursor(secondX, CLOCK_Y);
+    gfx->print(secondText);
 
-    String hh;
-    String mm;
-    clockStrings(hh, mm);
-
-    drawSegText(CLOCK_CX, HH_Y, hh, C_WHITE);
-
-    drawSeparator();  // 秒摆动分隔线（未同步时居中）
-
-    drawSegText(CLOCK_CX, MM_Y, mm, C_WHITE);
-
-    // 记录已绘制状态，供 tickUi 差量更新（未同步时不记录，保持 --/-- 可继续尝试）
-    sClockHH = hh;
-    sClockMM = mm;
-
-    const int minuteOfDay = currentLocalMinute();
-    if (minuteOfDay >= 0) {
-        lastClockMinute = minuteOfDay;
+    if (synced) {
+        lastClockMinute = currentLocalMinute();
         lastClockSecond = currentLocalSecond();
     }
 }
 
 // 常驻 tick（update() 每轮进一次，仅变化时碰屏；全部走像素差量，无清底闪烁）：
-//  - 分钟变化：仅差量更新 HH/MM 中变化的字形（换日补画日期行）
-//  - 秒变化：仅翻转摆动分隔线的新旧尾段
-//  未同步时分隔线保持静态居中
+//  - 分钟变化：擦写 HH:MM: 字段
+//  - 秒变化：只擦写 SS 字段
+//  未同步时保持 "--:--:--" 占位不动。
 void UsageManager::tickUi() {
+    if (!timeSynced()) {
+        return;
+    }
     const int m = currentLocalMinute();
-    if (m < 0) {
+    const int s = currentLocalSecond();
+    if (m == lastClockMinute && s == lastClockSecond) {
         return;
     }
-
-    auto* gfx = DisplayManager::getGfx();
-
-    if (m != lastClockMinute) {
-        String hh;
-        String mm;
-        clockStrings(hh, mm);
-
-        const struct tm tmv = localTmNow();
-
-        gfx->startWrite();
-        if (tmv.tm_yday != sClockYday) {
-            sClockYday = tmv.tm_yday;
-            drawDateLine();
-        }
-        if (hh != sClockHH) {
-            redrawSegTextDiff(CLOCK_CX, HH_Y, sClockHH, hh, C_WHITE);
-        }
-        if (mm != sClockMM) {
-            redrawSegTextDiff(CLOCK_CX, MM_Y, sClockMM, mm, C_WHITE);
-        }
-        gfx->endWrite();
-
-        sClockHH = hh;
-        sClockMM = mm;
-        lastClockMinute = m;
-        lastClockSecond = currentLocalSecond();
-        return;
-    }
-
-    int s = currentLocalSecond();  // 秒变化 -> 只差量更新分隔线
-    if (s == lastClockSecond) {
-        return;
-    }
-
-    const int oldX = CLOCK_CX - SEP_W / 2 + sepOffsetForSecond(lastClockSecond);
-    const int newX = CLOCK_CX - SEP_W / 2 + sepOffsetForSecond(s);
-    lastClockSecond = s;
-
-    if (newX == oldX) {
-        return;
-    }
-
-    // 两线段同行同宽，仅翻转互不重叠的尾段（重叠区不动 → 零闪烁）
-    gfx->startWrite();
-    if (newX > oldX) {
-        gfx->drawFastHLine(oldX, SEP_Y, newX - oldX, C_BG);
-        gfx->drawFastHLine(oldX + SEP_W, SEP_Y, newX - oldX, C_ACCENT);
-    } else {
-        gfx->drawFastHLine(newX + SEP_W, SEP_Y, oldX - newX, C_BG);
-        gfx->drawFastHLine(newX, SEP_Y, oldX - newX, C_ACCENT);
-    }
-    gfx->endWrite();
+    drawClock(m != lastClockMinute, false);  // 内部记录 lastClock*
 }
 
-// ---------- 右栏状态行 ----------
-// 右栏顶部 slim 状态行（推送模式，三态）：
-//   从未推送      -> "WAITING"
-//   有推送+状态行  -> 状态行文本（截断至 mini 字体 112px 内）
-//   有推送无状态行 -> "UPDATE HH:MM"（推送时刻本地时间；NTP 未同步时 "UPD --:--"）
-void UsageManager::drawUpdateRow() {
-    auto* gfx = DisplayManager::getGfx();
-    gfx->fillRect(122, STATUS_Y, 112, STATUS_H, C_BG);
+// ---------- 圆环上角迷你标签（左 UPD / 右 RST 两块）----------
+// 设备零语义：值行内容 = 推送缓冲**原样**上屏，转换全在上位机
+// tools/push_auto.py 预格式化（时间换算 / 5H·1W·1M 前缀 / 无值占位都在上游），
+// 设备端不做任何时间或重置解析，只管排版：
+//   i=0 UPD 行 ← status 原样（上游预格式化成 "HH:MM" 更新时刻），空 → "--:--"
+//   i=1..3 RST 行 ← resets[i-1] 原样（上游预格式化的完整显示行，如
+//            "5H: R14d3h"），空 → "--"
+// 空串回落 "--:--"/"--" 只是「无值」显示占位（同额度空槽口径），非内容换算。
 
+// 行宽超行带宽时逐字符收缩、末尾换 '~'（同 stock 场景名称截断口径）。
+// 4px 定宽字模下 RST 行带 43px 可容 10 字符（40px），上游典型行
+// "5H: R14d3h"（10 字符）正好不触发截断。
+static void fitMiniLine(char* s, int maxWidth) {
     u8g2().setFont(FONT_MINI);
-    char upd[UsageManager::kStatusCap];
-    statusDisplayText(upd, sizeof(upd));
-    truncateToFit(upd, 112);
-    drawTextC(QUOTA_X1 - textWidthC(upd), STATUS_Y + 4, upd, C_SUB);
+    size_t len = strlen(s);
+    // 每轮缩短一个字符并在新的末位换 '~'（内容截断标记）；len>1 保底，
+    // 最坏退化成单个 '~'，绝不空转。
+    while (len > 1 && textWidth(s) > maxWidth) {
+        len--;
+        s[len - 1] = '~';
+        s[len] = '\0';
+    }
+}
 
-    captureStatusShown();  // 画完即同步屏上快照
+// 值行 i 的当前应上屏串（0 = UPD 值行，1..3 = RST 三行显示串）
+static void buildMiniValueLine(uint8_t i, char* out, size_t cap) {
+    const char* raw = (i == 0) ? s_status : s_rowResets[i - 1];
+    const char* empty = (i == 0) ? "--:--" : "--";
+    strlcpy(out, raw[0] != '\0' ? raw : empty, cap);
+    fitMiniLine(out, i == 0 ? UPD_BAND_W : RST_BAND_W);
+}
+
+// 渲染串与屏上快照是否不一致（快照 == 屏上像素；相同 → 零绘制）
+static bool miniLineChanged(uint8_t i, const char* text) {
+    return strcmp(text, i == 0 ? s_shownUpd : s_shownReset[i - 1]) != 0;
+}
+
+// 画一条标签行：只清自己那条行带（MINI_BAND_H 高，绝不横扫整行）再写字。
+// rightAlign = 左块右对齐到 alignX；否则从 alignX 左对齐起排。
+static void drawMiniLineAt(int bandX, int bandW, int y, int alignX,
+                           bool rightAlign, const char* text, uint16_t color) {
+    auto* gfx = DisplayManager::getGfx();
+    gfx->fillRect(bandX, y - 1, bandW, MINI_BAND_H, C_BG);
+    u8g2().setFont(FONT_MINI);
+    drawText(rightAlign ? alignX + 1 - textWidth(text) : alignX, y, text, color);
+}
+
+// 单条值行上屏并同步快照（差量路径用；标题行是常量，只在整组绘制里出现）
+static void drawMiniValueLine(uint8_t i, const char* text) {
+    if (i == 0) {
+        drawMiniLineAt(UPD_BAND_X, UPD_BAND_W, UPD_Y + MINI_PITCH, UPD_TEXT_RIGHT,
+                       true, text, C_WHITE);
+        strlcpy(s_shownUpd, text, kMiniLineCap);
+        return;
+    }
+    const uint8_t r = i - 1;
+    drawMiniLineAt(RST_BAND_X, RST_BAND_W, RST_Y + (r + 1) * MINI_PITCH,
+                   RST_TEXT_X, false, text, C_WHITE);
+    strlcpy(s_shownReset[r], text, kMiniLineCap);
+}
+
+// 两块标签整组上屏（入场 / 整屏重绘路径）：标题行 C_SUB + 值行 C_WHITE，
+// 逐行擦各自的行带，收尾同步值行快照。
+void UsageManager::drawMiniLabels() {
+    char line[kMiniLineCap];
+    drawMiniLineAt(UPD_BAND_X, UPD_BAND_W, UPD_Y, UPD_TEXT_RIGHT, true,
+                   "UPD", C_SUB);
+    drawMiniLineAt(RST_BAND_X, RST_BAND_W, RST_Y, RST_TEXT_X, false,
+                   "RST", C_SUB);
+    for (uint8_t i = 0; i < 4; i++) {
+        buildMiniValueLine(i, line, sizeof(line));
+        drawMiniValueLine(i, line);
+    }
 }
 
 // ---------- 页面组装 ----------
-// 正文区域（状态行 + 额度栏 + 时钟栏 + 中缝竖线）；调用前须保证该区域已清底
+// 正文区域（居中额度环 + 圆环上角标签 + 底部像素时钟）；调用前须保证该区域已清底
 void UsageManager::drawBody() {
-    drawUpdateRow();
-    drawQuotaRow(quotaRowY(0), 0);
-    drawQuotaRow(quotaRowY(1), 1);
-    drawQuotaRow(quotaRowY(2), 2);
-    drawClock();
-    DisplayManager::getGfx()->drawFastVLine(120, STATUS_Y, ROW_BLOCK_BOTTOM - STATUS_Y, C_BORDER);
+    drawQuotaRings();
+    drawMiniLabels();
+    drawClock(true, true);
 }
 
 void UsageManager::drawMainPage() {
-    u8g2();  // 惰性初始化 U8g2 字形引擎
+    u8g2();  // 惰性初始化 U8g2 字形引擎（boot / clock 页沿用）
     auto* gfx = DisplayManager::getGfx();
     gfx->startWrite();
     gfx->fillScreen(C_BG);
@@ -646,40 +740,43 @@ void UsageManager::drawMainPage() {
 }
 
 // ---------- 推送局部刷新 ----------
-// 与七段时钟的像素差量重绘同一思路：推送只可能改动状态行与三行额度，
-// 因此只重画「屏上内容真的变了」的那一行（drawQuotaRow 行带自清底），
-// 内容完全一致时一次绘制都不做 → 消除整屏 fillScreen 造成的闪烁。
+// 与像素时钟的差量重绘同一思路：推送只可能改动三个额度百分比（环弧长）与
+// 四条标签值行（UPD / RST 显示串），因此只重画「屏上真的变了」的
+// 环块与标签行（环块自清底、标签行各自清自己的行带），内容完全一致时一次
+// 绘制都不做 → 消除整屏 fillScreen 造成的闪烁。
 // 返回是否真的碰了屏（全一致时 false → 零绘制）
 bool UsageManager::redrawChangedQuota() {
     // 先算差异再决定是否碰屏：全一致 → 零绘制（连 startWrite 都不开）
-    uint8_t changedRows = 0;
-    char label[UsageManager::kRowLabelCap];
-    char reset[UsageManager::kRowResetCap];
-    int progress = -1;
-    for (uint8_t i = 0; i < UsageManager::kBalanceLines; i++) {
-        quotaRowDisplayText(i, label, sizeof(label), reset, sizeof(reset), &progress);
-        if (strncmp(label, s_shownRows[i].label, UsageManager::kRowLabelCap) != 0 ||
-            strncmp(reset, s_shownRows[i].reset, UsageManager::kRowResetCap) != 0 ||
-            progress != s_shownRows[i].progress) {
-            changedRows |= static_cast<uint8_t>(1U << i);
+    bool ringsChanged = false;
+    for (uint8_t i = 0; i < kBalanceLines; i++) {
+        if (ringPercent(i) != s_shownQuota[i]) {
+            ringsChanged = true;
+            break;
         }
     }
-    char status[UsageManager::kStatusCap];
-    statusDisplayText(status, sizeof(status));
-    const bool statusChanged = (strncmp(status, s_shownStatus, UsageManager::kStatusCap) != 0);
-    if (changedRows == 0 && !statusChanged) {
+    char lines[4][kMiniLineCap];
+    bool lineChanged[4] = {false, false, false, false};
+    bool labelsChanged = false;
+    for (uint8_t i = 0; i < 4; i++) {
+        buildMiniValueLine(i, lines[i], sizeof(lines[i]));
+        lineChanged[i] = miniLineChanged(i, lines[i]);
+        labelsChanged = labelsChanged || lineChanged[i];
+    }
+    if (!ringsChanged && !labelsChanged) {
         return false;
     }
 
     u8g2();
     auto* gfx = DisplayManager::getGfx();
     gfx->startWrite();
-    if (statusChanged) {
-        drawUpdateRow();  // 内部同步快照
+    // 环块只在弧长变化时整块重画（自清底只覆盖 153×153 框，不碰框外标签）；
+    // 标签行各画各的，只动快照不一致的那条。
+    if (ringsChanged) {
+        drawQuotaRings();  // 自清底 + 收尾同步环快照
     }
-    for (uint8_t i = 0; i < kBalanceLines; i++) {
-        if (changedRows & (1U << i)) {
-            drawQuotaRow(quotaRowY(i), i);  // 内部同步快照
+    for (uint8_t i = 0; i < 4; i++) {
+        if (lineChanged[i]) {
+            drawMiniValueLine(i, lines[i]);
         }
     }
     gfx->endWrite();
@@ -802,7 +899,7 @@ static void drawClockPageDate() {
     }
 
     u8g2().setFont(FONT_LABEL);
-    drawText(CLOCK_PAGE_CX - textWidth(s) / 2, CLOCK_PAGE_DATE_Y, s, C_SUB);
+    drawText(CLOCK_PAGE_CX - textWidth(s.c_str()) / 2, CLOCK_PAGE_DATE_Y, s.c_str(), C_SUB);
 }
 
 // 纯时钟页入场：从零绘制所有元素（场景切换契约）
@@ -878,7 +975,7 @@ void UsageManager::pushBalance(uint8_t rowCount, const char* status, bool hasSta
     s_pushMillis = millis();
     s_pushEpoch = timeSynced() ? time(nullptr) : 0;
     // 立即刷新显示：只置「推送待刷新」，由 update() 走局部更新
-    //（逐行比对屏上快照，只重画变化行；严禁绘制启动屏，见坑 #4）
+    //（比对屏上额度环/标签快照，只重画变化环块与标签行；严禁绘制启动屏，见坑 #4）
     // 注意不碰 DisplayManager::requestFullRedraw()：那是显示设置变更
     //（rotation / 面板 profile）的整屏重绘信号，两者互不降级。
     s_pushRefreshPending = true;
@@ -926,12 +1023,12 @@ void UsageManager::update() {
         Logger::info("UsageManager: main page redrawn", "Balance");
     }
 
-    // 上位机推送：只重画与推送缓冲/屏上快照不一致的行（内容全同则零绘制）
+    // 上位机推送：只重画与推送缓冲/屏上快照不一致的环块与标签值行（内容全同则零绘制）
     if (s_pushRefreshPending) {
         s_pushRefreshPending = false;
         if (mainPageDrawn && s_shownValid) {
             if (redrawChangedQuota()) {
-                Logger::info("UsageManager: balance rows redrawn (diff only)", "Balance");
+                Logger::info("UsageManager: quota/labels redrawn (diff only)", "Balance");
             } else {
                 Logger::info("UsageManager: balance push unchanged (no redraw)", "Balance");
             }

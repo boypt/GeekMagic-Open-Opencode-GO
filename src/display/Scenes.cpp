@@ -347,6 +347,21 @@ static auto lerp565(uint16_t from, uint16_t to, uint8_t ratio) -> uint16_t {
                                  static_cast<uint32_t>(blue));
 }
 
+/// 圆头帽在单像素上的覆盖率（0..255）。dStart/dEnd 为像素中心到起点帽心 / 终点帽心
+/// 的 1/16 px 距离。帽半径 2px = 32 单位，外缘再留 0.5px（8 单位）渐隐，
+/// 与环带边缘同一口径；两端帽取覆盖率较大者（1~3% 时两帽重叠，取 max 防止重复混色）。
+static auto capCoverage(int16_t dStart, int16_t dEnd) -> uint8_t {
+    const int16_t dist = dStart < dEnd ? dStart : dEnd;
+    int32_t edge = 40 - dist;   // 32(半径) + 8(0.5px 外缘) − 距离
+    if (edge <= 0) {
+        return 0U;
+    }
+    if (edge > 16) {
+        edge = 16;              // 1px 宽的边缘过渡，内部恒为满覆盖
+    }
+    return static_cast<uint8_t>(edge * 255 / 16);
+}
+
 // ---------- stock：推送的股票行情 ----------
 // 固定五个槽位让 1~5 行的切换不跳动；数据变化只擦写行带，不触碰整屏。
 class StockScene : public Scene {
@@ -445,36 +460,29 @@ class StockScene : public Scene {
     /// 平盘 0.00%：中性白，比灰蓝醒目，也不与涨跌色混淆
     static constexpr uint16_t C_NEUTRAL = rgb565(0xFF, 0xFF, 0xFF);
     // 额度环：颜色**按行固定**，不随百分比变 —— 三个环各占一个身份色，数值完全
-    // 由弧长表达，色相只负责分辨「哪一个环是 5H / WK. / MO.」。所以这里不能套
-    // 额度页那套「越多越绿/越少越红」的严重度分档（会与 stock 的涨跌红绿打架，
-    // 也会被误读成告警），而是取三个**平级**的身份色。
-    //
-    // 上一版三色（#FFC53D / #FF7A2F / #B85C2E）在小屏上糊成一团，根因是两处：
-    //   ① 5H→WK 明度只差 2.7 点（62.0 vs 59.2），色相差 20° 却被同族暖色吃掉；
-    //   ② WK→MO 色相只差 1.7°（21.6° vs 20.0°），几乎同色，只靠明度硬撑，
-    //      而 2px 细弧 + 20% 背光又把这点明度差压掉了 —— 于是中圈与内圈糊成一片。
-    // 现改为**色相与明度同向单调递减**的三级阶梯（奶金 → 琥珀 → 陶红）：
-    //   5H #FFF2B4  H=51.7°  L=84.7   最亮的浅奶金
-    //   WK #FCA654  H=29.3°  L=65.9   中间调琥珀
-    //   MO #D4523C  H= 8.7°  L=53.3   最沉的陶红
-    // 三个色相角各差 20° 以上（52→29→9），明度各降 12 点以上，20% 背光下相邻
-    // 两环的实显亮度比仍有 1.80 / 2.37，肉眼一眼可分。
-    // 引入浅奶金作为第四种「色相」是为了把外环抬到足够亮 —— 这是暖调内部的
-    // 明度扩展，不引入任何冷色，整体仍是橙红黄棕。
-    // MO 比上一版更亮（L 45.5→53.3、对轨道对比 1.58→1.64），不会退回「看着
-    // 像空了半圈」的老问题；且刻意避开纯红（对涨红 #FF0000 的 ΔE=41，明显
-    // 偏棕的陶土色而非正红），也不含绿，不会与行情涨跌红绿混淆。
+    // 由弧长表达，色相只负责分辨「哪一个环是 5H / WK. / MO.」。现采用 Apple Watch
+    // 活动环的身份配色（粉 / 绿 / 青），每环再配一条**同色相压暗的独立轨道**
+    // （不再是三环共用的深棕轨道），并给弧的两端加圆头帽（见 drawQuota）。
+    // 取舍：粉/绿与行情涨红 #FF0000 / 跌绿 #00FF00 色相接近，但用户选定此配色，
+    // 且三环固定在右下角、与左侧行情文本空间隔离，实机上不会混淆。
     // 源值仍是真 RGB，由本文件的 rgb565() 做 BGR 交换（与全项目同一口径）。
-    static constexpr uint16_t C_TRACK = rgb565(0x40, 0x28, 0x1A);  // 轨道：深棕（同额度页 C_BORDER）
-    static constexpr uint16_t C_BAR_5H = rgb565(0xFF, 0xF2, 0xB4);  // 浅奶金（最亮）
-    static constexpr uint16_t C_BAR_WK = rgb565(0xFC, 0xA6, 0x54);  // 琥珀（居中）
-    static constexpr uint16_t C_BAR_MO = rgb565(0xD4, 0x52, 0x3C);  // 陶红（最沉但仍清晰）
+    static constexpr uint16_t C_ARC_5H = rgb565(0xFA, 0x11, 0x4F);  // 外环 5H：Apple Move 粉
+    static constexpr uint16_t C_ARC_WK = rgb565(0x92, 0xE8, 0x2A);  // 中环 WK.：Apple Exercise 绿
+    static constexpr uint16_t C_ARC_MO = rgb565(0x00, 0xE5, 0xFF);  // 内环 MO.：Apple Stand 青
+    static constexpr uint16_t C_TRACK_5H = rgb565(0x4A, 0x0E, 0x22);  // 外环轨道：暗栗（同环压暗）
+    static constexpr uint16_t C_TRACK_WK = rgb565(0x24, 0x38, 0x0A);  // 中环轨道：暗绿（同环压暗）
+    static constexpr uint16_t C_TRACK_MO = rgb565(0x06, 0x3B, 0x42);  // 内环轨道：暗青（同环压暗）
     /// 行序 0/1/2 = 5H / WK. / MO.，与额度页三行同序
-    static constexpr uint16_t C_BAR_ROW[StockData::QUOTA_MAX] = {
-        C_BAR_5H, C_BAR_WK, C_BAR_MO};
+    static constexpr uint16_t C_ARC_ROW[StockData::QUOTA_MAX] = {
+        C_ARC_5H, C_ARC_WK, C_ARC_MO};
+    static constexpr uint16_t C_TRACK_ROW[StockData::QUOTA_MAX] = {
+        C_TRACK_5H, C_TRACK_WK, C_TRACK_MO};
     // 额度指示 = **右下角**三重同心圆环，整体外径 40px，擦底方框 41×41。
     // 贴右下角各留 5px 余量：方框占 x=193..233 / y=194..234（屏幕 240×240），
     // 圆心 (213,214)，最外半径 20，故实际像素恰在框内不越界。
+    // 描边 4px + 环间空档 2px → 径向带 外 [16,20] / 中 [10,14] / 内 [4,8]，
+    // 三带互不重叠；中径 18/12/6，中心留 ⌀8px 空洞。弧两端各加半径 2px
+    // （= 描边一半）的圆头帽，帽盘正好填满所在环带的 4px 横截面、不外溢到邻环。
     // 环区与其它元素在两个方向上都错开，互不覆盖：
     //   · 行情行擦除带止于 y=180（环从 y=194 起，纵向 14px 空档）
     //   · 时钟擦除带只到 x=149（CLOCK_X−2 .. CLOCK_X+CLOCK_W+1），
@@ -485,8 +493,12 @@ class StockScene : public Scene {
     static constexpr int16_t RING_Y = 194;
     static constexpr int16_t RING_CX = RING_X + 20;
     static constexpr int16_t RING_CY = RING_Y + 20;
-    static constexpr int16_t RING_R[StockData::QUOTA_MAX] = {20, 14, 8};
-    static constexpr uint8_t RING_THICK = 2;   // 每环 2px 描边（向内取）
+    static constexpr int16_t RING_R[StockData::QUOTA_MAX] = {20, 14, 8};  // 各环外缘
+    static constexpr uint8_t RING_THICK = 4;   // 每环 4px 描边（向内取）
+    static constexpr uint8_t RING_CAP_R = RING_THICK / 2;  // 圆头帽半径 = 2px
+    /// 环带中径 = 外缘 − 帽半径，即 18/12/6；帽心与弧心对齐于此
+    static constexpr int16_t RING_MID_R[StockData::QUOTA_MAX] = {
+        RING_R[0] - RING_CAP_R, RING_R[1] - RING_CAP_R, RING_R[2] - RING_CAP_R};
     static constexpr int16_t ROW_Y = 50;
     static constexpr uint8_t ROW_STEP = 27;
     // 时钟**左对齐**（不再水平居中）：字号 3 每字 18px，8 字符共 144px，
@@ -561,14 +573,21 @@ class StockScene : public Scene {
     ///      drawPixel 里 56% 是重复覆盖同一像素），偶尔又跳 2px —— 弧长忽疏忽密。
     ///   ② 坐标用 `>> 16`，对负数是算术右移（向 −∞ 取整）而非就近取整，圆心左右
     ///      两侧取整规律不一致，一侧顺一侧毛。
-    ///   ③ 2px 描边按整数半径硬切，无法表达亚像素部分覆盖，内外缘必然是硬的。
+    ///   ③ 细描边按整数半径硬切，无法表达亚像素部分覆盖，内外缘必然是硬的。
     /// 现在反过来遍历包围盒里每个像素：整数开方算它到圆心的距离，落在环带内的按
     /// 覆盖率把颜色混出来 —— 径向完全对称（无累积取整误差）、每像素只画一次、
     /// 内外缘是真抗锯齿。与 16×16 超采样理想图（同样用 565 量化色）比对，平均
     /// 通道误差 44.7 → 4.9（三环同 70%）/ 44.6 → 4.7（100/50/0%）/ 26.3 → 3.0
     /// （3% 最小弧），三档都降 89%。
-    /// 相邻两环不会互相污染：环带之间本就有 4px 空白，抗锯齿最多向外洇 0.5px，
-    /// 实测同时被两条环带覆盖的像素为 0，环 0↔环 1 的着墨像素最小中心距 3.61px。
+    /// 相邻两环不会互相污染：环带之间本就有 2px 空白，抗锯齿最多向外洇 0.5px；
+    /// 帽盘半径取描边一半（2px）、圆心在中径上，恰好等于本环 4px 的横截面，
+    /// 故也不会伸进邻环或空档。三带互不重叠，一个像素至多命中一条环带。
+    ///
+    /// 圆头帽（Apple 活动环的标志性端头）：仅 0 < percent < 100 时画。在弧的起、
+    /// 终两个端点各放一个半径 2px 的圆盘，圆心落在环带中径、位于端角上；圆盘会向
+    /// 扇形角外鼓出，把生硬的平切口变成圆头。帽盘的着墨判定**独立于**环带的径向
+    /// 区间（端角外的像素不在扇形内，却仍在帽内），两者覆盖率取 max 合并，于是每
+    /// 像素至多混色一次；1~3% 时起终两帽重叠，取 max 同样避免重复混色。
     ///
     /// 扇形边界（弧的端头）用**叉积**判，不比较角度也不比较余弦：
     ///   A = cross(vΘ, P) = sinΘ·u − cosΘ·dx   —— A ≥ 0 ⇔ α ≤ Θ（在 α ≥ Θ−180 支上）
@@ -589,6 +608,13 @@ class StockScene : public Scene {
         uint8_t shape[StockData::QUOTA_MAX] = {};
         int16_t sinT[StockData::QUOTA_MAX] = {};
         int16_t cosT[StockData::QUOTA_MAX] = {};
+        // 圆头帽的圆心（仅形状 2/3 有效）：起点在角度 0、终点在角度 Θ，均落在
+        // 环带中径上。帽心以 1/16 px 定点存储，像素循环里不再做除法：
+        //   起点 (dx, up) = (0, midR)
+        //   终点 (dx, up) = (midR·sinΘ/255, midR·cosΘ/255)
+        int16_t capStartUp16[StockData::QUOTA_MAX] = {};
+        int16_t capEndDx16[StockData::QUOTA_MAX] = {};
+        int16_t capEndUp16[StockData::QUOTA_MAX] = {};
         for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
             const int16_t percent = m_savedQuota[i];
             if (percent <= 0) {
@@ -601,6 +627,14 @@ class StockScene : public Scene {
                 sinT[i] = sinUnitTenths(tenths);
                 cosT[i] = cosUnitTenths(tenths);
                 shape[i] = percent <= 50 ? 2U : 3U;
+                const int32_t mid16 = static_cast<int32_t>(RING_MID_R[i]) * 16;
+                capStartUp16[i] = static_cast<int16_t>(mid16);
+                const int32_t ex = mid16 * sinT[i];
+                const int32_t ey = mid16 * cosT[i];
+                capEndDx16[i] = static_cast<int16_t>(
+                    ex >= 0 ? (ex + 127) / 255 : -((-ex + 127) / 255));
+                capEndUp16[i] = static_cast<int16_t>(
+                    ey >= 0 ? (ey + 127) / 255 : -((-ey + 127) / 255));
             }
         }
 
@@ -614,8 +648,8 @@ class StockScene : public Scene {
             outer16[i] = RING_R[i] * 16 + 8;
         }
 
-        // 41×41 = 1681 次迭代，其中约 710 次真正落笔 —— 比旧画法 2160 次
-        // drawPixel（且 56% 互相覆盖）还少，SPI 传输量不增反降。
+        // 41×41 = 1681 次迭代，其中约千次真正落笔 —— 仍少于旧画法 2160 次
+        // drawPixel（且 56% 互相覆盖），SPI 传输量不增反降。
         for (int16_t y = RING_Y; y < RING_Y + RING_BOX; ++y) {
             for (int16_t x = RING_X; x < RING_X + RING_BOX; ++x) {
                 const int16_t dx = x - RING_CX;    // 右正
@@ -627,32 +661,57 @@ class StockScene : public Scene {
                 const int16_t low = r16 - 8;
                 const int16_t high = r16 + 8;
                 for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
+                    // 环带覆盖率 0..255（像素自身径向宽 1px = 16 个 1/16 单位）
                     const int16_t from = low > inner16[i] ? low : inner16[i];
                     const int16_t to = high < outer16[i] ? high : outer16[i];
-                    if (to <= from) {
-                        continue;
-                    }
-                    // 覆盖率 0..255（像素自身径向宽 1px = 16 个 1/16 单位）
-                    const uint8_t coverage =
-                        static_cast<uint8_t>((to - from) * 255 / 16);
-                    bool onArc = false;
+                    const uint8_t bandCov =
+                        to > from ? static_cast<uint8_t>((to - from) * 255 / 16) : 0U;
+                    // 扇形归属：形状 1 恒在弧上；形状 2/3 用叉积判端点方向。
+                    bool sector = false;
                     if (shape[i] == 1U) {
-                        onArc = true;
+                        sector = true;
                     } else if (shape[i] != 0U) {
                         const int32_t cross =
                             static_cast<int32_t>(sinT[i]) * up -
                             static_cast<int32_t>(cosT[i]) * dx;
-                        onArc = shape[i] == 2U ? (cross >= 0 && dx >= 0)
-                                               : (cross > 0 || dx >= 0);
+                        sector = shape[i] == 2U ? (cross >= 0 && dx >= 0)
+                                                : (cross > 0 || dx >= 0);
                     }
-                    const uint16_t base = onArc ? C_BAR_ROW[i] : C_TRACK;
+                    // 圆头帽独立于环带径向区间判定（帽盘可在端角外，仍属本环）；
+                    // 帽盘正好等于本环 4px 横截面，故不会命中邻环的带/空档。
+                    uint8_t capCov = 0U;
+                    if (shape[i] == 2U || shape[i] == 3U) {
+                        const int32_t sdx = static_cast<int32_t>(dx) * 16;
+                        const int32_t sup =
+                            static_cast<int32_t>(up) * 16 - capStartUp16[i];
+                        const int16_t sdist = static_cast<int16_t>(
+                            isqrt32(static_cast<uint32_t>(sdx * sdx + sup * sup)));
+                        const int32_t edx =
+                            static_cast<int32_t>(dx) * 16 - capEndDx16[i];
+                        const int32_t eup =
+                            static_cast<int32_t>(up) * 16 - capEndUp16[i];
+                        const int16_t edist = static_cast<int16_t>(
+                            isqrt32(static_cast<uint32_t>(edx * edx + eup * eup)));
+                        capCov = capCoverage(sdist, edist);
+                    }
+                    // 环带内像素**恒着墨**（在扇形内是弧色，否则是轨道色），所以
+                    // 基准覆盖率就是 bandCov；帽盘可在扇形外单独补墨，取 max。
+                    uint8_t total = bandCov;
+                    if (capCov > total) {
+                        total = capCov;   // 帽与带取 max：每像素至多混色一次
+                    }
+                    if (total == 0U) {
+                        continue;   // 本环在此像素无着墨，试下一条环带
+                    }
+                    const bool onArc = sector || capCov != 0U;
+                    const uint16_t base = onArc ? C_ARC_ROW[i] : C_TRACK_ROW[i];
                     // 环带**内外两侧都是背景（纯黑）**，轨道只存在于环带之内 ——
-                    // 所以径向抗锯齿要往 C_BG 混。往 C_TRACK 混会给每个环外缘糊上
-                    // 一层深棕光晕，既虚胖又把环色洗淡。
-                    gfx->drawPixel(x, y, coverage == 255U
+                    // 所以径向抗锯齿要往 C_BG 混。往轨道色混会给每个环外缘糊上
+                    // 一层同色光晕，既虚胖又把环色洗淡。
+                    gfx->drawPixel(x, y, total == 255U
                                                  ? base
-                                                 : lerp565(C_BG, base, coverage));
-                    break;   // 三条环带彼此隔 4px 空白，一个像素只可能命中一条
+                                                 : lerp565(C_BG, base, total));
+                    break;   // 三条环带彼此隔 2px 空白，一个像素只可能命中一条
                 }
             }
         }

@@ -4,6 +4,7 @@ function ntpHandler() {
     lastStatus: "",
     lastSyncTime: 0,
     lastOk: false,
+    lastServer: "",
     ntpServer: "",
 
     fetchStatus() {
@@ -13,6 +14,7 @@ function ntpHandler() {
           this.lastStatus = data.lastStatus || "";
           this.lastSyncTime = data.lastSyncTime || 0;
           this.lastOk = data.lastOk || false;
+          this.lastServer = data.ntp_server || "";
         })
         .catch((err) => {
           this.lastStatus = "error fetching status";
@@ -28,6 +30,7 @@ function ntpHandler() {
           this.lastStatus = data.lastStatus || "";
           this.lastSyncTime = data.lastSyncTime || 0;
           this.lastOk = data.status === "ok";
+          this.lastServer = data.ntp_server || "";
         })
         .catch((err) => {
           this.lastStatus = "sync failed";
@@ -36,6 +39,13 @@ function ntpHandler() {
         .finally(() => {
           this.loading = false;
         });
+    },
+
+    // 状态文案：synced 时拼上实际生效的服务器地址（例 "Synced: ... to pool.ntp.org"）
+    statusText() {
+      return this.lastServer
+        ? this.lastStatus + " to " + this.lastServer
+        : this.lastStatus;
     },
 
     fetchConfig() {

@@ -88,16 +88,18 @@ auto ConfigManager::load() -> bool {
     String nvs_password = secure.get("wifi_password", "");
     String nvs_api_token = secure.get("api_token", "");
 
+    // ntp_server 属于 config.json 的常规显示/系统配置，无条件载入；不要放进
+    // WiFi 凭据迁移分支，否则已配网设备重刷文件系统后该项永远读不回来（会随 save() 丢键）。
+    if (ntp_server_cfg.length() != 0) {
+        this->ntp_server = ntp_server_cfg.c_str();
+    }
+
     if ((ssid.length() != 0 && nvs_ssid.length() == 0) || (password.length() != 0 && nvs_password.length() == 0)) {
         secure.put("wifi_ssid", ssid.c_str());
         secure.put("wifi_password", password.c_str());
 
         this->ssid = secure.get("wifi_ssid").c_str();
         this->password = secure.get("wifi_password").c_str();
-
-        if (ntp_server_cfg.length() != 0) {
-            this->ntp_server = ntp_server_cfg.c_str();
-        }
 
         // Ensure we delete the wifi credentials from the json config after migrating
         ConfigManager::save();

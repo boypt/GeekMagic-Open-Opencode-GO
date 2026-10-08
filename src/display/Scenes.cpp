@@ -51,10 +51,64 @@ static auto textWidthPx(const char* text, uint8_t textSize) -> int {
     return text == nullptr ? 0 : static_cast<int>(strlen(text)) * 6 * textSize;
 }
 
+// ---------- HH:MM:SS 像素时钟（textSize 3）：分段擦除，共用绘制 ----------
+// sysinfo / stock 两场景共用同一函数、同一擦除几何口径（balance 的时钟是
+// UsageManager.cpp 里同模式的第三份实现 —— 跨编译单元过不去这里的 static
+// helper，改擦除口径时两处一起改）。要点：
+//   · 分钟字段变化才擦写 "HH:MM:"（108px），平时每秒只擦写 "SS"（36px）；
+//   · 整条擦除只在入场/整屏重绘时做，且**只擦时钟自己那一条**
+//     （x−2 .. x+147 / y−2 .. y+25，左右各留 2px 余量），绝不
+//     fillRect(0, …, 240, …) 整行横扫 —— 会抹掉同一水平带上的其它元素；
+//   · 分钟跳变时整条擦除不会执行，必须先擦本区域再画，否则新旧分钟
+//     数字叠影（14:37 → 14:38 会看到 7 与 8 重影）。
+// textSize 3 每字 18px，8 个字符恒 144px 宽；起点坐标与配色由调用场景按
+// 自己的布局传入（几何常量各场景各自推导，勿互相照搬）。
+// 返回本次实际画上去的（当日分钟 0..1439、秒 0..59），调用方据此记差量状态，
+// 避免「记的时刻」与「画的时刻」在秒边界上错开一拍。
+struct SegClockStamp {
+    int minuteOfDay;
+    int second;
+};
+
+static auto drawSegmentedClock(int16_t clockX, int16_t clockY, uint16_t fg, uint16_t bg,
+                               bool minuteChanged, bool fullRedraw) -> SegClockStamp {
+    const time_t now = time(nullptr) + 8 * 3600;
+    struct tm localTime;
+    gmtime_r(&now, &localTime);
+
+    auto* gfx = DisplayManager::getGfx();
+    gfx->setTextSize(3);
+    gfx->setTextColor(fg);
+    const int16_t minuteWidth = textWidthPx("00:00:", 3);   // 108
+    const int16_t secondX = clockX + minuteWidth;
+    const int16_t secondWidth = textWidthPx("00", 3);       // 36
+    if (fullRedraw) {
+        gfx->fillRect(clockX - 2, clockY - 2, minuteWidth + secondWidth + 4, 28, bg);
+    }
+    if (fullRedraw || minuteChanged) {
+        if (!fullRedraw) {
+            gfx->fillRect(clockX, clockY - 2, minuteWidth, 28, bg);
+        }
+        gfx->setCursor(clockX, clockY);
+        char minuteText[8];
+        strftime(minuteText, sizeof(minuteText), "%H:%M:", &localTime);
+        gfx->print(minuteText);
+    }
+    // 仅擦写秒字段，避免每秒把整条时钟重新推送到 SPI。
+    // 高度与全量路径一致（28px），避免字号下沿残留上一秒字形。
+    gfx->fillRect(secondX, clockY - 2, secondWidth, 28, bg);
+    char secondText[3];
+    strftime(secondText, sizeof(secondText), "%S", &localTime);
+    gfx->setCursor(secondX, clockY);
+    gfx->print(secondText);
+
+    return {static_cast<int>((now / 60) % 1440), static_cast<int>(now % 60)};
+}
+
 // ---------- sysinfo：系统信息 + UTC+8 时钟 ----------
 // LCD 内建字体只含 ASCII（固件无 CJK 字模），故所有标签走英文；
 // enter() 全量绘制；update() 只擦写「值发生变化」的单行小区域（IP/NTP/运行时长/剩余堆）
-// 与分钟变化的时钟区域，绝不整屏重绘，避免闪屏。
+// 与时钟分段（分钟字段/秒字段），绝不整屏重绘，避免闪屏。
 class SystemInfoScene : public Scene {
    public:
     auto name() const -> const char* override { return "sysinfo"; }
@@ -81,7 +135,7 @@ class SystemInfoScene : public Scene {
         drawLine("VERSION", PROJECT_VER_STR, 127);
 
         drawDate();
-        drawClock(true);
+        drawClock(true, true);
 
         return true;
     }
@@ -122,8 +176,11 @@ class SystemInfoScene : public Scene {
             drawDate();
         }
         const int minute = static_cast<int>((now / 60) % 1440);
-        if (minute != m_lastMinute) {
-            drawClock(false);
+        const int second = static_cast<int>(now % 60);
+        // 与 stock 同口径：秒变化就进 drawClock（平时只擦写 SS 36px），
+        // 分钟是否跳变由 drawClock 决定要不要补写 HH:MM: 字段。
+        if (second != m_lastSecond) {
+            drawClock(minute != m_lastMinute, false);
         }
     }
 
@@ -136,9 +193,19 @@ class SystemInfoScene : public Scene {
     static constexpr uint16_t C_ACCENT = rgb565(0x4D, 0x6B, 0xFE);
     static constexpr int16_t VALUE_X = 80;
     static constexpr int16_t VALUE_MAX_W = 151;
+    // 时钟几何按 sysinfo 布局重推（勿照搬 stock 的 4/204/144 或 balance 的
+    // 48/204/144）：
+    //   · W = 144：textSize 3 的 "00:00:00"（8 字 × 18px），与两场景同宽
+    //   · X = (240 − 144)/2 = 48：与上方日期行同为水平居中，日期+时钟成组
+    //   · Y = 181：字形占 181..204，擦除带 179..206；上距日期擦除带
+    //     （150..173）留 5px，与信息行擦除带（末行止于 136）更远 ——
+    //     三条擦除带互不相交，分段擦除绝不碰到信息行与日期。
+    static constexpr int16_t CLOCK_W = 144;                    // == textWidthPx("00:00:00", 3)
+    static constexpr int16_t CLOCK_X = (240 - CLOCK_W) / 2;    // 48，居中
     static constexpr int16_t CLOCK_Y = 181;
 
     int m_lastMinute = -1;
+    int m_lastSecond = -1;
     int m_lastDay = -1;
     bool m_ntpSynced = false;
     char m_deviceAddress[32] = {0};
@@ -228,9 +295,10 @@ class SystemInfoScene : public Scene {
         auto* gfx = DisplayManager::getGfx();
         // Clear the full date band before redrawing so a longer previous value
         // cannot leave glyph remnants. This is a fixed-area update, not a
-        // full-screen redraw, and the clock band starts at y=174.
+        // full-screen redraw. Date glyphs sit at 166..173; the clock's erase
+        // band starts at y=179 and never reaches up here (see CLOCK_Y notes).
         // 下移日期并收紧独占带：日期字形 166~173，时钟字形从 181 开始，视觉间隔约 7px。
-        // 仍不触及信息行末行和时钟从 y=174 开始的清屏边界。
+        // 时钟改分段擦除后只碰自己那条（y=179..206），日期带与信息行带零波及。
         gfx->fillRect(0, 150, 240, 24, C_BG);
         gfx->setTextSize(1);
         gfx->setTextColor(C_ACCENT);
@@ -238,26 +306,14 @@ class SystemInfoScene : public Scene {
         gfx->print(dateText);
     }
 
-    auto drawClock(bool fullRedraw) -> void {
-        const time_t now = time(nullptr) + 8 * 3600;
-        struct tm localTime;
-        gmtime_r(&now, &localTime);
-        const int minute = static_cast<int>((now / 60) % 1440);
-        m_lastMinute = minute;
-
-        char clockText[6];
-        strftime(clockText, sizeof(clockText), "%H:%M", &localTime);
-        auto* gfx = DisplayManager::getGfx();
-        if (fullRedraw) {
-            // 起点 174：日期行占 164~171，清屏不得覆盖（否则日期缺一像素行）
-            gfx->fillRect(0, 174, 240, 34, C_BG);
-        } else {
-            gfx->fillRect(0, CLOCK_Y - 2, 240, 28, C_BG);
-        }
-        gfx->setTextSize(3);
-        gfx->setTextColor(C_WHITE);
-        gfx->setCursor(120 - textWidthPx(clockText, 3) / 2, CLOCK_Y);
-        gfx->print(clockText);
+    // 与 stock / balance 同一套 HH:MM:SS 分段擦除像素时钟（见顶部
+    // drawSegmentedClock）。整条擦除只碰 x=46..193 / y=179..206 这一条，
+    // 不再整行横扫，信息行与日期行带零波及。
+    auto drawClock(bool minuteChanged, bool fullRedraw) -> void {
+        const SegClockStamp stamp = drawSegmentedClock(
+            CLOCK_X, CLOCK_Y, C_WHITE, C_BG, minuteChanged, fullRedraw);
+        m_lastMinute = stamp.minuteOfDay;
+        m_lastSecond = stamp.second;
     }
 };
 
@@ -783,46 +839,14 @@ class StockScene : public Scene {
         }
     }
 
+    // 与 sysinfo / balance 同一套 HH:MM:SS 分段擦除时钟（顶部
+    // drawSegmentedClock）。本场景时钟左对齐 CLOCK_X=4，整条擦除止于
+    // x=149，给右下角圆环（x≥193）让位 —— 几何约束见 CLOCK_* 常量注释。
     auto drawClock(bool minuteChanged, bool fullRedraw) -> void {
-        const time_t now = time(nullptr) + 8 * 3600;
-        struct tm localTime;
-        gmtime_r(&now, &localTime);
-        m_lastMinute = static_cast<int>((now / 60) % 1440);
-        m_lastSecond = static_cast<int>(now % 60);
-
-        auto* gfx = DisplayManager::getGfx();
-        gfx->setTextSize(3);
-        gfx->setTextColor(C_WHITE);
-        // 左对齐到 CLOCK_X，整条时钟恒为 CLOCK_W 宽（字形宽度固定，数字位数不变）。
-        const int16_t clockX = CLOCK_X;
-        const int16_t minuteWidth = textWidthPx("00:00:", 3);
-        const int16_t secondX = clockX + minuteWidth;
-        const int16_t secondWidth = textWidthPx("00", 3);
-        if (fullRedraw) {
-            // 关键：**只擦时钟自己那一条**（x=2..149），绝不能像原先那样
-            // fillRect(0, …, 240, 28) 横扫整行 —— 圆环已移到右下角
-            // x=193..233 / y=194..234，整行擦除会把三层同心环抹掉。
-            // 左右各留 2px 余量，保证字号下沿与首尾字形都不残留。
-            gfx->fillRect(CLOCK_X - 2, CLOCK_Y - 2, CLOCK_W + 4, 28, C_BG);
-        }
-        if (fullRedraw || minuteChanged) {
-            // 分钟跳变时整条擦除不会执行，必须先擦掉本区域再画，否则新旧分钟
-            // 数字直接叠在一起（14:37 → 14:38 会看到 7 与 8 重影）。
-            if (!fullRedraw) {
-                gfx->fillRect(clockX, CLOCK_Y - 2, minuteWidth, 28, C_BG);
-            }
-            gfx->setCursor(clockX, CLOCK_Y);
-            char minuteText[8];
-            strftime(minuteText, sizeof(minuteText), "%H:%M:", &localTime);
-            gfx->print(minuteText);
-        }
-        // 仅擦写秒字段，避免每秒把整条时钟或屏幕重新推送到 SPI。
-        // 高度与全量路径一致，避免字号下沿残留上一秒字形。
-        gfx->fillRect(secondX, CLOCK_Y - 2, secondWidth, 28, C_BG);
-        char secondText[3];
-        strftime(secondText, sizeof(secondText), "%S", &localTime);
-        gfx->setCursor(secondX, CLOCK_Y);
-        gfx->print(secondText);
+        const SegClockStamp stamp = drawSegmentedClock(
+            CLOCK_X, CLOCK_Y, C_WHITE, C_BG, minuteChanged, fullRedraw);
+        m_lastMinute = stamp.minuteOfDay;
+        m_lastSecond = stamp.second;
     }
 };
 

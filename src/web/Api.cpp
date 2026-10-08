@@ -970,6 +970,7 @@ void handleNtpSync(Webserver* webserver) {
     doc["status"] = syncOk ? "ok" : "error";
     doc["lastStatus"] = ntpClient->lastStatus();
     doc["lastSyncTime"] = ntpClient->lastSyncTime();
+    doc["ntp_server"] = NTPClient::effectiveServer();
 
     String json;
     serializeJson(doc, json);
@@ -1003,6 +1004,7 @@ void handleNtpStatus(Webserver* webserver) {
     doc["lastOk"] = ntpClient->lastSyncOk();
     doc["lastStatus"] = ntpClient->lastStatus();
     doc["lastSyncTime"] = ntpClient->lastSyncTime();
+    doc["ntp_server"] = NTPClient::effectiveServer();
 
     String json;
     serializeJson(doc, json);

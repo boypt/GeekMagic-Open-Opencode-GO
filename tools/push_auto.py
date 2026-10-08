@@ -220,10 +220,12 @@ Alarm；如果它改变模式，再在 TRANSITIONS 增加明确的 state/event �
 """
 
 import argparse
+import atexit
 import json
 import math
 import os
 import random
+import signal
 import socket
 import ssl
 import sys
@@ -2087,6 +2089,67 @@ def normalize_device_base(device):
     return d.rstrip("/")
 
 
+def make_exit_restore(args, device_base, clock=None):
+    """构造退出时的「还屏」回调：把设备切回纯时钟场景（clock）。
+
+    进程退出（正常结束 / SIGTERM / SIGINT）时，脚本原本把屏幕留在最后推送的
+    balance / stock（含 --demo-balance/--demo-stock 钉死的场景）上；退出后屏幕
+    会一直停在那儿。这个回调在退出前 best-effort 地把设备调回 clock 纯时钟页。
+
+    设计约束：
+      - **只在真实设备模式发**：没有 device_base（self-test / 无 --device / --check
+        等不推场景的路径）或 --dry-run 时返回空操作，一次网络都不发。
+      - **一次性 + 幂等**：atexit 与 signal 可能都命中，重复触发只发一次。
+      - **best-effort**：单次尝试（retries=0，失败不重试）、短超时（沿用
+        http_request 的 timeout，钳到 5s 内）、失败只记日志，绝不阻塞退出。
+    """
+    if not device_base or getattr(args, "dry_run", False):
+        return lambda: None
+    # VirtualClock 只出现在 self-test 等无设备路径。这里再兜一层：不是真实时钟就
+    # 返回空操作，杜绝任何测试路径意外打真实网络（self-test 不变量）。
+    if clock is not None and not isinstance(clock, RealClock):
+        return lambda: None
+
+    state = {"fired": False}
+
+    def restore():
+        if state["fired"]:
+            return
+        state["fired"] = True
+        timeout = min(float(getattr(args, "timeout", 15.0) or 0.0), 5.0) or 5.0
+        try:
+            # 复用现有 post_device 底层实现与 DEVICE/DEVICE_TOKEN 鉴权，不另起 HTTP。
+            # 端点用固件实际的场景切换端点 POST /api/v1/scene（body {"scene":...}）。
+            push_device(device_base + "/api/v1/scene", args.device_token,
+                        {"scene": "clock"}, timeout, retries=0)
+        except Exception as ex:
+            eprint("退出：设备切回 clock 场景失败（忽略）：%s" % ex)
+
+    return restore
+
+
+def install_exit_hook(restore):
+    """注册一次性 best-effort 退出回调（正常退出 / SIGTERM / SIGINT）。
+
+    正常退出：atexit 天然触发。
+    SIGTERM：systemd stop 默认直接终止、不跑 atexit，必须转成 SystemExit 才会走
+             退出流程。
+    SIGINT：沿用原有 KeyboardInterrupt 语义（main 里会打「中断退出」），只是先还屏。
+    """
+    atexit.register(restore)
+
+    def _terminate(signum, _frame):
+        restore()
+        raise SystemExit(128 + signum)
+
+    def _interrupt(signum, _frame):
+        restore()
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _interrupt)
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="额度/股票自动推送与时间策略调度")
@@ -3660,6 +3723,9 @@ def main(argv=None):
         return stock_dry_run(args, symbols, aliases, windows)
     scheduler = Scheduler(args, device_base, symbols, clock=RealClock(),
                           aliases=aliases, windows=windows)
+    # 退出监听：正常结束 / SIGTERM(systemd stop) / SIGINT(Ctrl-C) 前把屏幕还回纯时钟。
+    # 只在真实设备模式注册（无 --device / --dry-run 时内部即空操作）。
+    install_exit_hook(make_exit_restore(args, device_base, scheduler.clock))
     try:
         scheduler.start()
         scheduler.run(max_events=None if args.loop else 1)

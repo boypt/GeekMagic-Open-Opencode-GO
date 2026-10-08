@@ -22,10 +22,17 @@
 
 #include "display/Scene.h"
 
+#include <stdint.h>
+
 /// 可注册场景上限（够用即可，RAM 敏感）
 static constexpr int SCENE_MAX = 8;
 /// 场景参数最大长度（如 GIF 文件名）
 static constexpr int SCENE_PARAM_MAX = 64;
+
+/// 无更新自动回钟超时（ms）：超过此时长没有任何鉴权写入类 API 请求，
+/// 自动回落纯时钟场景 "clock"。由 Api 在写入端点鉴权通过时经
+/// notifyActivity() 续期；休眠期间 SceneManager::update() 不跑，故不参与。
+static constexpr uint32_t SCENE_IDLE_TIMEOUT_MS = 600000UL;
 
 /**
  * 场景调度器：显示面的唯一所有者入口。
@@ -45,6 +52,10 @@ class SceneManager {
     static auto currentParam() -> const char*;
     static auto sceneCount() -> int;
     static auto sceneNameAt(int index) -> const char*;
+
+    /// 写入类 API 请求鉴权通过时打点续期（幂等，无堆分配）。
+    /// 纯 GET 状态查询不计，由调用方按 HTTP 方法过滤。
+    static auto notifyActivity() -> void;
 
    private:
     static auto find(const char* name) -> Scene*;

@@ -326,7 +326,17 @@ static auto validateBearerToken(Webserver* webserver) -> bool {
         return false;
     }
 
-    return providedToken.equals(storedToken);
+    const bool valid = providedToken.equals(storedToken);
+
+    // 无更新自动回钟打点：鉴权通过的非 GET 请求视为“API 更新请求”，
+    // 续期 SceneManager 的空闲计时器。此处是 requireBearerToken 与各
+    // multipart 上传（/album、/album/live、/notice/image）共同的鉴权出口，
+    // 一处即覆盖全部写入类端点；纯 GET 状态查询不计。
+    if (valid && webserver->raw().method() != HTTP_GET) {
+        SceneManager::notifyActivity();
+    }
+
+    return valid;
 }
 
 /**

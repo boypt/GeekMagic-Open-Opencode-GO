@@ -29,6 +29,40 @@ static int s_sceneCount = 0;
 static Scene* s_current = nullptr;
 static char s_currentParam[SCENE_PARAM_MAX] = {0};
 
+// ---- 无更新自动回钟（见 SCENE_IDLE_TIMEOUT_MS）----
+// s_lastActivityMs 初值 0：开机起即可用，故 sysinfo 停留 600s 无人推送也会回落 clock。
+// s_idleTriggered 保证超时只切一次，直到下一次写入请求打点才重新武装。
+static uint32_t s_lastActivityMs = 0;
+static bool s_idleTriggered = false;
+
+auto SceneManager::notifyActivity() -> void {
+    s_lastActivityMs = millis();
+    s_idleTriggered = false;
+}
+
+// 由 update() 每 loop 调用（休眠时 update() 不跑，故休眠期间不抢场景）。
+static void checkIdleTimeout() {
+    if (s_current == nullptr || s_idleTriggered) {
+        return;
+    }
+
+    // 已在纯时钟场景：无需切换（避免每 600s 无谓地重进 clock 重绘）
+    if (strcmp(s_current->name(), "clock") == 0) {
+        return;
+    }
+
+    // millis() 回绕安全差值
+    if (static_cast<uint32_t>(millis() - s_lastActivityMs) < SCENE_IDLE_TIMEOUT_MS) {
+        return;
+    }
+
+    // notice 覆盖层激活时 switchTo 会被闸门拒绝：保持未触发，下一 loop 重试，
+    // 不强切、不更新打点（通知结束后若仍无更新再回落 clock）。
+    if (SceneManager::switchTo("clock")) {
+        s_idleTriggered = true;
+    }
+}
+
 auto SceneManager::addScene(Scene* scene) -> bool {
     if (scene == nullptr || s_sceneCount >= SCENE_MAX) {
         return false;
@@ -110,6 +144,9 @@ auto SceneManager::switchTo(const char* name, const char* param) -> bool {
 }
 
 auto SceneManager::update() -> void {
+    // 无更新自动回钟：先判超时（可能切到 clock），再驱动当前场景
+    checkIdleTimeout();
+
     if (s_current != nullptr) {
         s_current->update();
     }

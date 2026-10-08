@@ -524,15 +524,22 @@ void UsageManager::drawQuotaRings() {
                 const uint8_t bandCov =
                     to > from ? static_cast<uint8_t>((to - from) * 255 / 16) : 0U;
                 // 扇形归属：形状 1 恒在弧上；形状 2/3 用叉积判端点方向。
+                // 判定点取像素中心在外缘半径上的径向投影 (ox,ou) = (dx,up)·R_outer/dist
+                // —— 复用本像素已算出的 r16 作 dist（1/16px 定点），使弧端切口
+                // 与外缘切线对齐；r16==0（圆心像素）无方向，跳过（本就不在任何环带）。
                 bool sector = false;
                 if (shape[i] == 1U) {
                     sector = true;
-                } else if (shape[i] != 0U) {
+                } else if (shape[i] != 0U && r16 != 0) {
+                    const int32_t ox =
+                        static_cast<int32_t>(dx) * RING_R[i] * 16 / r16;
+                    const int32_t ou =
+                        static_cast<int32_t>(up) * RING_R[i] * 16 / r16;
                     const int32_t cross =
-                        static_cast<int32_t>(sinT[i]) * up -
-                        static_cast<int32_t>(cosT[i]) * dx;
-                    sector = shape[i] == 2U ? (cross >= 0 && dx >= 0)
-                                            : (cross > 0 || dx >= 0);
+                        static_cast<int32_t>(sinT[i]) * ou -
+                        static_cast<int32_t>(cosT[i]) * ox;
+                    sector = shape[i] == 2U ? (cross >= 0 && ox >= 0)
+                                            : (cross > 0 || ox >= 0);
                 }
                 // 圆头帽独立于环带径向区间判定（帽盘可在端角外，仍属本环）；
                 // 帽盘正好等于本环 16px 横截面，故不会命中邻环的带/空档。

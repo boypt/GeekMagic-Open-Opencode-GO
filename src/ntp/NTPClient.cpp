@@ -83,7 +83,7 @@ auto NTPClient::effectiveServer() -> const char* {
 
 /**
  * @brief Initialize the NTP client
- * @param syncIntervalSeconds Sync interval in seconds (default: 6 hours)
+ * @param syncIntervalSeconds Sync interval in seconds (default: 1 hour)
  * @param maxRetries Maximum number of retries on failure (default: 3)
  *
  * @return void

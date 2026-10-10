@@ -25,7 +25,7 @@
 class NTPClient {
    public:
     NTPClient();
-    void begin(uint32_t syncIntervalSeconds = 6 * 3600, uint8_t maxRetries = 3);
+    void begin(uint32_t syncIntervalSeconds = 3600, uint8_t maxRetries = 3);
     void loop();
     bool syncNow();
 
@@ -37,7 +37,7 @@ class NTPClient {
     String lastStatus() const;
 
    private:
-    uint32_t _syncIntervalSeconds = 6 * 3600;
+    uint32_t _syncIntervalSeconds = 3600;
     uint8_t _maxRetries = 3;
     time_t _lastSync = 0;
     bool _lastOk = false;

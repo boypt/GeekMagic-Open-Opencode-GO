@@ -1,0 +1,72 @@
+# /etc/sd2.conf —— sd2-push.service 的环境变量文件（EnvironmentFile）
+#
+# 用法：sudo install -m 600 -o root -g root tools/sd2.conf.example /etc/sd2.conf
+#       sudo vi /etc/sd2.conf            # 填入真实值
+#       sudo systemctl restart sd2-push.service
+#       sudo journalctl -u sd2-push.service -f
+#
+# 格式：KEY=VALUE，一行一个，**不要 export**（systemd EnvironmentFile 不认 export）。
+#       引号可有可无；值里含空格/逗号时不必加引号（SYMBOLS 就是逗号分隔的）。
+#
+# 安全：文件含密钥，必须 root 属主 + 0600。**别提交进 git**（本仓库只留这份
+#       .example 模板）。
+#
+# 占位符一律用不含空格的 CHANGE_ME_*：systemd 的 EnvironmentFile 允许值里带空格，
+# 但 `set -a; . /etc/sd2.conf` 这种 shell 手动加载方式不行（会被当成命令）。
+# 值里真的必须带空格时才加引号，两种加载方式都兼容。
+#
+# 生效优先级：命令行 flag > 本文件（环境变量）> 脚本内置默认值。
+#       所以改时间策略、休眠时段这类想固化的值放这里即可，不必改 unit 的 ExecStart。
+#       注意 unit 里 ExecStart 只有 `--loop`，其余参数全靠本文件。
+
+
+# ── 设备（必填）────────────────────────────────────────────────────────────
+# 设备地址：IP 或完整 URL，缺 scheme 时脚本自动补 http://。
+# 设备通常在 STA 模式下与上位机同网段，地址可从设备 Web 页或串口日志
+# （`WiFiManager: IP : x.x.x.x`）拿到。
+DEVICE=http://192.168.1.100
+
+# 设备 Bearer token：设备端 /api/v1/* 全部要求这个头。
+# 来源：Web 配置页，或 LittleFS 里的 data/config.json 的 api_token
+#       （config.json 被 .gitignore 忽略，别提交）。
+# 来源：Web 配置页，或 LittleFS 里的 data/config.json 的 api_token
+#       （config.json 被 .gitignore 忽略，别提交）。
+DEVICE_TOKEN=CHANGE_ME_device_api_token
+
+
+# ── 额度上游（额度通道，缺 UPSTREAM_KEY 时脚本自动跳过额度、只推行情）──────
+# OpenCode Go 用量接口的完整 URL（必须带 scheme，末尾多余的 / 会被去掉）。
+UPSTREAM_URL=https://opencode.ai/zen/go/v1/usage
+
+# 该接口的 API Key（请求头 Authorization: Bearer <key>）。
+UPSTREAM_KEY=CHANGE_ME_upstream_api_key
+
+
+# ── 股票行情（新浪接口）────────────────────────────────────────────────────
+# 标的代码，逗号分隔，最多 5 个。**大小写非对称**：A 股/北交所必须小写
+# （sh000300 ✓ / SH000300 ✗），外盘期货必须保大小写（hf_NQ ✓ / hf_nq ✗），
+# 港股保大小写（hkHSI）。代码语法上限 16 字节。
+SYMBOLS=sh000300,sh000905,sz159531,sz399006,sh000688
+
+# 新浪接口前缀，一般不用改。脚本会在其后追加 list=<代码,...>。
+SINA_URL=https://hq.sinajs.cn/list=
+
+# 行名简称：**与 SYMBOLS 按位置一一对应，项数必须相同**，否则脚本启动失败
+#（错位会把简称贴到错的标的上）。留空项表示那只沿用代码。
+#   - 每项 1..9 字节可打印 ASCII（设备端同名上限）。
+#   - SYMBOLS 里超过 9 字节的代码（如 int_hangseng 12 / int_nikkei 10）
+#     **必须**在这里配简称，否则没配的会原样上屏、被设备以 400 拒掉。
+#   - 屏上只显示简称/代码；新浪返回的中文名只进日志与 --stock-dry-run。
+SYMBOL_NAMES=CSI300,CSI500,CSI2000,GEM,STAR50
+
+
+# ── 时间策略（北京时间，HH:MM；一般不用改）────────────────────────────────
+# 每日休眠起止，跨午夜：20:00 入睡、08:00 唤醒并立即推一次额度。
+# 休眠期间黑屏，只保留 10min 一次的 sleep 重申，零出站。
+SLEEP_FROM=20:00
+SLEEP_TO=08:00
+
+# A 股开市窗口，**半开区间** [开盘, 收盘)：默认 09:20~15:30。
+# 周末恒休市；节假日由新浪完整版行情日期 ≠ 今天兜底。
+MARKET_OPEN=09:20
+MARKET_CLOSE=15:30

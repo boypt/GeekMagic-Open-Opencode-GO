@@ -196,6 +196,11 @@ sh/sz 下位置一致。所以「字段少的是指数」只在 s_ 简版下成�
 都不给、或用 ``--demo``（向后兼容别名）= 只造假数据**，走完整时间策略：开市窗口、
 休眠、行情日期判定、两条通道都照常。
 
+``--dry-run`` / ``--stock-dry-run`` / ``--balance-dry-run`` 是三种「只看不打」的
+模式：``--dry-run`` 完全不联网、用本地随机数据走一遍调度（含 sleep）；后两个分别
+真实拉取一次行情 / 额度（``--balance-dry-run`` 一查额度、不连设备），不走进度策略、
+用来单独验证取数链路，两者可并存。
+
 日志分两层：普通日志只有**启动摘要**、**状态转移**和**全部失败/异常**；例行节拍
 的成功行（15s 行情、5min 额度、休眠 keepalive）走 Verbose 任务，默认丢弃，
 `--verbose` 才逐拍输出。否则 journal 每分钟 4 行正常噪音，真异常反而被淹没。
@@ -294,14 +299,6 @@ USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 SINA_REFERER = "https://finance.sina.com.cn"
 MARKET_WINDOWS = ((9 * 3600 + 20 * 60, 15 * 3600 + 30 * 60),)
 WEEKDAY_NAMES = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-SAMPLE_USAGE = {
-    "rolling": {"status": "active", "percent": 24,
-                "resetsAt": "2026-08-28T15:42:25.791Z"},
-    "weekly": {"status": "active", "percent": 45,
-               "resetsAt": "2026-09-01T00:00:00.000Z"},
-    "monthly": {"status": "active", "percent": 9,
-                "resetsAt": "2026-09-01T00:00:00.000Z"},
-}
 
 
 def eprint(*args):
@@ -2171,6 +2168,9 @@ def build_arg_parser():
                          help="上游 API key（也可用 UPSTREAM_KEY）；缺失时跳过额度")
     balance.add_argument("--insecure", action="store_true",
                          help="上游 TLS 不校验证书")
+    balance.add_argument("--balance-dry-run", action="store_true",
+                         help="只真实拉取并打印额度 payload，不连接设备"
+                              "（用于测试额度取数链路；加 --demo-balance 则用本地随机数据）")
 
     stock = parser.add_argument_group("股票行情")
     stock.add_argument("--symbols", default=os.environ.get("SYMBOLS", DEFAULT_SYMBOLS),
@@ -2284,8 +2284,8 @@ def validate_args(args):
                     "--%s 必须 > 0" % name.replace("_", "-"))
     if not (args.sina_url or "").strip():
         return device_base, symbols, aliases, windows, "缺少 --sina-url（或环境变量 SINA_URL）"
-    # --stock-dry-run 只测取数，不需要设备地址与 token
-    if args.check or not (args.dry_run or args.stock_dry_run):
+    # --stock-dry-run / --balance-dry-run 只测取数，不需要设备地址与 token
+    if args.check or not (args.dry_run or args.stock_dry_run or args.balance_dry_run):
         if not device_base:
             return device_base, symbols, aliases, windows, "缺少 --device（或环境变量 DEVICE）"
         if not args.device_token:
@@ -2372,85 +2372,30 @@ def stock_dry_run(args, symbols, aliases=None, windows=None):
     return 0
 
 
-def run_balance(args, device_base):
-    demo_balance = demo_modes(args)[1]
-    if not demo_balance and not args.upstream_key:
-        return 1, False
-    if demo_balance:
-        labels, progress, resets, status = build_payload(build_demo_usage())
-        # UPD 显示串（status）标注 DEMO，屏幕左上角显示 "DEMO HH:MM"
-        status = "DEMO " + status
-        usage_ok = True
-    elif args.dry_run:
-        # dry-run 的定义是完全不联网，用固定样例走格式化路径。
-        labels, progress, resets, status = build_payload(SAMPLE_USAGE)
-        usage_ok = True
+def balance_dry_run(args):
+    """真实拉取一次额度并打印 payload，全程不连接设备。
+
+    对标 ``--stock-dry-run``：都是「只看不打」的取数链路自测，区别是盯的是额度
+    上游（fetch_upstream → build_payload），与行情无关、也不走时间策略。
+    加 ``--demo-balance`` 则改用本地随机数据，不请求上游。
+    """
+    if demo_modes(args)[1]:
+        usage = build_demo_usage()
+        print("[dry-run] 额度使用本地随机数据（非真实上游）")
     else:
         try:
             usage = fetch_upstream(args.upstream_url, args.upstream_key,
                                    args.timeout, args.insecure)
         except RuntimeError as ex:
             eprint("额度失败: %s" % ex)
-            return 1, True
-        labels, progress, resets, status = build_payload(usage)
-        usage_ok = True
+            return 1
+    # 先把上游原始 usage 打出来，再看归一化后的三段字段：原始值帮你看清解析入口，
+    # payload 才是设备真正会收到的形状（与 --stock-dry-run 的打印顺序一致）。
+    print(json.dumps(usage, ensure_ascii=False))
+    labels, progress, resets, status = build_payload(usage)
     payload = {"labels": labels, "progress": progress, "resets": resets,
                "status": status}
-    endpoint = device_base + "/api/v1/balance"
-    if args.dry_run:
-        show_dry_run(endpoint, payload)
-        return 0, usage_ok
-    try:
-        push_device(endpoint, args.device_token, payload, args.timeout)
-    except RuntimeError as ex:
-        eprint("设备失败: %s" % ex)
-        return 2, usage_ok
-    return 0, usage_ok
-
-
-def run_stock(args, device_base, symbols, aliases=None):
-    if demo_modes(args)[0] or args.dry_run:
-        # dry-run 也不能访问新浪；使用本地样例保证离线可重复。
-        rows = [{"name": symbol,
-                 "change": round_change(random.uniform(-5.0, 5.0))}
-                for symbol in symbols]
-        data_date = None
-    else:
-        try:
-            rows, data_date = fetch_quotes(args.sina_url, symbols, args.timeout,
-                                           args.insecure)
-        except RuntimeError as ex:
-            eprint("行情失败: %s" % ex)
-            return 1, None
-        # 接口日期是节假日的权威兜底；日期不是今天时只作探针，不把旧行情
-        # 推上屏，下一轮会转入休市/额度节拍。
-        if data_date and data_date != beijing_date(beijing_time_now()):
-            eprint("新浪行情日期 %s 不是今天，按休市处理" % data_date)
-            return 0, data_date
-    endpoint = device_base + "/api/v1/stock"
-    payload = {"rows": apply_aliases(rows, aliases or {})}
-    if args.dry_run:
-        show_dry_run(endpoint, payload)
-        return 0, data_date
-    try:
-        push_device(endpoint, args.device_token, payload, args.timeout)
-    except RuntimeError as ex:
-        eprint("设备失败: %s" % ex)
-        return 2, data_date
-    return 0, data_date
-
-
-def run_sleep(args, device_base, on):
-    payload = {"on": bool(on)}
-    endpoint = device_base + "/api/v1/display/sleep"
-    if args.dry_run:
-        show_dry_run(endpoint, payload)
-        return 0
-    try:
-        push_device(endpoint, args.device_token, payload, args.timeout)
-    except RuntimeError as ex:
-        eprint("设备失败: %s" % ex)
-        return 2
+    show_dry_run("/api/v1/balance", payload)
     return 0
 
 
@@ -2466,7 +2411,8 @@ def self_test():
                       sleep_keepalive=600, loop=False, dry_run=False,
                       check=False, demo=True, self_test=False,
                       no_quota_bars=False, verbose=False,
-                      symbol_names="", stock_dry_run=False)
+                      symbol_names="", stock_dry_run=False,
+                      balance_dry_run=False)
         values.update(changes)
         return argparse.Namespace(**values)
     
@@ -3693,6 +3639,13 @@ def self_test():
        [p for p, _ in backend.posts].count("/api/v1/balance") == 0 and
        not any("行情节拍自愈" in line for line in s.log_lines))
 
+    # 92. --balance-dry-run 只测额度取数，同样免设备地址与 token（与 --stock-dry-run
+    #     同级）；未开任何 dry-run 时设备地址与 token 仍是硬要求，别把门槛改松了。
+    ok("--balance-dry-run 免设备要求",
+       validate_args(args_for(device="", device_token="",
+                              balance_dry_run=True))[-1] == "" and
+       validate_args(args_for(device="", device_token=""))[-1] != "")
+
     print("SELF-TEST PASS: %d/%d" % (len(results), len(results)))
     
 
@@ -3719,8 +3672,13 @@ def main(argv=None):
         except (RuntimeError, OSError) as ex:
             eprint("设备失败: %s" % ex)
             return 2
-    if args.stock_dry_run:
-        return stock_dry_run(args, symbols, aliases, windows)
+    if args.balance_dry_run or args.stock_dry_run:
+        rc = 0
+        if args.balance_dry_run:
+            rc = balance_dry_run(args)
+        if args.stock_dry_run:
+            rc = stock_dry_run(args, symbols, aliases, windows) or rc
+        return rc
     scheduler = Scheduler(args, device_base, symbols, clock=RealClock(),
                           aliases=aliases, windows=windows)
     # 退出监听：正常结束 / SIGTERM(systemd stop) / SIGINT(Ctrl-C) 前把屏幕还回纯时钟。

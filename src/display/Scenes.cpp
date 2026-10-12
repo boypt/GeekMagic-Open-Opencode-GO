@@ -27,6 +27,7 @@
 
 #include "display/DisplayManager.h"
 #include "display/NoticeScene.h"
+#include "display/QuotaRingRenderer.h"
 #include "display/SceneManager.h"
 #include "opencodego/UsageManager.h"
 #include "wireless/WiFiManager.h"
@@ -317,107 +318,6 @@ class SystemInfoScene : public Scene {
     }
 };
 
-// 1/255 定标的正弦表（0..90°，四分之一波）。画圆弧要取圆周坐标，为了不把 libm 的
-// sinf/cosf（连带浮点库和一堆代码）带进固件，这里用 91 字节查表 + 象限映射，误差
-// ≤ 0.5/255 ≈ 0.04px，240×240 屏上完全看不出来。91 字节常驻静态区（.rodata），
-// 不参与堆分配。
-static const uint8_t kSinUnitDeg[91] = {
-      0,   4,   9,  13,  18,  22,  27,  31,  35,  40,  44,  49,  53,  57,  62,
-     66,  70,  75,  79,  83,  87,  91,  96, 100, 104, 108, 112, 116, 120, 124,
-    127, 131, 135, 139, 143, 146, 150, 153, 157, 160, 164, 167, 171, 174, 177,
-    180, 183, 186, 190, 192, 195, 198, 201, 204, 206, 209, 211, 214, 216, 219,
-    221, 223, 225, 227, 229, 231, 233, 235, 236, 238, 240, 241, 243, 244, 245,
-    246, 247, 248, 249, 250, 251, 252, 253, 253, 254, 254, 254, 255, 255, 255,
-    255,
-};
-
-/// sin(角度) 的 1/255 定标值（-255..255）。tenths = 角度×10，即 0.1° 分辨率，
-/// 在 kSinUnitDeg 上线性插值。取 0.1° 而不是整度，是因为额度环的扇形边界正好是
-/// 3.6·percent 度（如 70% → 252.0°、17% → 61.2°），整度会把边界量化掉 0.5°，
-/// 在 r=20 处就是 0.17px 的错位；0.1° 只剩 0.02px。
-static auto sinUnitTenths(uint16_t tenths) -> int16_t {
-    tenths %= 3600U;
-    uint16_t folded = 0U;
-    bool negative = false;
-    if (tenths < 900U) {
-        folded = tenths;
-    } else if (tenths < 1800U) {
-        folded = 1800U - tenths;
-    } else if (tenths < 2700U) {
-        folded = tenths - 1800U;
-        negative = true;
-    } else {
-        folded = 3600U - tenths;
-        negative = true;
-    }
-    const uint16_t index = folded / 10U;   // 0..90
-    const int16_t remainder = static_cast<int16_t>(folded % 10U);
-    int16_t magnitude = 255;
-    if (index < 90U) {
-        const int16_t low = kSinUnitDeg[index];
-        const int16_t high = kSinUnitDeg[index + 1U];
-        magnitude = static_cast<int16_t>(low + (((high - low) * remainder + 5) / 10));
-    }
-    return negative ? static_cast<int16_t>(-magnitude) : magnitude;
-}
-
-/// cos(角度) = sin(角度 + 90°)，复用同一张表。
-static auto cosUnitTenths(uint16_t tenths) -> int16_t {
-    return sinUnitTenths(static_cast<uint16_t>(tenths + 900U));
-}
-
-/// 32 位整数平方根（逐位恢复法）。算像素到圆心的距离要用到它 —— 引入 sqrtf() 连带
-/// libm 与浮点库，正是本文件上面那张正弦表要绕开的东西，所以这里手写整数版。
-static auto isqrt32(uint32_t value) -> uint16_t {
-    uint32_t remainder = value;
-    uint32_t root = 0U;
-    uint32_t bit = 1UL << 30;
-    while (bit > remainder) {
-        bit >>= 2;
-    }
-    for (; bit != 0U; bit >>= 2) {
-        if (remainder >= root + bit) {
-            remainder -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-    }
-    return static_cast<uint16_t>(root);
-}
-
-/// 两个**已交换色序**的 RGB565 之间按 ratio(0..255) 线性插值。
-/// BGR 交换是固定通道置换，与逐通道 lerp 可交换，所以直接在本文件 rgb565() 打包
-/// 出来的值上插即可，不必回到源 RGB 再转换。三段通道位宽不同（5/6/5），
-/// 必须各自在自己的位宽里插完再拼回去，跨位宽插会偏色。
-static auto lerp565(uint16_t from, uint16_t to, uint8_t ratio) -> uint16_t {
-    const int32_t weight = ratio;
-    const int32_t fromR = (from >> 11) & 0x1FU;
-    const int32_t fromG = (from >> 5) & 0x3FU;
-    const int32_t fromB = from & 0x1FU;
-    const int32_t red = fromR + ((((to >> 11) & 0x1FU) - fromR) * weight + 127) / 255;
-    const int32_t green = fromG + ((((to >> 5) & 0x3FU) - fromG) * weight + 127) / 255;
-    const int32_t blue = fromB + (((static_cast<int32_t>(to & 0x1FU) - fromB) * weight + 127) / 255);
-    return static_cast<uint16_t>((static_cast<uint32_t>(red) << 11) |
-                                 (static_cast<uint32_t>(green) << 5) |
-                                 static_cast<uint32_t>(blue));
-}
-
-/// 圆头帽在单像素上的覆盖率（0..255）。dStart/dEnd 为像素中心到起点帽心 / 终点帽心
-/// 的 1/16 px 距离。帽半径 2px = 32 单位，外缘再留 0.5px（8 单位）渐隐，
-/// 与环带边缘同一口径；两端帽取覆盖率较大者（1~3% 时两帽重叠，取 max 防止重复混色）。
-static auto capCoverage(int16_t dStart, int16_t dEnd) -> uint8_t {
-    const int16_t dist = dStart < dEnd ? dStart : dEnd;
-    int32_t edge = 40 - dist;   // 32(半径) + 8(0.5px 外缘) − 距离
-    if (edge <= 0) {
-        return 0U;
-    }
-    if (edge > 16) {
-        edge = 16;              // 1px 宽的边缘过渡，内部恒为满覆盖
-    }
-    return static_cast<uint8_t>(edge * 255 / 16);
-}
-
 // ---------- stock：推送的股票行情 ----------
 // 固定五个槽位让 1~5 行的切换不跳动；数据变化只擦写行带，不触碰整屏。
 class StockScene : public Scene {
@@ -552,10 +452,8 @@ class StockScene : public Scene {
     static constexpr int16_t RING_CY = RING_Y + 20;
     static constexpr int16_t RING_R[StockData::QUOTA_MAX] = {20, 14, 8};  // 各环外缘
     static constexpr uint8_t RING_THICK = 4;   // 每环 4px 描边（向内取）
-    static constexpr uint8_t RING_CAP_R = RING_THICK / 2;  // 圆头帽半径 = 2px
-    /// 环带中径 = 外缘 − 帽半径，即 18/12/6；帽心与弧心对齐于此
-    static constexpr int16_t RING_MID_R[StockData::QUOTA_MAX] = {
-        RING_R[0] - RING_CAP_R, RING_R[1] - RING_CAP_R, RING_R[2] - RING_CAP_R};
+    // 帽半径（=THICK/2=2）、环带中径（=R−CAP_R=18/12/6）由共享 renderer 从
+    // RING_R 与 RING_THICK 现算，本场景不再各自存一份。
     static constexpr int16_t ROW_Y = 50;
     static constexpr uint8_t ROW_STEP = 27;
     // 时钟**左对齐**（不再水平居中）：字号 3 每字 18px，8 字符共 144px，
@@ -616,221 +514,56 @@ class StockScene : public Scene {
         }
     }
 
-    /// 使**两端帽心弦长 ≥ 2×帽半径**的最小弧长（0.1° 单位）—— 即「两帽正好外切」。
-    /// 帽半径 2px、帽心在中径上；弧长小于它时两端帽盘会重叠成一个圆点，看不出
-    /// 「这条弧的两端在哪」。剩余语义下弧长一律夹取到 [Θ_min, 360°−Θ_min]。
-    /// 必须是**算出来的**：RING_THICK / RING_R 一改，Θ_min 要自动跟着变，不能写死。
-    /// 代价是每次 drawQuota 多约 350 次 sinUnitTenths 迭代（外环 RING_MID_R=18 约
-    /// 64 次、内环 =6 约 194 次），相对后面 41×41=1681 次像素循环可忽略；且 drawQuota
-    /// 只在额度变化 / 进场景时调用，不在每帧热路径上。
-    /// 实测（当前几何）：{128, 194, 388} 0.1° = 12.8° / 19.4° / 38.8°，帽心弦长
-    /// 4.013 / 4.045 / 3.988px ≈ 2×帽半径；正弦表 1/255 定标带来约 0.05px 量化残差，
-    /// 正是「正好相切」的观感来源（缝隙中点两侧覆盖率各 50%）。
-    static auto tangentArcTenths(uint8_t ring) -> uint16_t {
-        const int32_t mid16 = static_cast<int32_t>(RING_MID_R[ring]) * 16;
-        const int32_t need = 2 * RING_CAP_R * 16;   // 帽心间距下限（1/16px）
-        // 弦长 = 2·mid·sin(Θ/2)；正弦表 1/255 定标，故 (2·mid16·sin)/255。
-        for (uint16_t half = 1U; half <= 1800U; ++half) {
-            if ((2 * mid16 * sinUnitTenths(half)) / 255 >= need) {
-                return static_cast<uint16_t>(half * 2U);
-            }
-        }
-        return 3600U;   // 不可达：中径恒远大于帽半径
-    }
-
     /// 右下角三重同心额度环：外/中/内 = 5H / WK. / MO.，无任何文字。
     /// 弧长 = **剩余百分比**（= StockData 的 progress），是唯一的数据通道；环色 = 行
     /// 身份，不随数值变。故**亮弧代表剩余额度、暗轨道代表已消耗掉的那段**（暗 = 亮度
     /// 低，与「额度已用掉」的直觉一致）：剩余 100%（一点没用）→ 满额度，画满整圈
     /// （唯一无帽的整圈态，用户明确要的 100% 特殊处理）；剩余越低弧越短；剩余 0%
-    /// （用尽）→ 弧长 0，被下界夹到 Θ_min，与 1% 同形的最小 pip（不是整圈）。
-    /// 中间 1..99 恒是带帽的剩余弧、永不与整圈合并（99% 也会被上界夹到 360°−Θ_min）。
-    /// 从 12 点起顺时针扫：x = cx + r·sin(Θ)，y = cy − r·cos(Θ)。
-    /// 两端弧长夹取到 [Θ_min, 360°−Θ_min]（Θ_min 见 tangentArcTenths）：
-    ///   · 下侧 Θ_min：剩余很小（如 1% → 3.6°，外环仅 1.26px）时两端帽心间距 < 2×帽
-    ///     半径，两帽会重叠成一个圆点、看不出环的两端在哪；夹到 Θ_min 后两帽正好外切。
-    ///   · 上侧 360°−Θ_min：剩余 99%（356.4°）时缺口只剩 3.6°，会被两个帽补满、
-    ///     与 100% 的整圈无法区分；夹到上界后 1..99 永远不会与整圈合并。这是用户点名
-    ///     的取舍（牺牲 100→99 的动画连贯性，换「缺口视觉的进度」强调）。
-    /// 已知几何代价：内环中径仅 6px、帽盘宽 4px ⇒ 剩余 < ~10%（内环 Θ_min=38.8°）会被
-    /// 下界夹成同一条最小弧、彼此分辨不出，外环 ~3.5%；这是半径与帽径的固有限制、
-    /// 不是 bug。
+    /// （用尽）→ **不画弧，只在 12 点画一个身份色实心圆点**（直径 = 该环描边宽，
+    /// 半径 capR=thickness/2），环带其余仍是暗轨道。
+    /// 中间 1..99 是剩余弧，弧角按 `remaining*36` **原始**计算、**只做上侧夹取**
+    /// （tenths ≤ 3600−Θ_min，防 99% 缺口被两端帽补满而与整圈混淆）—— 低百分比
+    /// 不再被下界抬高。端帽仅在两端帽心弦长 ≥ 两帽直径 (2*capR) 时绘制：更短的弧直接
+    /// 不画端帽，按原始角度/弧长呈现，不被两个大圆盘融合撑宽（帽半径不缩放）。
+    /// 本页小环 capR=2、midR=18/12/6：progress=5（18°）本就短于端帽直径，中/内环
+    /// 不再被抬到 Θ_min（60.4°=16.8%）；只剩像素栅格对低于约 1px 弧长的量化（显示
+    /// 固有限制，与帽盘无关）。99% 上界弧已接近整圈、只在 12 点处留一道约 1px 背景窄缝。
     /// 无值 -1 只留暗轨道；没有任何额度数据时三段必全是 -1，故显示三圈空轨道。
-    /// 环区自清底（fillRect 只覆盖 RING_X/RING_Y 起的 41×41，落在 x≤233 / y≤234），
-    /// 因此它本身就是自洽的局部更新单元（约屏面 0.7%），既不触碰左上标题、
-    /// 中部行情行带，也碰不到左侧时钟（时钟擦除带止于 x=149）。
     ///
-    /// 画法：**逐像素距离场 + 径向覆盖率抗锯齿**。旧画法是按 1° 步长沿角度逐点
-    /// 落笔，根因有三，都会在 240px 小屏上显成「像素感重、弧不圆滑」：
-    ///   ① 外环 1° 只走 0.35px 弧长，相邻角度**大量落在同一像素**（实测 2160 次
-    ///      drawPixel 里 56% 是重复覆盖同一像素），偶尔又跳 2px —— 弧长忽疏忽密。
-    ///   ② 坐标用 `>> 16`，对负数是算术右移（向 −∞ 取整）而非就近取整，圆心左右
-    ///      两侧取整规律不一致，一侧顺一侧毛。
-    ///   ③ 细描边按整数半径硬切，无法表达亚像素部分覆盖，内外缘必然是硬的。
-    /// 现在反过来遍历包围盒里每个像素：整数开方算它到圆心的距离，落在环带内的按
-    /// 覆盖率把颜色混出来 —— 径向完全对称（无累积取整误差）、每像素只画一次、
-    /// 内外缘是真抗锯齿。与 16×16 超采样理想图（同样用 565 量化色）比对，平均
-    /// 通道误差 44.7 → 4.9（三环同档）/ 44.6 → 4.7（整圈 / 半圈 / 最小弧三档）/
-    /// 26.3 → 3.0（最小弧），三档都降 89%。
-    /// 相邻两环不会互相污染：环带之间本就有 2px 空白，抗锯齿最多向外洇 0.5px；
-    /// 帽盘半径取描边一半（2px）、圆心在中径上，恰好等于本环 4px 的横截面，
-    /// 故也不会伸进邻环或空档。三带互不重叠，一个像素至多命中一条环带。
+    /// 像素算法（逐像素距离场 + 径向覆盖率抗锯齿）、三角查表 / 整数开方 / 混色 / 端帽
+    /// 数学全部下沉到**共享的 QuotaRingRenderer**（include/display/QuotaRingRenderer.h）：
+    /// 本场景只负责组装布局（圆心 / 外径 / 描边 / 擦底框）、调色板（身份弧色 + 轨道色 +
+    /// 底色）与三行 remaining，再调 `QuotaRingRenderer::draw()`。balance 居中大环走
+    /// **同一份实现**，两页像素口径由构造保证一致 —— 算法细节与旧画法的三处根因
+    /// （同像素重复落笔 / `>>16` 对负数取整不对称 / 整数半径硬切）见该 renderer 文件。
     ///
-    /// 圆头帽（Apple 活动环的标志性端头）：仅形状 2/3（即 1..99 的剩余弧）时画。
-    /// 在弧的起、终两个端点各放一个半径 2px 的圆盘，圆心落在环带中径、位于端角上；
-    /// 圆盘会向扇形角外鼓出，把生硬的平切口变成圆头。帽盘的着墨判定**独立于**环带
-    /// 的径向区间（端角外的像素不在扇形内，却仍在帽内），两者覆盖率取 max 合并，
-    /// 于是每像素至多混色一次；弧被夹到 Θ_min 时两端帽恰好相切（不重叠），取 max
-    /// 同样避免重复混色。
+    /// 弧长**只做上侧夹取**到 `3600 − Θ_min`（Θ_min 由 renderer 的
+    /// `tangentArcTenths()` 按**本页实际几何**现算，不写死、**只用于上界**；本页小环
+    /// 实测 {194, 288, 604} 0.1° = 19.4° / 28.8° / 60.4°，对应帽心弦长
+    /// 6.062 / 6.000 / 6.000px = 两帽盘(含各自 0.5px AA 外沿)×2 + 约 1px 背景缝）：
+    ///   · 上侧 360°−Θ_min：剩余 99% 的 1% 缺口会被两个帽补满、与 100% 整圈无法区分；
+    ///     夹到上界后缺口固定、两帽边之间留约 1px 背景缝，1..99 永不与整圈合并。
+    ///   · 低百分比**不再下侧抬高**：短弧按原始角度如实画，短于端帽直径 (2*capR) 时
+    ///     连端帽都不画（balance 大环几何不同，Θ_min 自算、同公式）。0% 不走弧分支，
+    ///     由 12 点单点处理。
+    /// 已知几何限制：低于约 1px 的弧长会被像素栅格量化（显示固有限制）；这不再像旧
+    /// 下界夹取那样把阈值人为撑到 Δ_min（例如内环 60.4°）。
     ///
-    /// 扇形边界（弧的端头）用**叉积**判，不比较角度也不比较余弦：
-    ///   A = cross(vΘ, P) = sinΘ·u − cosΘ·dx   —— A ≥ 0 ⇔ α ≤ Θ（在 α ≥ Θ−180 支上）
-    ///   B = dx ≥ 0                            —— ⇔ α ∈ [0,180]
-    /// 凸扇形 Θ≤180 取 A ≥ 0 且 B；反射扇形 Θ>180 取 [0,Θ] = 整圈减 (Θ,360)，
-    /// 后者正是 A ≤ 0 且 !B，故取补得 A > 0 或 B。判据对 P 线性，误差只有坐标的
-    /// 1/255，角分辨率约 0.02°。这里刻意不用「cos α ≥ cos Θ/2」那种半角写法：
-    /// cos 在 0 附近极平坦，最小弧档（剩余很小、被夹到 Θ_min，仍偏小）的余弦差不足
-    /// 半个 LSB，会整圈判反。
+    /// 环区自清底（renderer 的 fillRect 只覆盖 RING_X/RING_Y 起的 41×41，落在
+    /// x≤233 / y≤234），因此它本身就是自洽的局部更新单元（约屏面 0.7%），既不触碰
+    /// 左上标题、中部行情行带，也碰不到左侧时钟（时钟擦除带止于 x=149）。
     auto drawQuota() -> void {
-        auto* gfx = DisplayManager::getGfx();
-        // 只擦环区（x=193..233 / y=194..234），不碰标题/行带/时钟。
-        gfx->fillRect(RING_X, RING_Y, RING_BOX, RING_BOX, C_BG);
-
-        // 每个环的扇形边界方向预先算好（1/255 定标），像素循环里只做点积。
-        // 形状 0 = 无弧（仅无值 -1 只剩暗轨道；完全没有额度数据时三段必全是 -1 ——
-        // setQuota 只在至少一段 >=0 时才置位 hasQuota，clear() 也复位，所以这里不
-        // 提前返回，三圈轨道照画）、1 = 整圈（仅满额度 percent>=100，不画帽，是唯一
-        // 无帽态）、2 = 凸扇形、3 = 反射扇形（1..99 一律按夹取后的剩余弧长判）。
-        uint8_t shape[StockData::QUOTA_MAX] = {};
-        int16_t sinT[StockData::QUOTA_MAX] = {};
-        int16_t cosT[StockData::QUOTA_MAX] = {};
-        // 圆头帽的圆心（仅形状 2/3 有效）：起点在角度 0、终点在角度 Θ，均落在
-        // 环带中径上。帽心以 1/16 px 定点存储，像素循环里不再做除法：
-        //   起点 (dx, up) = (0, midR)
-        //   终点 (dx, up) = (midR·sinΘ/255, midR·cosΘ/255)
-        int16_t capStartUp16[StockData::QUOTA_MAX] = {};
-        int16_t capEndDx16[StockData::QUOTA_MAX] = {};
-        int16_t capEndUp16[StockData::QUOTA_MAX] = {};
+        // 三环参数在**自动局部栈数组**上组装（3×几个标量，几十 bytes）：不把静态
+        // constexpr 数组指针交给共享 TU，规避 ESP8266 IROM 16bit 访问坑。
+        QuotaRingRenderer::Ring rings[StockData::QUOTA_MAX];
         for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
-            const int16_t percent = m_savedQuota[i];
-            if (percent < 0) {
-                // 无值：只剩暗轨道（无任何额度数据时三段必全 -1，见上）。
-                shape[i] = 0U;
-            } else if (percent >= 100) {
-                // 满额度：画满整圈、不画帽 —— 用户明确要的 100% 特殊处理，也是唯一
-                // 无帽的整圈态。100→99 会从满圈「塌」成两帽外切的弧（用户接受此跳动）。
-                shape[i] = 1U;
-            } else {
-                // 弧长 = 剩余百分比 = percent·36 个 0.1°（与旧代码同一套刻度）。
-                uint16_t tenths = static_cast<uint16_t>(percent) * 36U;
-                // 两端夹取：下侧 Θ_min 防剩余很小时两帽重叠成一个圆点；上侧
-                // 360°−Θ_min 防剩余 99%（缺口仅 3.6°=1.26px）被两帽补满、与整圈无法
-                // 区分。夹取后 1..99（含 0 被夹到下界）恒与整圈可分。
-                const uint16_t lo = tangentArcTenths(i);
-                const uint16_t hi = 3600U - lo;
-                if (tenths < lo) {
-                    tenths = lo;
-                } else if (tenths > hi) {
-                    tenths = hi;
-                }
-                sinT[i] = sinUnitTenths(tenths);
-                cosT[i] = cosUnitTenths(tenths);
-                shape[i] = tenths <= 1800U ? 2U : 3U;   // 按弧长判，不再按 percent
-                const int32_t mid16 = static_cast<int32_t>(RING_MID_R[i]) * 16;
-                capStartUp16[i] = static_cast<int16_t>(mid16);
-                const int32_t ex = mid16 * sinT[i];
-                const int32_t ey = mid16 * cosT[i];
-                capEndDx16[i] = static_cast<int16_t>(
-                    ex >= 0 ? (ex + 127) / 255 : -((-ex + 127) / 255));
-                capEndUp16[i] = static_cast<int16_t>(
-                    ey >= 0 ? (ey + 127) / 255 : -((-ey + 127) / 255));
-            }
+            rings[i].outerRadius = RING_R[i];
+            rings[i].remaining = m_savedQuota[i];
+            rings[i].arc565 = C_ARC_ROW[i];
+            rings[i].track565 = C_TRACK_ROW[i];
         }
-
-        // 环带的内外边界，1/16 px 定标。取 (R−THICK+0.5) 与 (R+0.5) 而不是整数
-        // R−THICK / R，是为了让连续极限正好等于旧画法「取 r 与 r−1 两个整数半径」
-        // 的实际着墨面积 —— 换句话说抗锯齿只改边缘质感，不改环的视觉粗细。
-        int16_t inner16[StockData::QUOTA_MAX];
-        int16_t outer16[StockData::QUOTA_MAX];
-        for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
-            inner16[i] = (RING_R[i] - RING_THICK) * 16 + 8;
-            outer16[i] = RING_R[i] * 16 + 8;
-        }
-
-        // 41×41 = 1681 次迭代，其中约千次真正落笔 —— 仍少于旧画法 2160 次
-        // drawPixel（且 56% 互相覆盖），SPI 传输量不增反降。
-        for (int16_t y = RING_Y; y < RING_Y + RING_BOX; ++y) {
-            for (int16_t x = RING_X; x < RING_X + RING_BOX; ++x) {
-                const int16_t dx = x - RING_CX;    // 右正
-                const int16_t up = RING_CY - y;    // 上正
-                // 到圆心的距离，1/16 px 定标：isqrt(n·2^8) 恰是 16·√n。
-                const int16_t r16 = static_cast<int16_t>(
-                    isqrt32(static_cast<uint32_t>(dx * dx + up * up) << 8));
-                // 本像素在径向覆盖 [r−0.5, r+0.5]
-                const int16_t low = r16 - 8;
-                const int16_t high = r16 + 8;
-                for (uint8_t i = 0; i < StockData::QUOTA_MAX; ++i) {
-                    // 环带覆盖率 0..255（像素自身径向宽 1px = 16 个 1/16 单位）
-                    const int16_t from = low > inner16[i] ? low : inner16[i];
-                    const int16_t to = high < outer16[i] ? high : outer16[i];
-                    const uint8_t bandCov =
-                        to > from ? static_cast<uint8_t>((to - from) * 255 / 16) : 0U;
-                    // 扇形归属：形状 1 恒在弧上；形状 2/3 用叉积判端点方向。
-                    // 判定点取像素中心在外缘半径上的径向投影 (ox,ou) = (dx,up)·R_outer/dist
-                    // —— 复用本像素已算出的 r16 作 dist（1/16px 定点），使弧端切口
-                    // 与外缘切线对齐；r16==0（圆心像素）无方向，跳过（本就不在任何环带）。
-                    bool sector = false;
-                    if (shape[i] == 1U) {
-                        sector = true;
-                    } else if (shape[i] != 0U && r16 != 0) {
-                        const int32_t ox =
-                            static_cast<int32_t>(dx) * RING_R[i] * 16 / r16;
-                        const int32_t ou =
-                            static_cast<int32_t>(up) * RING_R[i] * 16 / r16;
-                        const int32_t cross =
-                            static_cast<int32_t>(sinT[i]) * ou -
-                            static_cast<int32_t>(cosT[i]) * ox;
-                        sector = shape[i] == 2U ? (cross >= 0 && ox >= 0)
-                                                : (cross > 0 || ox >= 0);
-                    }
-                    // 圆头帽独立于环带径向区间判定（帽盘可在端角外，仍属本环）；
-                    // 帽盘正好等于本环 4px 横截面，故不会命中邻环的带/空档。
-                    uint8_t capCov = 0U;
-                    if (shape[i] == 2U || shape[i] == 3U) {
-                        const int32_t sdx = static_cast<int32_t>(dx) * 16;
-                        const int32_t sup =
-                            static_cast<int32_t>(up) * 16 - capStartUp16[i];
-                        const int16_t sdist = static_cast<int16_t>(
-                            isqrt32(static_cast<uint32_t>(sdx * sdx + sup * sup)));
-                        const int32_t edx =
-                            static_cast<int32_t>(dx) * 16 - capEndDx16[i];
-                        const int32_t eup =
-                            static_cast<int32_t>(up) * 16 - capEndUp16[i];
-                        const int16_t edist = static_cast<int16_t>(
-                            isqrt32(static_cast<uint32_t>(edx * edx + eup * eup)));
-                        capCov = capCoverage(sdist, edist);
-                    }
-                    // 环带内像素**恒着墨**（在扇形内是弧色，否则是轨道色），所以
-                    // 基准覆盖率就是 bandCov；帽盘可在扇形外单独补墨，取 max。
-                    uint8_t total = bandCov;
-                    if (capCov > total) {
-                        total = capCov;   // 帽与带取 max：每像素至多混色一次
-                    }
-                    if (total == 0U) {
-                        continue;   // 本环在此像素无着墨，试下一条环带
-                    }
-                    const bool onArc = sector || capCov != 0U;
-                    const uint16_t base = onArc ? C_ARC_ROW[i] : C_TRACK_ROW[i];
-                    // 环带**内外两侧都是背景（纯黑）**，轨道只存在于环带之内 ——
-                    // 所以径向抗锯齿要往 C_BG 混。往轨道色混会给每个环外缘糊上
-                    // 一层同色光晕，既虚胖又把环色洗淡。
-                    gfx->drawPixel(x, y, total == 255U
-                                                 ? base
-                                                 : lerp565(C_BG, base, total));
-                    break;   // 三条环带彼此隔 2px 空白，一个像素只可能命中一条
-                }
-            }
-        }
+        QuotaRingRenderer::draw(DisplayManager::getGfx(), RING_X, RING_Y, RING_BOX,
+                                RING_CX, RING_CY, RING_THICK, C_BG, rings);
     }
 
     auto drawTitle() -> void {

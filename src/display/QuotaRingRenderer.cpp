@@ -103,8 +103,9 @@ uint16_t lerp565(uint16_t from, uint16_t to, uint8_t ratio) {
 // 的 1/16 px 距离。帽半径 capR px = capR·16 单位，外缘再留 0.5px（8 单位）渐隐，
 // 与环带边缘同一口径；取两端较小距离 = 若两个端帽覆盖到同一像素就取较大覆盖率，
 // 避免重复混色。渐隐带恒 1px（16 单位）。capR 动态传入（= thickness/2），随各页几何变化。
-// 单点态（remaining==0）把起点/终点帽心设成同一点，于是 min(起点距, 终点距) 退化为
-// 只按这唯一的帽心算覆盖率——即一个实心圆点，不会出现第二个端帽。
+// 单点 marker 态（shape 4，正值但端点弦长 < 1px）把起点/终点帽心设成同一点，于是
+// min(起点距, 终点距) 退化为只按这唯一的帽心算覆盖率——即 12 点一个实心圆点，
+// 不会出现第二个端帽。
 uint8_t capCoverage(int16_t dStart, int16_t dEnd, uint8_t capR) {
     const int16_t dist = dStart < dEnd ? dStart : dEnd;
     int32_t edge = static_cast<int32_t>(capR) * 16 + 8 - dist;
@@ -154,52 +155,40 @@ void draw(Arduino_GFX* gfx,
     const uint8_t capR = static_cast<uint8_t>(thickness / 2U);
 
     // 每个环的扇形边界方向预先算好（1/255 定标），像素循环里只做点积。
-    // 形状 0 = 无弧（无值 -1 只剩暗轨道；完全没有额度数据时三段必全是 -1 —— 三圈
-    // 轨道照画，不提前返回）、1 = 整圈（仅满额度 remaining>=100，不画帽，是唯一
-    // 无帽态）、2 = 凸扇形、3 = 反射扇形（1..99 按**原始**剩余弧长判）、
-    // 4 = 12 点单个实心圆点（仅 remaining==0：不画弧、不画第二个端帽，只画一个以
-    // 12 点上端帽心为圆心、半径 capR 的身份色圆盘）。
+    // 形状 0 = 无弧（remaining <= 0：无数据 -1 或用尽 0 都只剩暗轨道；没有任何额度
+    //   数据时三段必全 -1，三圈轨道照画、不提前返回）、
+    // 1 = 整圈（仅满额度 remaining>=100，不画帽，是唯一无帽的整圈态）、
+    // 2 = 凸扇形、3 = 反射扇形（1..99 中端点弦长 ≥ 1px 者，按原始/上夹后弧长判）、
+    // 4 = 12 点单个实心圆点 marker（**正值但小于可绘制分辨率**：1..99 中端点弦长
+    //   < 1px —— 此时弧短到画不出来，用 12 点一个半径 capR 的身份色圆点表达「有值但极小」）。
     uint8_t shape[kRingCount] = {};
-    // 1..99 是否绘制两端圆头帽：仅当两端帽心弦长 ≥ 两帽直径 (2*capR) 时才画。短于此
-    // 的低值弧保留原始弧长 / 角度，不被两个大圆盘融合撑宽；帽半径本身不做缩放。
-    // shape 4 单点不受它影响（点恒画）。
+    // 1..99 是否绘制两端圆头帽：仅当两端帽心弦长 ≥ 两帽直径 (2*capR) 时才画。短于此的
+    // 弧保留原始弧长 / 角度，不被两个大圆盘融合撑宽；帽半径本身不做缩放。shape 4 marker
+    // 不受它影响（marker 恒画）。
     uint8_t drawCaps[kRingCount] = {};
     int16_t sinT[kRingCount] = {};
     int16_t cosT[kRingCount] = {};
     // 圆头帽的圆心（形状 2/3/4 有效）：起点在角度 0、终点在角度 Θ，均落在
     // 环带中径上。帽心以 1/16 px 定点存储，像素循环里不再做除法：
-    //   起点 (dx, up) = (0, midR)              ← 也是 shape 4 单点的圆心
+    //   起点 (dx, up) = (0, midR)              ← 也是 shape 4 marker 的圆心
     //   终点 (dx, up) = (midR·sinΘ/255, midR·cosΘ/255)
     int16_t capStartUp16[kRingCount] = {};
     int16_t capEndDx16[kRingCount] = {};
     int16_t capEndUp16[kRingCount] = {};
     for (uint8_t i = 0; i < kRingCount; ++i) {
         const int16_t percent = rings[i].remaining;
-        if (percent < 0) {
-            // 无值：只剩暗轨道（无任何额度数据时三段必全 -1）。
+        if (percent <= 0) {
+            // 无数据 (-1) 或 用尽 (0)：只画暗轨道，**完全无亮点**（0% 不再是圆点）。
             shape[i] = 0U;
-        } else if (percent == 0) {
-            // 用尽：不画弧，只在 12 点画一个身份色实心圆点（半径 capR，直径 = 该环描边宽）。
-            // 复用 12 点上端帽心 (dx=0, up=midR)，并把终点帽心也赋成同一点 —— 下方
-            // capCoverage() 取两端较小距离，退化为只按这一个帽心算覆盖率（单点圆盘，
-            // 不会出现第二个帽）。像素环带基准仍是轨道（sector=false），只有圆盘覆盖
-            // 命中处才用弧色，故绝不等同于一个小角扇形。
-            shape[i] = 4U;
-            const int32_t mid16 = static_cast<int32_t>(rings[i].outerRadius - capR) * 16;
-            capStartUp16[i] = static_cast<int16_t>(mid16);
-            capEndDx16[i] = 0;                                  // 终点 == 起点
-            capEndUp16[i] = static_cast<int16_t>(mid16);
         } else if (percent >= 100) {
             // 满额度：画满整圈、不画帽 —— 用户明确要的 100% 特殊处理，也是唯一
             // 无帽的整圈态。100→99 会从满圈变成整圈带一道约 1px 背景窄缝的弧。
             shape[i] = 1U;
         } else {
-            // 弧长 = 剩余百分比 = percent·36 个 0.1°（本支只处理 1..99；0% 已由上方
-            // shape=4 单点接管，不走这里）。
+            // 弧长 = 剩余百分比 = percent·36 个 0.1°（本支只处理 1..99）。
             uint16_t tenths = static_cast<uint16_t>(percent) * 36U;
             // **只做上侧夹取**：360°−Θ_min 防剩余 99%（缺口仅 3.6°）被两端帽盘补满、
-            // 与整圈无法区分。低百分比**不再下侧抬高** —— 短弧按原始角度如实呈现，
-            // 不再把例如内环 5%（18°）抬到 Θ_min（60.4°），短于端帽直径时直接不画端帽。
+            // 与整圈无法区分。低百分比**不再下侧抬高** —— 短弧按原始角度如实呈现。
             const uint16_t lo = tangentArcTenths(rings[i].outerRadius, capR);
             const uint16_t hi = static_cast<uint16_t>(3600U - lo);
             if (tenths > hi) {
@@ -207,24 +196,38 @@ void draw(Arduino_GFX* gfx,
             }
             sinT[i] = sinUnitTenths(tenths);
             cosT[i] = cosUnitTenths(tenths);
-            shape[i] = tenths <= 1800U ? 2U : 3U;   // 按剩余弧长判（上界可能已夹）
             const int32_t mid16 = static_cast<int32_t>(rings[i].outerRadius - capR) * 16;
             capStartUp16[i] = static_cast<int16_t>(mid16);
             const int32_t ex = mid16 * sinT[i];
             const int32_t ey = mid16 * cosT[i];
-            capEndDx16[i] = static_cast<int16_t>(
+            const int16_t endDx = static_cast<int16_t>(
                 ex >= 0 ? (ex + 127) / 255 : -((-ex + 127) / 255));
-            capEndUp16[i] = static_cast<int16_t>(
+            const int16_t endUp = static_cast<int16_t>(
                 ey >= 0 ? (ey + 127) / 255 : -((-ey + 127) / 255));
-            // 端到端帽心弦长（1/16 px）：起点 (0, capStartUp16)、终点
-            // (capEndDx16, capEndUp16)。弦长 < 两帽直径 (2*capR) ⇒ 不画两端帽圆盘，
-            // 让该弧以原始角度呈现而不被两大圆盘融合撑宽。
-            const int32_t chordDx = capEndDx16[i];
+            // 端到端帽心弦长（1/16 px 定点）：起点 (0, capStartUp16)、终点 (endDx, endUp)。
+            const int32_t chordDx = endDx;
             const int32_t chordUp =
-                static_cast<int32_t>(capEndUp16[i]) - static_cast<int32_t>(capStartUp16[i]);
+                static_cast<int32_t>(endUp) - static_cast<int32_t>(capStartUp16[i]);
             const uint32_t chord16 = isqrt32(
                 static_cast<uint32_t>(chordDx * chordDx + chordUp * chordUp));
-            drawCaps[i] = chord16 >= static_cast<uint32_t>(2U * capR * 16U) ? 1U : 0U;
+            if (chord16 < 16U) {
+                // 正值但小于 1px（16 个 1/16px 单位）分辨率：画不出可辨认的弧 →
+                // shape 4 只在 12 点画一个 capR 半径的实心身份色圆点（不画弧、不画第二端帽）。
+                // 复用 12 点上端帽心，并把终点帽心也赋成同一点 —— capCoverage() 取两端较小
+                // 距离退化为单点圆盘；sector 恒 false（像素循环对 shape4 不判扇形），故绝不等同
+                // 于一个小角扇形。阈值是**每环按几何/像素现算**的弦长，不写死 percent。
+                shape[i] = 4U;
+                capEndDx16[i] = 0;                      // 终点 == 起点
+                capEndUp16[i] = static_cast<int16_t>(mid16);
+            } else {
+                // 弦长 ≥ 1px：按原始/上夹后的 tenths 画真实 sector。
+                shape[i] = tenths <= 1800U ? 2U : 3U;
+                capEndDx16[i] = endDx;
+                capEndUp16[i] = endUp;
+                // 端帽另按直径：弦长 ≥ 2*capR 才画两枚圆端帽，否则两帽都不画、真实弧仍画。
+                drawCaps[i] =
+                    chord16 >= static_cast<uint32_t>(2U * capR * 16U) ? 1U : 0U;
+            }
         }
     }
 
@@ -276,8 +279,9 @@ void draw(Arduino_GFX* gfx,
                                             : (cross > 0 || ox >= 0);
                 }
                 // 圆头帽独立于环带径向区间判定（帽盘可在端角外，仍属本环）；
-                // 帽盘正好等于本环横截面，故不会命中邻环的带 / 空档。形状 4 把起终帽心
-                // 设成同一点，这里算出的 capCov 即 12 点那个单点圆盘的覆盖率（点恒画）。
+                // 帽盘正好等于本环横截面，故不会命中邻环的带 / 空档。形状 4 是「正值但
+                // 端点弦长 < 1px」的亚像素 marker：起终帽心被设成同一点，这里算出的
+                // capCov 即 12 点那个单点圆盘的覆盖率（marker 恒画，与 drawCaps 无关）。
                 // 形状 2/3 仅当 drawCaps（帽心弦长 ≥ 两帽直径）时才画端帽；否则
                 // capCov=0，弧带仍由上面 sector 判定着色、径向 AA 照做 —— 短弧保留
                 // 原始弧长，不会被端帽融合撑宽。

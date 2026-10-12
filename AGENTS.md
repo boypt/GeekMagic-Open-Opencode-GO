@@ -98,7 +98,7 @@ curl -H "Authorization: Bearer <token>" http://<ip>/api/v1/display/rotation
 
 改动后标准闭环：`pio run` → `upload`（+ 必要时 `uploadfs`）→ pyserial 抓 40-95s 启动日志，确认
 `Clean boot (...)` 或 `Boot stable`、无 `Exception`、`UsageManager initialized`、`Free heap` 稳定无泄漏趋势。
-调度策略自测：`python3 tools/push_auto.py --self-test`（虚拟时钟瞬时跑完 17 条：开市 15s 行情 tick / 开市 300s 额度只刷条不切屏 / **额度与行情分别推送互不夹带** / 额度取不到就不开推送（设备保留上次的条）/ `--no-quota-bars` / 额度上游失败 / 入市预取先于首帧行情 / 休市 300s / 休眠进入·keepalive·静默零出站·唤醒（休市与开市中两种）/ 行情日期过期 / 跨午夜区间 / 非法转移抛错 / 漏节拍跳过）。
+调度策略自测：`python3 tools/push_auto.py --self-test`（虚拟时钟瞬时跑完 92 条，开市/休市策略只摘几条：开市 15s 行情 tick / 开市 300s 额度只刷条不切屏 / **额度与行情分别推送互不夹带** / 额度取不到就不开推送（设备保留上次的条）/ `--no-quota-bars` / 额度上游失败 / 入市预取先于首帧行情 / 休市 300s / 休眠进入·keepalive·静默零出站·唤醒（休市与开市中两种）/ 行情日期过期 / 跨午夜区间 / 非法转移抛错 / 漏节拍跳过）。
 额度取数链路单测（真实请求上游，不连设备）：
 
 ```bash

@@ -1,0 +1,49 @@
+[Unit]
+Description=GeekMagic 小屏推送：额度 + 股票行情（push_auto）
+Documentation=file:/opt/sd2/push_auto.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 匿名运行：systemd 动态分配 uid/gid，不建系统账号、不留家目录
+DynamicUser=yes
+# 用法：cp /etc/sd2.conf.example /etc/sd2.conf 后填入真实值再启动
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/sd2.conf
+WorkingDirectory=/opt/sd2
+ExecStart=/usr/bin/python3 /opt/sd2/push_auto.py --loop
+Restart=always
+KillSignal=SIGINT
+RestartSec=10
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sd2-push
+
+# 脚本只做网络请求，不写任何文件 → 全程只读沙箱
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
